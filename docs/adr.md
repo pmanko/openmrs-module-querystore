@@ -15,7 +15,7 @@ Originating discussion: [RFC: A separate read-optimized projection of OpenMRS cl
 
 1. [CQRS Pattern — Separate Read Store from Transactional Database](#decision-1-cqrs-pattern--separate-read-store-from-transactional-database)
 2. [Module, Not Core](#decision-2-module-not-core)
-3. [Elasticsearch as the Backing Store](#decision-3-elasticsearch-as-the-backing-store)
+3. [Pluggable Backend SPI with Three Reference Implementations](#decision-3-pluggable-backend-spi-with-three-reference-implementations)
 4. [Per-Type Indices Over a Single Index](#decision-4-per-type-indices-over-a-single-index)
 5. [Plain Text Serialization Over JSON or FHIR](#decision-5-plain-text-serialization-over-json-or-fhir)
 6. [Document Model — Text, Embeddings, and Structured Metadata](#decision-6-document-model--text-embeddings-and-structured-metadata)
@@ -85,37 +85,59 @@ Core provides the hook points (events, AOP, service interfaces) that this module
 
 ---
 
-## Decision 3: Elasticsearch as the Backing Store
+## Decision 3: Pluggable Backend SPI with Three Reference Implementations
 
 ### Status
 Accepted
 
 ### Context
-The query store needs a backend that supports full-text search (keyword matching), semantic search (vector similarity), structured filtering (by patient, date, concept, etc.), and cross-patient aggregation. Candidates considered:
+The query store needs a backend that supports full-text search (keyword matching), semantic search (vector similarity), structured filtering (by patient, date, concept, etc.), and cross-patient aggregation.
+
+OpenMRS deployments span a wide range of operational profiles. A small rural hospital may run OpenMRS on a single server with limited spare RAM and no infrastructure team to operate a separate search cluster. A large national or research-network deployment may already run Elasticsearch, expects cross-patient analytics over millions of records, and has dedicated operational staff. A single backend choice forces every deployment into the same operational profile — either over-provisioning the small site or under-serving the large one.
+
+Candidate backends considered, with the workloads each handles well:
 
 | Option | Full-text | Vector | Structured filter | Cross-patient scale | Extra infra |
 |---|---|---|---|---|---|
-| MySQL (existing) | Limited | No native support | Yes | Moderate | None |
+| MySQL (reuse core's DB) | Limited (FULLTEXT) | No native support; brute-force in-process | Yes | Per-patient yes; cross-patient O(N) | None |
+| Embedded Lucene (in-JVM) | Yes (BM25) | Yes (HNSW kNN since Lucene 9) | Limited (point/range) | Single-host only | None new |
 | PostgreSQL + pgvector | Yes | Yes | Yes | Good | New database |
-| Elasticsearch | Yes | Yes (dense_vector + kNN) | Yes | Excellent | New service |
+| Elasticsearch / OpenSearch | Yes | Yes (dense_vector / knn_vector + RRF) | Yes | Excellent | New service |
 | Dedicated vector DB (Pinecone, Milvus, Qdrant) | No/limited | Yes | Limited | Excellent | New service |
 
+The chartsearchai module — querystore's primary near-term consumer — already supports four selectable retrieval pipelines (`embedding | lucene | hybrid | elasticsearch`) backed by MySQL, Lucene, and Elasticsearch in different combinations. Querystore is being designed as a generic read store that can absorb that capability surface without locking deployments into a single tier.
+
 ### Decision
-Use Elasticsearch as the primary backing store.
+The backing store is pluggable via a Java SPI. Querystore depends on the SPI; it does not depend on a specific backend. Three reference implementations ship with the module, and a deployment selects one via an explicit configuration property (`querystore.backend=mysql|lucene|elasticsearch`). Default is `mysql` so that a fresh install imposes no new infrastructure.
+
+| Tier | Backend | Footprint | Trade-offs accepted |
+|---|---|---|---|
+| Small | **MySQL** — vectors stored as binary in per-type tables inside core's existing database; brute-force in-process kNN; MySQL FULLTEXT for keyword search | No new process, no new storage, no new dependency | Cross-patient kNN is O(N) and not viable above modest scale; FULLTEXT keyword quality is below Lucene/ES BM25 |
+| Medium | **Embedded Lucene** — local FSDirectory in the OpenMRS app-data directory; native BM25 + HNSW kNN; in-process RRF fusion | No new process; local disk only | Single-host; no replication; index loss requires rebuild from core; throughput bounded by one JVM |
+| Large | **Elasticsearch / OpenSearch** — separate cluster; native `dense_vector`/`knn_vector` with HNSW; ES retriever or OS hybrid query for RRF fusion | Cross-server replication, cross-patient analytics at scale, native hybrid retrieval | ~1-2 GB+ baseline RAM for a separate JVM; new operational surface |
+
+The SPI is a Java interface that abstracts the per-type separation primitive (ES index / Lucene directory / MySQL table — see [Decision 4](#decision-4-per-type-indices-over-a-single-index)), document upsert, document delete, BM25 search, kNN search, hybrid search, bulk operations, and per-type schema/mapping creation. The exact contract is implementation work and is tracked under the [Backend SPI contract surface](#backend-spi-contract-surface) open question.
+
+The document model ([Decision 6](#decision-6-document-model--text-embeddings-and-structured-metadata)) is tier-invariant — the same fields are stored regardless of backend. The embedding pipeline ([Decision 8](#decision-8-locale-specific-serialization-with-multilingual-embeddings)) is also tier-invariant — same model, same vectors, same dimensions. Only the storage primitives, index/query throughput, and which advanced query patterns are viable differ across tiers.
+
+PostgreSQL + pgvector and dedicated vector databases are not in the v1 reference set. Either could be added as additional SPI implementations later without changing this decision. The three tiers shipped are picked to span the operational range from "no new infrastructure" to "cluster scale" with one clear option each.
 
 ### Rationale
-- **Hybrid search in one system.** Elasticsearch supports BM25 full-text search, dense vector kNN search, and structured filtering — all combinable in a single query. This avoids the complexity of coordinating multiple systems.
-- **Cross-patient scale.** Unlike brute-force in-application similarity computation, Elasticsearch's inverted indices and HNSW vector indices handle millions of documents efficiently.
-- **Mature ecosystem.** Well-documented, battle-tested, widely deployed in healthcare settings.
-- **Query DSL.** Rich filtering and aggregation capabilities that go beyond what a pure vector database offers.
-- **Some OpenMRS deployments already run Elasticsearch,** reducing the incremental infrastructure cost.
-
-A dedicated vector database was rejected because it would only serve semantic search, requiring a separate system for keyword search and structured filtering. MySQL was rejected because it lacks native vector search and its full-text capabilities are limited compared to Elasticsearch.
+1. **Small-deployment fit is a primary requirement, not an afterthought.** Forcing Elasticsearch on a single-server hospital is operationally untenable. The MySQL tier reuses the database that's already running and already backed up.
+2. **Capability honesty over uniform pretense.** Making the tier choice explicit, and documenting what each tier omits (cross-patient kNN at scale, FULLTEXT vs BM25 quality, single-host vs replicated), lets deployments choose with eyes open rather than discovering limits at scale. The alternative — pretending all tiers are equivalent — produces silent quality degradation.
+3. **Consumers don't need to know.** Per [Decision 14](#decision-14-authorization-and-consumer-api-surface), querystore's public surface is the Java service `QueryStoreService`. Consumers like chartsearchai never see the backend; they go through the same Java API regardless of tier. Backend choice is internal infrastructure.
+4. **Mirrors chartsearchai's existing approach.** chartsearchai already supports backend selection via a global property, with MySQL, Lucene, and Elasticsearch all in production-tested code paths. Absorbing that capability into querystore is a recombination of code that already works, not new untested territory.
+5. **Designing pluggability up front is cheaper than retrofitting it.** Once consumer code is written against an ES-specific API, replacing the backend is invasive. An SPI from day one keeps backend choice deferrable indefinitely.
+6. **Tier migration is a re-index, not a data migration.** Per [Decision 1](#decision-1-cqrs-pattern--separate-read-store-from-transactional-database), the read store is rebuildable from core. A deployment that outgrows the MySQL tier moves to Lucene or Elasticsearch by changing the config and rebuilding — no data export, no schema migration.
 
 ### Consequences
-- Deployments must run an Elasticsearch instance (separate JVM process, minimum ~1-2GB RAM).
-- This adds operational complexity for low-resource settings where infrastructure is constrained.
-- The module should be designed so the Elasticsearch dependency can be swapped for an alternative backend in the future if needed.
+- The module ships and maintains three backends. The SPI surface and each backend's correctness must be exercised in CI; behavioral parity (same query → same result set, modulo score tie-breaking and tier-specific capability gaps) is part of the test contract.
+- Cross-patient kNN at scale is only available on the Elasticsearch tier. The MySQL and Lucene tiers serve per-patient queries well; deployments that need cross-patient semantic search must use Elasticsearch. This is documented; it is not a hidden limit.
+- Keyword search quality varies by tier. MySQL FULLTEXT is weaker than Lucene/ES BM25 for clinical text (no concept-aware tokenization, weaker term-frequency model). The MySQL tier is functional for keyword search but not optimal.
+- The SPI is part of querystore's *internal* contract. It is not a public extension surface — modules that want to plug in a custom backend can, but querystore does not commit to backward compatibility on the SPI the way it does on the consumer-facing `QueryStoreService` ([Decision 14](#decision-14-authorization-and-consumer-api-surface)).
+- Migrating between tiers is a re-index operation, coordinated with the [Re-index / alias strategy](#re-index--alias-strategy) open question.
+- The `openmrs_<type>` naming convention from [Decision 4](#decision-4-per-type-indices-over-a-single-index) applies to the per-type separation primitive in each backend (ES index, Lucene directory, MySQL table). The prefix has cross-backend value: it scopes ES indices in shared clusters and prevents MySQL table-name collisions in core's database.
+- Operational documentation must cover all three tiers — install steps, sizing guidance, "when to upgrade tier" signals (e.g., dataset size thresholds, query-latency degradation patterns).
 
 ---
 
@@ -125,30 +147,40 @@ A dedicated vector database was rejected because it would only serve semantic se
 Accepted
 
 ### Context
-Data in OpenMRS spans multiple resource types: patients, encounters, visits, observations, conditions, diagnoses, drug orders, test orders, allergies, patient programs, and medication dispenses. These types have different fields and different query patterns. The data can be stored in a single Elasticsearch index with a `resource_type` discriminator or in separate per-type indices.
+Data in OpenMRS spans multiple resource types: patients, encounters, visits, observations, conditions, diagnoses, drug orders, test orders, allergies, patient programs, and medication dispenses. These types have different fields and different query patterns. The data can be stored in a single store with a `resource_type` discriminator column/field, or in separate per-type stores.
 
 ### Decision
-Use per-type indices (e.g., `openmrs_obs`, `openmrs_condition`, `openmrs_drug_order`, etc.) rather than a single mixed index. All index names follow `openmrs_<resource_type>` — the suffix equals the document's `resource_type` exactly — so the prefix functions as a stable cluster-wide namespace for everything this module produces and routing code can derive the index name from any document mechanically.
+Use per-type stores (e.g., `openmrs_obs`, `openmrs_condition`, `openmrs_drug_order`, etc.) rather than a single mixed store. All names follow `openmrs_<resource_type>` — the suffix equals the document's `resource_type` exactly — so the prefix functions as a stable namespace for everything this module produces and routing code can derive the store name from any document mechanically.
+
+The word "index" is used throughout this ADR as the generic term for the per-type separation primitive. It maps to the backend-specific construct under [Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations):
+
+| Backend | "index" means |
+|---|---|
+| Elasticsearch / OpenSearch | An ES/OS index |
+| Embedded Lucene | A separate Lucene `IndexWriter` / FSDirectory per type |
+| MySQL | A separate table per type |
+
+The naming convention is identical across all three.
 
 ### Rationale
-1. **No sparse fields.** Each index contains only the fields relevant to its type. A single index would carry empty drug order fields on every obs document and vice versa, wasting storage and slowing queries at scale.
+1. **No sparse fields.** Each index contains only the fields relevant to its type. A single mixed store would carry empty drug order fields on every obs document and vice versa, wasting storage and slowing queries at scale. (chartsearchai today uses a single MySQL table `chartsearchai_embedding` with a `resource_type` discriminator and a single `text_content` column — querystore deliberately does not inherit that shape, because per-type structured fields per [Decision 6](#decision-6-document-model--text-embeddings-and-structured-metadata) require per-type schemas.)
 2. **Better query performance.** Type-specific queries (e.g., "all patients with HbA1c above 7") only scan the relevant index rather than skipping irrelevant document types.
-3. **Better relevance scoring.** BM25 term frequencies are computed per index. Mixing clinical notes, lab results, and drug orders dilutes term frequencies across unrelated document types, hurting search quality.
-4. **Cross-type search is still easy.** Elasticsearch wildcard patterns (e.g., `openmrs_*`) allow querying across all types when needed, providing the same convenience as a single index.
+3. **Better relevance scoring.** BM25 term frequencies are computed per index. Mixing clinical notes, lab results, and drug orders dilutes term frequencies across unrelated document types, hurting search quality. This applies to Elasticsearch, OpenSearch, and Lucene; the MySQL FULLTEXT engine has analogous per-table statistics.
+4. **Cross-type search is still easy.** Wildcard patterns (e.g., `openmrs_*` in ES/OS, multi-directory readers in Lucene, `UNION ALL` over `openmrs_*` tables in MySQL) allow querying across all types when needed, providing the same convenience as a single store.
 5. **Future-proof for cross-patient search.** Per-patient chart search works fine with either approach since the patient_uuid filter narrows the scope. But cross-patient search at scale benefits significantly from type-specific indices.
 
 #### Why the `openmrs_` prefix
-The prefix scopes every index this module manages under a single cluster-wide namespace. This matters for four reasons:
+The prefix scopes every store this module manages under a single namespace. This matters for four reasons, each of which applies across all three backends:
 
-- **Cluster sharing.** Elasticsearch clusters are often shared with other applications, or with multiple OpenMRS environments (dev / staging / prod) on the same cluster. Generic names like `obs`, `patient`, or `report` would collide; `openmrs_` keeps OpenMRS data unambiguously identifiable.
+- **Namespace sharing.** Elasticsearch clusters are often shared with other applications, or with multiple OpenMRS environments (dev / staging / prod) on the same cluster. Generic names like `obs`, `patient`, or `report` would collide; `openmrs_` keeps OpenMRS data unambiguously identifiable. The same concern applies to the MySQL backend — querystore tables live in core's existing database alongside core's own tables, and the prefix prevents collisions there too.
 - **Reliable wildcard target.** `openmrs_*` matches every index this module produces and nothing else, making it the natural target for cross-type retrieval (the convention promoted by [Decision 13](#decision-13-module-extension-spi-service-provider-interface-for-custom-resource-types)) without having to enumerate names or risk pulling in unrelated indices.
-- **Index templates and lifecycle policies.** ES index templates apply by name pattern. A single template on `openmrs_*` propagates common settings — shard count, replicas, refresh interval, vector-index parameters — to every OpenMRS index, including module-contributed ones. Without the prefix, templates either get broader than intended or have to be maintained per name.
-- **Operational visibility.** A DBA scanning the cluster sees at a glance which indices belong to OpenMRS. Useful for capacity planning, audit, and incident response.
+- **Templates and lifecycle policies.** ES/OS index templates apply by name pattern. A single template on `openmrs_*` propagates common settings — shard count, replicas, refresh interval, vector-index parameters — to every OpenMRS index, including module-contributed ones. Without the prefix, templates either get broader than intended or have to be maintained per name. The Lucene and MySQL backends apply per-type settings in code rather than via templates, but the same prefix-based addressing makes "all OpenMRS stores" enumerable.
+- **Operational visibility.** A DBA scanning the cluster (or the database) sees at a glance which stores belong to OpenMRS. Useful for capacity planning, audit, and incident response.
 
 ### Consequences
-- More indices to manage, though an index template can share common settings across all `openmrs_*` indices.
-- Document writes must be routed to the correct index based on resource type.
-- Cross-type queries require multi-index search syntax.
+- More stores to manage, though an index template (ES/OS) or shared schema-creation routine (Lucene/MySQL) can share common settings across all `openmrs_*` stores.
+- Document writes must be routed to the correct store based on resource type. The backend SPI ([Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations)) hides this from consumers.
+- Cross-type queries require backend-specific multi-store syntax (multi-index search in ES/OS, multi-directory reader in Lucene, `UNION ALL` in MySQL). The SPI normalises this so consumers do not write backend-specific queries.
 
 ---
 
@@ -158,7 +190,7 @@ The prefix scopes every index this module manages under a single cluster-wide na
 Accepted
 
 ### Context
-Clinical records must be serialized into a text representation that is stored in Elasticsearch and used for two purposes: (1) as input to embedding models for vector generation, and (2) as content read by LLMs when generating answers. The format options are plain labeled text, JSON, XML, or FHIR JSON.
+Clinical records must be serialized into a text representation that is stored in the read store and used for two purposes: (1) as input to embedding models for vector generation, and (2) as content read by LLMs when generating answers. The format options are plain labeled text, JSON, XML, or FHIR JSON.
 
 ### Decision
 Serialize clinical records as labeled plain text.
@@ -184,7 +216,7 @@ Duration: 30 Day(s). Quantity: 60.0 Tablet(s). Action: NEW. Urgency: ROUTINE
 
 ### Consequences
 - A serializer must be implemented for each clinical resource type.
-- The plain text format is less machine-parseable than JSON — consumers that need structured access should use the structured metadata fields in the Elasticsearch document, not parse the text.
+- The plain text format is less machine-parseable than JSON — consumers that need structured access should use the structured metadata fields in the read-store document, not parse the text.
 - Changes to the serialization format require re-embedding and re-indexing affected records.
 
 ---
@@ -198,10 +230,10 @@ Accepted
 Each document in the query store needs to serve multiple purposes: semantic search, keyword search, structured filtering, LLM answer generation, and linking back to the source record in OpenMRS.
 
 ### Decision
-Each Elasticsearch document contains three components:
+Each read-store document contains three components:
 
 1. **Text chunk** — the plain text serialization of the clinical record.
-2. **Vector embedding** — a dense vector computed from the text chunk, stored in a `dense_vector` field.
+2. **Vector embedding** — a dense vector computed from the text chunk, stored in the backend's vector field type (`dense_vector` in Elasticsearch, `knn_vector` in OpenSearch, a Lucene `KnnFloatVectorField`, or a binary column in MySQL — see [Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations)).
 3. **Structured metadata** — typed fields for filtering and aggregation (patient_uuid, date, resource_type, resource_uuid, concept_name, and type-specific fields).
 
 Example documents:
@@ -681,7 +713,7 @@ Each component serves distinct purposes that the others cannot fulfill:
 - **Vector embedding** (`embedding`): Enables semantic similarity search. Without it, you can only do keyword matching.
 - **Structured metadata** (all other fields): Enables precise filtering, sorting, aggregation, and linking back to source records. Neither keyword nor semantic search can reliably answer queries like "labs from last 6 months with value above 7 at Kenyatta National Hospital."
 
-Elasticsearch's strength is that it can combine all three in a single query — kNN on the vector, BM25 on the text, and filters on the metadata — making the three-component model a natural fit.
+Elasticsearch and OpenSearch can combine all three in a single query — kNN on the vector, BM25 on the text, and filters on the metadata — making the three-component model a natural fit on the cluster tier. The Lucene and MySQL tiers achieve the same surface via in-process fusion at the service layer (see [Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations) and the [Backend SPI contract surface](#backend-spi-contract-surface) open question for how fusion is normalised across tiers).
 
 ### Consequences
 - Storage per document is larger than text-only or embedding-only approaches.
@@ -699,7 +731,7 @@ Accepted
 Clinical records have observation dates (when the record was created). These dates are important for clinical reasoning (e.g., "most recent lab result") but affect embedding quality.
 
 ### Decision
-Exclude observation dates from the text that is embedded. Include dates as structured metadata fields in the Elasticsearch document and prepend them to the text only at LLM prompt assembly time.
+Exclude observation dates from the text that is embedded. Include dates as structured metadata fields in the read-store document and prepend them to the text only at LLM prompt assembly time.
 
 - **For embedding**: `"Fasting blood glucose: 11.2 mmol/L"`
 - **For LLM prompt**: `"(2025-03-15) Fasting blood glucose: 11.2 mmol/L"`
@@ -745,16 +777,23 @@ Options considered:
 ### Decision
 Serialize concept names in the deployment's configured locale and use a multilingual embedding model (e.g., `multilingual-e5`) for vector generation.
 
+**The embedding provider is an SPI.** Querystore depends on an `EmbeddingProvider` interface that exposes `embed(text) -> float[]`, `embedQuery(text) -> float[]` (for dual-encoder models like MedCPT where queries and documents use different encoders), and `getDimensions()`. Querystore ships a default ONNX-based provider — pluggable to any BERT-class model file via configuration (`querystore.embedding.modelFilePath`, `querystore.embedding.vocabFilePath`) — and deployments may register a custom provider bean to swap in a different inference backend (remote API, GPU-accelerated, or specialised clinical model). The default model packaged with the module must satisfy the multilingual constraint stated in this decision.
+
+The embedding model identifier and its dimensions are part of the public contract surfaced through the SPI per [Decision 13](#decision-13-module-extension-spi-service-provider-interface-for-custom-resource-types) — every consumer that issues kNN queries must embed its query text with the same model querystore used at index time, or vectors are incomparable and results silently break.
+
 ### Rationale
 1. **Clinicians search in their own language.** A French-speaking clinician will type "glycémie" not "blood glucose." The serialized text and BM25 index should match the language they use.
 2. **Multilingual embedding models handle cross-language similarity.** Models like `multilingual-e5` are trained across 100+ languages and produce comparable vectors for semantically equivalent text regardless of language.
 3. **Single serialization per record keeps storage and indexing simple.** Storing multiple locale variants per record would multiply storage cost and complicate synchronization without proportional benefit.
 4. **Consistent with OpenMRS conventions.** OpenMRS already resolves concept names to the configured locale throughout its UI and APIs.
+5. **Pluggable provider, fixed contract.** Different deployments have different inference budgets — a small site may want a 384-dim CPU-friendly model, a research network may want a clinical-domain model, a centralised deployment may proxy to a remote embedding API. The SPI lets all of these coexist with one document model. chartsearchai's `OnnxEmbeddingProvider` already proves this pattern works in practice (model-agnostic, dual-encoder support, dimension auto-detection); querystore inherits that approach rather than reinventing it.
 
 ### Consequences
 - The embedding model must be multilingual. Monolingual models (e.g., English-only) should not be used.
 - Deployments that change their default locale after initial indexing will need to re-serialize and re-index existing records.
 - Cross-deployment searches (e.g., a research network spanning French and English sites) would require additional consideration, potentially storing an English canonical form alongside the localized text.
+- Swapping the embedding provider is a re-index event — the new model produces different vectors for the same text, and existing kNN results become incomparable to fresh queries until the index is rebuilt. This couples to the [Embedding model versioning](#embedding-model-versioning) and [Re-index / alias strategy](#re-index--alias-strategy) open questions.
+- The provider SPI is independent of the backend SPI ([Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations)). Choice of MySQL/Lucene/Elasticsearch does not constrain choice of embedding provider, and vice versa.
 
 ---
 
@@ -810,7 +849,7 @@ Three options were considered:
 
 | Option | Behavior on void event | Trade-off |
 |---|---|---|
-| Delete from index | Document is removed from Elasticsearch | Simplest reads; no audit on read side |
+| Delete from index | Document is removed from the read store | Simplest reads; no audit on read side |
 | Keep with `voided` flag | Document stays; every query must filter `voided=false` | Audit available on read side; every consumer must remember the filter |
 | Parallel audit index | Move voided documents to a sibling index (e.g., `openmrs_obs_voided`) | Clean separation; doubles index management |
 
@@ -936,7 +975,7 @@ Adopt the module extension SPI (Service Provider Interface) model. Querystore ex
 4. Receives a per-type index `openmrs_<resource_type>` under [Decision 4](#decision-4-per-type-indices-over-a-single-index)'s naming convention.
 
 Querystore retains ownership of the shared infrastructure:
-- Elasticsearch connection and index lifecycle (creation, mapping, alias management).
+- Backend connection and per-type store lifecycle (creation, mapping/schema, alias management) — abstracted by the backend SPI per [Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations) so the contributing module is unaware which tier is running.
 - The embedding pipeline ([Decision 8](#decision-8-locale-specific-serialization-with-multilingual-embeddings)). Modules provide text; querystore embeds. Modules do not pick their own embedding model.
 - Voiding ([Decision 10](#decision-10-voided-records--deleted-from-the-read-store-not-marked)) and retired-metadata ([Decision 11](#decision-11-retired-metadata--data-references-preserved-names-snapshotted)) handling.
 - Locale-aware serialization conventions ([Decision 8](#decision-8-locale-specific-serialization-with-multilingual-embeddings)).
@@ -975,7 +1014,7 @@ The ADR specifies what is indexed and how data flows in, but says nothing about 
 The chartsearchai migration ([migration-chartsearchai.md](./migration-chartsearchai.md)) makes this concrete. chartsearchai today enforces an "AI Query Patient Data" privilege plus core's per-patient access checks. Without an authorization model on the querystore side, a migration either pushes those checks onto every consumer (fragile, easy to forget) or runs unauthenticated queries against patient data — the leakage failure mode the original Authorization open question flagged.
 
 ### Decision
-1. **Primary consumer surface for v1 is a Java service** (`QueryStoreService`) running in-process inside the OpenMRS JVM. Elasticsearch is internal infrastructure; consumers never query it directly. REST, FHIR Search, and other HTTP-fronted surfaces are out of v1 scope but explicitly additive — they layer on top of the same Java service and apply the same enforcement boundary at their own entry points.
+1. **Primary consumer surface for v1 is a Java service** (`QueryStoreService`) running in-process inside the OpenMRS JVM. The backend (Elasticsearch, embedded Lucene, or MySQL — see [Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations)) is internal infrastructure; consumers never query it directly. REST, FHIR Search, and other HTTP-fronted surfaces are out of v1 scope but explicitly additive — they layer on top of the same Java service and apply the same enforcement boundary at their own entry points.
 
 2. **Authorization is declared on the service interface via `@Authorized` annotations.** Read methods on `QueryStoreService` carry OpenMRS's `@Authorized` annotation naming the required privilege; core's `AuthorizationAdvice` AOP enforces it before the method body runs and throws `APIAuthenticationException` when the caller lacks it. v1 read methods (`search`, `searchByPatient`) require `PrivilegeConstants.GET_PATIENTS` — the same privilege `PatientService.getPatient` requires. Per-patient post-filtering is *not* applied in v1 — see consequences.
 
@@ -1012,6 +1051,7 @@ Design questions that have been recognized but not yet resolved. Each item below
 - [Long-text chunking for embeddings](#long-text-chunking-for-embeddings)
 - [Complex obs handling](#complex-obs-handling)
 - [Re-index / alias strategy](#re-index--alias-strategy)
+- [Backend SPI contract surface](#backend-spi-contract-surface)
 - [Name-refresh re-projection](#name-refresh-re-projection)
 - [PII and data-minimization scopes](#pii-and-data-minimization-scopes)
 - [Patient merge handling](#patient-merge-handling)
@@ -1061,7 +1101,19 @@ Sub-questions:
 A decision should pick the per-handler behavior, the default for unknown handlers, the v1 scope for each modality, and the migration path if multimodal is enabled later.
 
 ### Re-index / alias strategy
-Multiple decisions ([8](#decision-8-locale-specific-serialization-with-multilingual-embeddings), [11](#decision-11-retired-metadata--data-references-preserved-names-snapshotted), and any future serializer change) imply re-indexing as the remedy. Doing this without downtime requires writing through aliases (e.g., `openmrs_obs` → `openmrs_obs_v1`, with atomic swap to `_v2` after backfill). No decision covers the alias convention, the cutover protocol, or — given [Decision 12](#decision-12-sync-mechanism--events-first-aop-as-last-resort-gap-filler) — how the live event subscription is coordinated during cutover (events arriving mid-rebuild must land somewhere: dual-write to old and new aliases, replay from a snapshot, or a controlled subscription pause). Several existing claims rely on this being possible. The lighter-weight [Name-refresh re-projection](#name-refresh-re-projection) path below is a per-document partial-update operation and does not strictly require alias cutover, but it shares operational concerns (bounded fan-out throughput, coordination with concurrent event-driven updates, failure recovery) with the full re-index path and is best designed alongside it.
+Multiple decisions ([8](#decision-8-locale-specific-serialization-with-multilingual-embeddings), [11](#decision-11-retired-metadata--data-references-preserved-names-snapshotted), and any future serializer change) imply re-indexing as the remedy. Doing this without downtime requires writing through aliases (e.g., `openmrs_obs` → `openmrs_obs_v1`, with atomic swap to `_v2` after backfill). No decision covers the alias convention, the cutover protocol, or — given [Decision 12](#decision-12-sync-mechanism--events-first-aop-as-last-resort-gap-filler) — how the live event subscription is coordinated during cutover (events arriving mid-rebuild must land somewhere: dual-write to old and new aliases, replay from a snapshot, or a controlled subscription pause). Several existing claims rely on this being possible. The lighter-weight [Name-refresh re-projection](#name-refresh-re-projection) path below is a per-document partial-update operation and does not strictly require alias cutover, but it shares operational concerns (bounded fan-out throughput, coordination with concurrent event-driven updates, failure recovery) with the full re-index path and is best designed alongside it. Tier migration under [Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations) (e.g., a deployment outgrowing the MySQL tier and switching to Elasticsearch) is structurally a re-index from one backend to another and shares the same coordination problem; the alias convention chosen here should generalise across backends.
+
+### Backend SPI contract surface
+[Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations) makes the backend pluggable but defers the exact SPI contract to implementation work. The contract becomes load-bearing as soon as the second reference backend is implemented — every tier-specific API (ES retriever DSL, Lucene `IndexWriter`, MySQL JDBC) needs a normalised abstraction, and tier-specific capability gaps (cross-patient kNN at scale, native RRF vs. in-process fusion, FULLTEXT vs BM25 quality) need explicit handling. Decision needed on:
+
+- **Operation surface.** What the SPI must expose: per-type schema/mapping creation, document upsert, single-document delete by `resource_uuid`, bulk delete by `patient_uuid` (used by [Patient merge handling](#patient-merge-handling) and full per-patient re-projection), bulk index for [Initial backfill / bootstrap](#initial-backfill--bootstrap), BM25 search, kNN search, hybrid search, structured filter pushdown (range filters on `date`, term filters on coded UUIDs per [Decision 9](#decision-9-coded-fields--store-both-uuid-and-name)), pagination, and health/diagnostic queries. Whether aggregations (counts, group-by) are in v1 or deferred is itself part of this decision.
+- **Hybrid fusion location.** Elasticsearch exposes a native RRF retriever; OpenSearch uses a hybrid query plus a search-pipeline; Lucene and MySQL have no native fusion. Two viable shapes: (a) the SPI returns separately-ranked BM25 and kNN result sets and querystore's service layer fuses uniformly in-process, or (b) the SPI itself surfaces `hybridSearch(...)` and each backend implements fusion natively where it can. Option (b) is faster on ES; option (a) is uniform and easier to test. chartsearchai today does (a) for Lucene/hybrid and (b) for ES/OS — querystore needs to pick one shape across all tiers or accept that the SPI is non-uniform.
+- **Capability negotiation.** How the SPI signals that a backend doesn't support a query pattern at scale (e.g., MySQL cross-patient kNN over millions of obs). Hard error from the backend, soft warning logged by the service layer, or an explicit `BackendCapabilities` query the service consults before dispatching the call?
+- **Score semantics.** BM25 scores, cosine similarities, and RRF scores are not directly comparable across backends or even across queries on the same backend. What the SPI returns — raw backend scores, normalised scores, ranks only, or all three — affects how consumers reason about result quality and confidence across tiers.
+- **Bulk-write success semantics.** Per-document errors during a bulk write are silently lost in chartsearchai's current ES indexer (the bulk *response* is logged but per-doc failures are not surfaced as errors). The SPI must specify what success / partial-success / failure looks like uniformly so the sync pipeline ([Decision 12](#decision-12-sync-mechanism--events-first-aop-as-last-resort-gap-filler)) and reconciliation ([Sync reliability and reconciliation](#sync-reliability-and-reconciliation)) can rely on it.
+- **Transactional boundaries.** MySQL writes can participate in core's transactions; Lucene's `IndexWriter` has its own commit boundary; ES has no transaction concept. The SPI must define what "the write succeeded" means uniformly enough that callers don't need to know which backend they're on.
+
+Out of scope for this open question: operational tier-selection guidance ("when do we move from MySQL to Lucene to Elasticsearch?") — that lives in deployment documentation, not the SPI.
 
 ### Name-refresh re-projection
 [Decision 11](#decision-11-retired-metadata--data-references-preserved-names-snapshotted) accepts denormalized-name staleness as policy and names a full resource-type re-index as the remedy when freshness matters. That remedy is heavy: a full re-index of `openmrs_obs` in any decent-sized site is millions of documents of embedding-generation cost, so in practice it is unlikely to be invoked routinely, and renames may sit unfixed for long periods. A lighter-weight path would be a **name-refresh re-projection**, triggered by a metadata-rename event: fan out across the documents that reference the renamed UUID and (1) re-render the document's text from its existing structured fields with the new name, (2) re-embed the new text, and (3) update the `*_name` field to match. This is *not* "re-embed only" — the text has to change too, because document text and embedding vector must remain consistent ([Decision 6](#decision-6-document-model--text-embeddings-and-structured-metadata)). The savings versus a full re-index come from (a) not re-fetching the underlying record from core (the obs / encounter / visit row hasn't changed; only the metadata it references did) and (b) scoping to documents that reference the renamed UUID rather than the entire resource type. For small-cardinality renames (a location, an encounter type, an obscure concept) the cost gap is orders of magnitude. Decision needed on: whether to build it (gate: whether the chartsearchai eval workflow exposes meaningful rename-driven recall degradation in practice), how to bound fan-out for large-cardinality renames (a popular concept rename can still touch millions of obs), and how it coordinates with the [Re-index / alias strategy](#re-index--alias-strategy) open question — strictly, name-refresh is a per-document partial update that does not require alias cutover, but it shares operational concerns (throughput, concurrent-event coordination, failure recovery) with the full re-index path and is best designed alongside it.
