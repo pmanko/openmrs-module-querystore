@@ -17,4 +17,42 @@
 
     <updateURL>https://modules.openmrs.org/modules/download/${project.parent.artifactId}/update.rdf</updateURL>
 
+    <globalProperty>
+        <property>querystore.embedding.providerBean</property>
+        <defaultValue>querystore.embedding.onnx</defaultValue>
+        <description>Spring bean name of the active EmbeddingProvider. Modules may register
+            additional EmbeddingProvider beans, but selecting which is active is a deployment
+            decision. See ADR Decision 8.</description>
+    </globalProperty>
+
+    <globalProperty>
+        <property>querystore.embedding.modelFilePath</property>
+        <defaultValue></defaultValue>
+        <description>Path (relative to the OpenMRS application data directory) to the ONNX model
+            file used by the default embedding provider. Required when the ONNX provider is
+            active. The model must be multilingual per ADR Decision 8.</description>
+    </globalProperty>
+
+    <globalProperty>
+        <property>querystore.embedding.queryModelFilePath</property>
+        <defaultValue></defaultValue>
+        <description>Optional path to a separate query-encoder ONNX model. Set only for
+            dual-encoder models such as MedCPT; leave empty for single-encoder models.</description>
+    </globalProperty>
+
+    <globalProperty>
+        <property>querystore.embedding.vocabFilePath</property>
+        <defaultValue></defaultValue>
+        <description>Path (relative to the OpenMRS application data directory) to the WordPiece
+            vocabulary file (vocab.txt) for the configured ONNX model.</description>
+    </globalProperty>
+
+    <globalProperty>
+        <property>querystore.embedding.maxSequenceLength</property>
+        <defaultValue>512</defaultValue>
+        <description>Maximum number of tokens passed to the embedding model. Inputs beyond this
+            length are silently truncated; the chunking layer above the tokenizer is the right
+            place to redesign that behavior.</description>
+    </globalProperty>
+
 </module>

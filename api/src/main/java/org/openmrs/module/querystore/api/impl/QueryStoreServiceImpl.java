@@ -22,14 +22,14 @@ import org.openmrs.module.querystore.backend.BackendStore;
 import org.openmrs.module.querystore.backend.Filter;
 import org.openmrs.module.querystore.backend.SearchRequest;
 import org.openmrs.module.querystore.backend.SearchResult;
-import org.openmrs.module.querystore.embedding.EmbeddingClient;
+import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 
 /**
  * Default {@link QueryStoreService}. Delegates writes to the configured {@link BackendStore} and
  * fuses BM25 + kNN ranks at the service layer using {@link ReciprocalRankFusion} (ADR Decision 3
- * SPI sub-point 2). The {@link EmbeddingClient} dependency is optional: when null, search degrades
- * to BM25-only.
+ * SPI sub-point 2). The {@link EmbeddingProvider} dependency is optional: when null, search
+ * degrades to BM25-only.
  */
 public class QueryStoreServiceImpl extends BaseOpenmrsService implements QueryStoreService {
 
@@ -37,14 +37,14 @@ public class QueryStoreServiceImpl extends BaseOpenmrsService implements QuerySt
 
 	private BackendStore backend;
 
-	private EmbeddingClient embeddingClient;
+	private EmbeddingProvider embeddingProvider;
 
 	public void setBackend(BackendStore backend) {
 		this.backend = backend;
 	}
 
-	public void setEmbeddingClient(EmbeddingClient embeddingClient) {
-		this.embeddingClient = embeddingClient;
+	public void setEmbeddingProvider(EmbeddingProvider embeddingProvider) {
+		this.embeddingProvider = embeddingProvider;
 	}
 
 	@Override
@@ -96,10 +96,10 @@ public class QueryStoreServiceImpl extends BaseOpenmrsService implements QuerySt
 		}
 		SearchResult bm25 = backend.bm25(bm25Req.build());
 
-		if (embeddingClient == null) {
+		if (embeddingProvider == null) {
 			return toDocuments(bm25);
 		}
-		float[] queryVector = embeddingClient.embed(query);
+		float[] queryVector = embeddingProvider.embedQuery(query);
 		SearchRequest.Builder knnReq = SearchRequest.builder().queryText(query).queryVector(queryVector).limit(limit);
 		if (scope != null) {
 			knnReq.filter(scope);

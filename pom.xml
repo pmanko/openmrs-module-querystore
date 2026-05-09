@@ -45,6 +45,7 @@
 
         <openMRSVersion>2.8.0</openMRSVersion>
         <elasticsearchVersion>8.13.4</elasticsearchVersion>
+        <onnxruntimeVersion>1.24.3</onnxruntimeVersion>
 
         <junitVersion>4.13.2</junitVersion>
         <mockitoVersion>4.11.0</mockitoVersion>
@@ -92,6 +93,12 @@
                 <groupId>co.elastic.clients</groupId>
                 <artifactId>elasticsearch-java</artifactId>
                 <version>${elasticsearchVersion}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>com.microsoft.onnxruntime</groupId>
+                <artifactId>onnxruntime</artifactId>
+                <version>${onnxruntimeVersion}</version>
             </dependency>
 
             <dependency>

@@ -16,9 +16,16 @@
         <constructor-arg ref="dataSource"/>
     </bean>
 
+    <bean id="querystore.embedding.onnx"
+          class="org.openmrs.module.querystore.embedding.OnnxEmbeddingProvider"/>
+
+    <bean id="querystore.embedding.dispatcher"
+          class="org.openmrs.module.querystore.embedding.ConfiguredEmbeddingProvider"/>
+
     <bean id="queryStoreService"
           class="org.openmrs.module.querystore.api.impl.QueryStoreServiceImpl">
         <property name="backend" ref="querystore.backend"/>
+        <property name="embeddingProvider" ref="querystore.embedding.dispatcher"/>
     </bean>
 
     <bean parent="serviceContext">
