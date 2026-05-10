@@ -86,6 +86,16 @@ public final class QueryStoreConstants {
 	public static final String FIELD_DATE_STOPPED = "date_stopped";
 	public static final String FIELD_AUTO_EXPIRE_DATE = "auto_expire_date";
 
+	public static final String FIELD_DRUG_ORDER_UUID = "drug_order_uuid";
+	public static final String FIELD_DATE_HANDED_OVER = "date_handed_over";
+	public static final String FIELD_WAS_SUBSTITUTED = "was_substituted";
+	public static final String FIELD_SUBSTITUTION_TYPE_UUID = "substitution_type_uuid";
+	public static final String FIELD_SUBSTITUTION_TYPE = "substitution_type";
+	public static final String FIELD_SUBSTITUTION_REASON_UUID = "substitution_reason_uuid";
+	public static final String FIELD_SUBSTITUTION_REASON = "substitution_reason";
+	public static final String FIELD_DISPENSER_UUID = "dispenser_uuid";
+	public static final String FIELD_DISPENSER_NAME = "dispenser_name";
+
 	public static final String FIELD_ENCOUNTER_UUID = "encounter_uuid";
 	public static final String FIELD_ENCOUNTER_TYPE_UUID = "encounter_type_uuid";
 	public static final String FIELD_ENCOUNTER_TYPE_NAME = "encounter_type_name";
