@@ -112,17 +112,16 @@ public abstract class AbstractRecordSerializer<T> implements ClinicalRecordSeria
 
 		putUuidAndName(doc, FIELD_FORM_UUID, FIELD_FORM_NAME, encounter.getForm());
 		putUuidAndName(doc, FIELD_LOCATION_UUID, FIELD_LOCATION_NAME, encounter.getLocation());
-
-		Provider provider = pickActiveProvider(encounter);
-		if (provider != null) {
-			doc.putMetadata(FIELD_PROVIDER_UUID, provider.getUuid());
-			if (provider.getName() != null) {
-				doc.putMetadata(FIELD_PROVIDER_NAME, provider.getName());
-			}
-		}
+		putUuidAndName(doc, FIELD_PROVIDER_UUID, FIELD_PROVIDER_NAME, pickActiveProvider(encounter));
 	}
 
-	private static void putUuidAndName(QueryDocument doc, String uuidKey, String nameKey, OpenmrsMetadata ref) {
+	/**
+	 * Writes a UUID + name pair for any {@link OpenmrsMetadata}-typed reference (Form, Location,
+	 * Provider, CareSetting, EncounterType, etc.). No-ops on null. The name is read via the
+	 * entity's own {@code getName()}; for Concept references the name needs locale-aware
+	 * resolution and should be written via {@link #putConceptUuidAndName} instead.
+	 */
+	protected static void putUuidAndName(QueryDocument doc, String uuidKey, String nameKey, OpenmrsMetadata ref) {
 		if (ref == null) {
 			return;
 		}
@@ -130,6 +129,36 @@ public abstract class AbstractRecordSerializer<T> implements ClinicalRecordSeria
 		if (ref.getName() != null) {
 			doc.putMetadata(nameKey, ref.getName());
 		}
+	}
+
+	/**
+	 * Writes a UUID + name pair for a {@link Concept} reference, e.g. dose units, route,
+	 * specimen source, substitution type. The caller resolves the locale-aware preferred name
+	 * once (typically via {@link ConceptNameUtil#getPreferredNameOrNull}) and passes it through,
+	 * preserving the single-walk-per-concept invariant. No-ops when the concept is null.
+	 */
+	protected static void putConceptUuidAndName(QueryDocument doc, String uuidKey, String nameKey,
+	                                            Concept concept, String resolvedName) {
+		if (concept == null) {
+			return;
+		}
+		doc.putMetadata(uuidKey, concept.getUuid());
+		if (resolvedName != null) {
+			doc.putMetadata(nameKey, resolvedName);
+		}
+	}
+
+	/**
+	 * Trims a free-text string and returns {@code null} when empty or null, so callers can
+	 * null-check once instead of separately guarding null and emptiness, and can reuse the
+	 * trimmed result across text composition and metadata writes without re-trimming.
+	 */
+	protected static String trimToNull(String s) {
+		if (s == null) {
+			return null;
+		}
+		String t = s.trim();
+		return t.isEmpty() ? null : t;
 	}
 
 	private static Provider pickActiveProvider(Encounter encounter) {

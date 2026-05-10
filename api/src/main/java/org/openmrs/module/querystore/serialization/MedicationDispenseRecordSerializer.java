@@ -41,10 +41,8 @@ import java.util.Date;
 import org.openmrs.Concept;
 import org.openmrs.Drug;
 import org.openmrs.DrugOrder;
-import org.openmrs.Location;
 import org.openmrs.MedicationDispense;
 import org.openmrs.OrderFrequency;
-import org.openmrs.Provider;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.openmrs.module.querystore.util.ConceptNameUtil;
 import org.openmrs.module.querystore.util.DateFormatUtil;
@@ -104,11 +102,11 @@ public class MedicationDispenseRecordSerializer extends AbstractRecordSerializer
 		Concept route = dispense.getRoute();
 		Concept quantityUnits = dispense.getQuantityUnits();
 		OrderFrequency frequency = dispense.getFrequency();
-		String statusName = conceptName(statusConcept);
-		String doseUnitsName = conceptName(doseUnits);
-		String routeName = conceptName(route);
-		String frequencyName = frequency != null ? conceptName(frequency.getConcept()) : null;
-		String quantityUnitsName = conceptName(quantityUnits);
+		String statusName = ConceptNameUtil.getPreferredNameOrNull(statusConcept);
+		String doseUnitsName = ConceptNameUtil.getPreferredNameOrNull(doseUnits);
+		String routeName = ConceptNameUtil.getPreferredNameOrNull(route);
+		String frequencyName = frequency != null ? ConceptNameUtil.getPreferredNameOrNull(frequency.getConcept()) : null;
+		String quantityUnitsName = ConceptNameUtil.getPreferredNameOrNull(quantityUnits);
 		String dateHandedOverText = dispense.getDateHandedOver() != null
 		        ? DateFormatUtil.formatDate(dispense.getDateHandedOver()) : null;
 		Double dose = dispense.getDose();
@@ -161,8 +159,8 @@ public class MedicationDispenseRecordSerializer extends AbstractRecordSerializer
 		putSubstitutionFields(doc, dispense);
 
 		putEncounterContext(doc, dispense.getEncounter());
-		putLocationOverride(doc, dispense.getLocation());
-		putDispenser(doc, dispense.getDispenser());
+		putUuidAndName(doc, FIELD_LOCATION_UUID, FIELD_LOCATION_NAME, dispense.getLocation());
+		putUuidAndName(doc, FIELD_DISPENSER_UUID, FIELD_DISPENSER_NAME, dispense.getDispenser());
 	}
 
 	private static String buildText(String displayName, Double dose, Double quantity,
@@ -212,56 +210,10 @@ public class MedicationDispenseRecordSerializer extends AbstractRecordSerializer
 		}
 		Concept substitutionType = dispense.getSubstitutionType();
 		putConceptUuidAndName(doc, FIELD_SUBSTITUTION_TYPE_UUID, FIELD_SUBSTITUTION_TYPE,
-		        substitutionType, conceptName(substitutionType));
+		        substitutionType, ConceptNameUtil.getPreferredNameOrNull(substitutionType));
 		Concept substitutionReason = dispense.getSubstitutionReason();
 		putConceptUuidAndName(doc, FIELD_SUBSTITUTION_REASON_UUID, FIELD_SUBSTITUTION_REASON,
-		        substitutionReason, conceptName(substitutionReason));
+		        substitutionReason, ConceptNameUtil.getPreferredNameOrNull(substitutionReason));
 	}
 
-	private static void putConceptUuidAndName(QueryDocument doc, String uuidKey, String nameKey,
-	                                          Concept concept, String resolvedName) {
-		if (concept == null) {
-			return;
-		}
-		doc.putMetadata(uuidKey, concept.getUuid());
-		if (resolvedName != null) {
-			doc.putMetadata(nameKey, resolvedName);
-		}
-	}
-
-	private static void putLocationOverride(QueryDocument doc, Location location) {
-		if (location == null) {
-			return;
-		}
-		doc.putMetadata(FIELD_LOCATION_UUID, location.getUuid());
-		if (location.getName() != null) {
-			doc.putMetadata(FIELD_LOCATION_NAME, location.getName());
-		}
-	}
-
-	private static void putDispenser(QueryDocument doc, Provider dispenser) {
-		if (dispenser == null) {
-			return;
-		}
-		doc.putMetadata(FIELD_DISPENSER_UUID, dispenser.getUuid());
-		if (dispenser.getName() != null) {
-			doc.putMetadata(FIELD_DISPENSER_NAME, dispenser.getName());
-		}
-	}
-
-	private static String conceptName(Concept concept) {
-		if (concept == null) {
-			return null;
-		}
-		String name = ConceptNameUtil.getPreferredName(concept);
-		return name.isEmpty() ? null : name;
-	}
-
-	private static String trimToNull(String s) {
-		if (s == null) {
-			return null;
-		}
-		String t = s.trim();
-		return t.isEmpty() ? null : t;
-	}
 }

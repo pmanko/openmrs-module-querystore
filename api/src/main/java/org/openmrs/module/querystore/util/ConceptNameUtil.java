@@ -46,6 +46,17 @@ public final class ConceptNameUtil {
 		return name != null && name.getName() != null ? name.getName() : "";
 	}
 
+	/**
+	 * Variant of {@link #getPreferredName(Concept)} that returns {@code null} when the concept is
+	 * null or has no usable name in the active locale, instead of an empty string. Callers that
+	 * write the name to optional metadata fields prefer this shape — they can null-check once
+	 * and skip both the lookup and the write.
+	 */
+	public static String getPreferredNameOrNull(Concept concept) {
+		String name = getPreferredName(concept);
+		return name.isEmpty() ? null : name;
+	}
+
 	public static List<String> getSynonyms(Concept concept) {
 		return getSynonyms(concept, getPreferredName(concept));
 	}

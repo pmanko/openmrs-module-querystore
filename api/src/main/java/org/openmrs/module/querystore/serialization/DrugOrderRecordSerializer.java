@@ -46,7 +46,6 @@ import org.openmrs.Drug;
 import org.openmrs.DrugOrder;
 import org.openmrs.Order;
 import org.openmrs.OrderFrequency;
-import org.openmrs.Provider;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.openmrs.module.querystore.util.ConceptNameUtil;
 import org.openmrs.module.querystore.util.DateFormatUtil;
@@ -99,15 +98,16 @@ public class DrugOrderRecordSerializer extends AbstractRecordSerializer<DrugOrde
 			return;
 		}
 
-		String doseUnitsName = unitName(order.getDoseUnits());
-		String routeName = unitName(order.getRoute());
+		String doseUnitsName = ConceptNameUtil.getPreferredNameOrNull(order.getDoseUnits());
+		String routeName = ConceptNameUtil.getPreferredNameOrNull(order.getRoute());
 		OrderFrequency frequency = order.getFrequency();
 		// Read the frequency name via its wrapped concept rather than OrderFrequency.getName(),
 		// which routes through Concept.getName() (no-arg) and requires the OpenMRS Context.
 		// ConceptNameUtil's locale resolution is Context-safe per its own contract.
-		String frequencyName = frequency != null ? unitName(frequency.getConcept()) : null;
-		String durationUnitsName = unitName(order.getDurationUnits());
-		String quantityUnitsName = unitName(order.getQuantityUnits());
+		String frequencyName = frequency != null
+		        ? ConceptNameUtil.getPreferredNameOrNull(frequency.getConcept()) : null;
+		String durationUnitsName = ConceptNameUtil.getPreferredNameOrNull(order.getDurationUnits());
+		String quantityUnitsName = ConceptNameUtil.getPreferredNameOrNull(order.getQuantityUnits());
 
 		String dateStoppedText = order.getDateStopped() != null
 		        ? DateFormatUtil.formatDate(order.getDateStopped()) : null;
@@ -128,8 +128,8 @@ public class DrugOrderRecordSerializer extends AbstractRecordSerializer<DrugOrde
 		if (order.getDose() != null) {
 			doc.putMetadata(FIELD_DOSE, order.getDose());
 		}
-		putUnitFields(doc, FIELD_DOSE_UNITS_UUID, FIELD_DOSE_UNITS, order.getDoseUnits(), doseUnitsName);
-		putUnitFields(doc, FIELD_ROUTE_UUID, FIELD_ROUTE, order.getRoute(), routeName);
+		putConceptUuidAndName(doc, FIELD_DOSE_UNITS_UUID, FIELD_DOSE_UNITS, order.getDoseUnits(), doseUnitsName);
+		putConceptUuidAndName(doc, FIELD_ROUTE_UUID, FIELD_ROUTE, order.getRoute(), routeName);
 		if (frequency != null) {
 			doc.putMetadata(FIELD_FREQUENCY_UUID, frequency.getUuid());
 			if (frequencyName != null) {
@@ -139,18 +139,20 @@ public class DrugOrderRecordSerializer extends AbstractRecordSerializer<DrugOrde
 		if (order.getDuration() != null) {
 			doc.putMetadata(FIELD_DURATION, order.getDuration());
 		}
-		putUnitFields(doc, FIELD_DURATION_UNITS_UUID, FIELD_DURATION_UNITS,
+		putConceptUuidAndName(doc, FIELD_DURATION_UNITS_UUID, FIELD_DURATION_UNITS,
 		        order.getDurationUnits(), durationUnitsName);
 		if (order.getQuantity() != null) {
 			doc.putMetadata(FIELD_QUANTITY, order.getQuantity());
 		}
-		putUnitFields(doc, FIELD_QUANTITY_UNITS_UUID, FIELD_QUANTITY_UNITS,
+		putConceptUuidAndName(doc, FIELD_QUANTITY_UNITS_UUID, FIELD_QUANTITY_UNITS,
 		        order.getQuantityUnits(), quantityUnitsName);
 
 		putOrderMetaFields(doc, order, dateStoppedText, autoExpireText);
 
 		putEncounterContext(doc, order.getEncounter());
-		putOrderer(doc, order.getOrderer());
+		// Order-family convention: orderer overrides encounter-derived provider when present
+		// (ADR Decision 6, Serializer conventions).
+		putUuidAndName(doc, FIELD_PROVIDER_UUID, FIELD_PROVIDER_NAME, order.getOrderer());
 	}
 
 	private static String buildText(String displayName, DrugOrder order, String doseUnitsName,
@@ -271,40 +273,4 @@ public class DrugOrderRecordSerializer extends AbstractRecordSerializer<DrugOrde
 		}
 	}
 
-	private static void putUnitFields(QueryDocument doc, String uuidKey, String nameKey,
-	                                  Concept unit, String resolvedName) {
-		if (unit == null) {
-			return;
-		}
-		doc.putMetadata(uuidKey, unit.getUuid());
-		if (resolvedName != null) {
-			doc.putMetadata(nameKey, resolvedName);
-		}
-	}
-
-	private static void putOrderer(QueryDocument doc, Provider orderer) {
-		if (orderer == null) {
-			return;
-		}
-		doc.putMetadata(FIELD_PROVIDER_UUID, orderer.getUuid());
-		if (orderer.getName() != null) {
-			doc.putMetadata(FIELD_PROVIDER_NAME, orderer.getName());
-		}
-	}
-
-	private static String unitName(Concept unit) {
-		if (unit == null) {
-			return null;
-		}
-		String name = ConceptNameUtil.getPreferredName(unit);
-		return name.isEmpty() ? null : name;
-	}
-
-	private static String trimToNull(String s) {
-		if (s == null) {
-			return null;
-		}
-		String t = s.trim();
-		return t.isEmpty() ? null : t;
-	}
 }

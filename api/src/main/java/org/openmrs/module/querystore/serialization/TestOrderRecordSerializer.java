@@ -30,7 +30,6 @@ import java.util.Date;
 import org.openmrs.CareSetting;
 import org.openmrs.Concept;
 import org.openmrs.Order;
-import org.openmrs.Provider;
 import org.openmrs.ServiceOrder;
 import org.openmrs.TestOrder;
 import org.openmrs.module.querystore.model.QueryDocument;
@@ -83,7 +82,7 @@ public class TestOrderRecordSerializer extends AbstractRecordSerializer<TestOrde
 		}
 
 		Concept specimenSource = order.getSpecimenSource();
-		String specimenSourceName = conceptName(specimenSource);
+		String specimenSourceName = ConceptNameUtil.getPreferredNameOrNull(specimenSource);
 		String clinicalHistory = trimToNull(order.getClinicalHistory());
 		String instructions = trimToNull(order.getInstructions());
 		ServiceOrder.Laterality laterality = order.getLaterality();
@@ -135,7 +134,9 @@ public class TestOrderRecordSerializer extends AbstractRecordSerializer<TestOrde
 		}
 
 		putEncounterContext(doc, order.getEncounter());
-		putOrderer(doc, order.getOrderer());
+		// Order-family convention: orderer overrides encounter-derived provider when present
+		// (ADR Decision 6, Serializer conventions).
+		putUuidAndName(doc, FIELD_PROVIDER_UUID, FIELD_PROVIDER_NAME, order.getOrderer());
 	}
 
 	private static String buildText(String preferredName, ServiceOrder.Laterality laterality,
@@ -165,40 +166,4 @@ public class TestOrderRecordSerializer extends AbstractRecordSerializer<TestOrde
 		return sb.toString();
 	}
 
-	private static void putConceptUuidAndName(QueryDocument doc, String uuidKey, String nameKey,
-	                                          Concept concept, String resolvedName) {
-		if (concept == null) {
-			return;
-		}
-		doc.putMetadata(uuidKey, concept.getUuid());
-		if (resolvedName != null) {
-			doc.putMetadata(nameKey, resolvedName);
-		}
-	}
-
-	private static void putOrderer(QueryDocument doc, Provider orderer) {
-		if (orderer == null) {
-			return;
-		}
-		doc.putMetadata(FIELD_PROVIDER_UUID, orderer.getUuid());
-		if (orderer.getName() != null) {
-			doc.putMetadata(FIELD_PROVIDER_NAME, orderer.getName());
-		}
-	}
-
-	private static String conceptName(Concept concept) {
-		if (concept == null) {
-			return null;
-		}
-		String name = ConceptNameUtil.getPreferredName(concept);
-		return name.isEmpty() ? null : name;
-	}
-
-	private static String trimToNull(String s) {
-		if (s == null) {
-			return null;
-		}
-		String t = s.trim();
-		return t.isEmpty() ? null : t;
-	}
 }
