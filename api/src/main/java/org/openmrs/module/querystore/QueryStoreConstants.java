@@ -109,6 +109,16 @@ public final class QueryStoreConstants {
 	public static final String FIELD_SEVERITY = "severity";
 	public static final String FIELD_REACTIONS = "reactions";
 
+	public static final String FIELD_PROGRAM_UUID = "program_uuid";
+	public static final String FIELD_PROGRAM_NAME = "program_name";
+	public static final String FIELD_ENROLLMENT_DATE = "enrollment_date";
+	public static final String FIELD_COMPLETION_DATE = "completion_date";
+	public static final String FIELD_ACTIVE = "active";
+	public static final String FIELD_OUTCOME_UUID = "outcome_uuid";
+	public static final String FIELD_OUTCOME = "outcome";
+	public static final String FIELD_CURRENT_STATE_UUID = "current_state_uuid";
+	public static final String FIELD_CURRENT_STATE = "current_state";
+
 	public static final String FIELD_ENCOUNTER_UUID = "encounter_uuid";
 	public static final String FIELD_ENCOUNTER_TYPE_UUID = "encounter_type_uuid";
 	public static final String FIELD_ENCOUNTER_TYPE_NAME = "encounter_type_name";
