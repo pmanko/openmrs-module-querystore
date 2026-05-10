@@ -14,13 +14,14 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.openmrs.module.querystore.serialization.ConceptFixtures.concept;
+import static org.openmrs.module.querystore.serialization.DateFixtures.utcDate;
+import static org.openmrs.module.querystore.serialization.ProviderFixtures.providerNamed;
 
 import java.lang.reflect.Field;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.TimeZone;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -31,8 +32,6 @@ import org.openmrs.EncounterProvider;
 import org.openmrs.EncounterType;
 import org.openmrs.Order;
 import org.openmrs.Patient;
-import org.openmrs.Person;
-import org.openmrs.PersonName;
 import org.openmrs.Provider;
 import org.openmrs.ServiceOrder;
 import org.openmrs.TestOrder;
@@ -284,18 +283,6 @@ public class TestOrderRecordSerializerTest {
 		return order;
 	}
 
-	private static Provider providerNamed(String uuid, String givenName, String familyName) {
-		PersonName personName = new PersonName();
-		personName.setGivenName(givenName);
-		personName.setFamilyName(familyName);
-		Person person = new Person();
-		person.addName(personName);
-		Provider p = new Provider();
-		p.setUuid(uuid);
-		p.setPerson(person);
-		return p;
-	}
-
 	private static void setOrderField(Order order, String fieldName, Object value) {
 		try {
 			Field f = Order.class.getDeclaredField(fieldName);
@@ -305,12 +292,5 @@ public class TestOrderRecordSerializerTest {
 		catch (ReflectiveOperationException e) {
 			throw new AssertionError("Failed to set Order." + fieldName, e);
 		}
-	}
-
-	private static Date utcDate(int year, int month, int day) {
-		Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-		cal.set(year, month, day, 12, 0, 0);
-		cal.set(Calendar.MILLISECOND, 0);
-		return cal.getTime();
 	}
 }

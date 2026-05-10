@@ -17,6 +17,7 @@ import static org.junit.Assert.assertTrue;
 import static org.openmrs.module.querystore.serialization.ConceptFixtures.concept;
 import static org.openmrs.module.querystore.serialization.ConceptFixtures.conceptName;
 import static org.openmrs.module.querystore.serialization.ConceptFixtures.preferredName;
+import static org.openmrs.module.querystore.serialization.DateFixtures.utcDate;
 
 import java.util.Arrays;
 import java.util.Calendar;
@@ -24,7 +25,6 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
-import java.util.TimeZone;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -317,10 +317,4 @@ public class ObsRecordSerializerTest {
 		return obs;
 	}
 
-	private static Date utcDate(int year, int month, int day) {
-		Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-		cal.set(year, month, day, 12, 0, 0);
-		cal.set(Calendar.MILLISECOND, 0);
-		return cal.getTime();
-	}
 }
