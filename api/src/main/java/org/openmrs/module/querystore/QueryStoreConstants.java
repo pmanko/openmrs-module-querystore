@@ -55,6 +55,10 @@ public final class QueryStoreConstants {
 	public static final String FIELD_ADDITIONAL_DETAIL = "additional_detail";
 	public static final String FIELD_PREVIOUS_VERSION_UUID = "previous_version_uuid";
 
+	public static final String FIELD_CERTAINTY = "certainty";
+	public static final String FIELD_RANK = "rank";
+	public static final String FIELD_CONDITION_UUID = "condition_uuid";
+
 	public static final String FIELD_ENCOUNTER_UUID = "encounter_uuid";
 	public static final String FIELD_ENCOUNTER_TYPE_UUID = "encounter_type_uuid";
 	public static final String FIELD_ENCOUNTER_TYPE_NAME = "encounter_type_name";
