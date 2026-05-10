@@ -102,6 +102,13 @@ public final class QueryStoreConstants {
 	public static final String FIELD_SPECIMEN_SOURCE_UUID = "specimen_source_uuid";
 	public static final String FIELD_SPECIMEN_SOURCE_NAME = "specimen_source_name";
 
+	public static final String FIELD_ALLERGEN_UUID = "allergen_uuid";
+	public static final String FIELD_ALLERGEN_NAME = "allergen_name";
+	public static final String FIELD_ALLERGEN_NON_CODED = "allergen_non_coded";
+	public static final String FIELD_ALLERGEN_TYPE = "allergen_type";
+	public static final String FIELD_SEVERITY = "severity";
+	public static final String FIELD_REACTIONS = "reactions";
+
 	public static final String FIELD_ENCOUNTER_UUID = "encounter_uuid";
 	public static final String FIELD_ENCOUNTER_TYPE_UUID = "encounter_type_uuid";
 	public static final String FIELD_ENCOUNTER_TYPE_NAME = "encounter_type_name";
