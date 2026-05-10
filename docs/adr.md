@@ -715,6 +715,27 @@ Two cross-cutting conventions apply to documents that carry a primary clinical c
 
 **Embedding input construction.** For a coded record, the embedding input is `[obs_group_concept_name + " — "] + text + [" " + synonyms.join(" ")]` (bracketed parts conditional on presence). The stored `text` is unaffected. An indexer that has access to the structured fields can reconstruct the embedding input deterministically; round-tripping `text` through the embedder is therefore *not* the contract.
 
+### Serializer conventions
+
+Patterns common to all type-specific serializers, distilled from the Obs and Condition implementations. These are contract-level rules; the abstract base implements the template-method shape that enforces them.
+
+**Cross-cutting `date` source.** The cross-cutting `date` field uses the type's most clinically meaningful "this record was made" timestamp:
+- Types with a clinical-event time field (e.g., `obs_datetime` on Obs) use that.
+- Types without one (e.g., Condition) fall back to `dateCreated` (the audit field).
+- Onset, end, resolution, and other clinical-fact dates remain on dedicated metadata fields per [Decision 7](#decision-7-date-separation--excluded-from-embeddings-included-at-query-time) — they are *not* the cross-cutting `date`.
+
+**Free-text annotations are metadata-only.** Free-text clinician annotations — `comment` on obs, `additional_detail` on condition, and the equivalent on other types — are excluded from the stored `text` field but indexed as metadata for BM25 keyword matching. Citation-clean text is the contract; consumers that want the annotation render it from the metadata field at presentation time.
+
+**Coded-or-free-text fallback.** For types whose primary concept is wrapped in `CodedOrFreeText` (Condition, Diagnosis), the serializer resolves the display name as: coded concept's preferred name when present; otherwise the trimmed `non_coded` string. The non-coded string is also stored on the `non_coded` metadata field. The display name (coded or non-coded) is what appears in `text`; `concept_uuid`/`concept_name`/`synonyms` are populated only on the coded path.
+
+**Status enums.** OpenMRS status enums whose values are HL7-aligned (`Obs.Interpretation`, `Obs.Status`, `ConditionClinicalStatus`, `ConditionVerificationStatus`, etc.) are serialized via `enum.name()` directly. The HL7-aligned constants are stable across OpenMRS versions; downstream consumers query against the enum-name strings (e.g., `interpretation = "ABNORMAL"`).
+
+**Clinical-date labels in text.** Clinically significant dates appear in `text` as labeled clauses with stable label conventions: `Onset:` for onset, `Resolved:` for end/resolution, `Stopped:` for order discontinuation, `Enrolled:` for program enrollment. The labels are part of the `text` contract — they appear in LLM citations — so they are not free to reword per type.
+
+**Skip semantics.** A serializer returns `null` from `serialize()` when the record produces no useful document — typically when the resolved display name is empty (e.g., an obs with no value, a condition with neither coded nor non-coded text, an obs group parent whose own value is empty). The caller (sync pipeline / backfill task) filters out null documents.
+
+**Single-walk performance.** Each serializer walks its source record exactly once during `populate()`. The preferred concept name is resolved once and threaded into both the text composition and `putConceptFields` (rather than re-walking the names collection); date strings used in both `text` and metadata are formatted once and reused. This matters at bulk-backfill throughput where millions of records pass through the serializer.
+
 ### Field descriptions
 
 | Field | Purpose |
