@@ -145,6 +145,26 @@ public final class QueryStoreConstants {
 	public static final String FIELD_TYPE_NAME = "type_name";
 	public static final String FIELD_VALUE = "value";
 
+	public static final String FIELD_GIVEN_NAME = "given_name";
+	public static final String FIELD_MIDDLE_NAME = "middle_name";
+	public static final String FIELD_FAMILY_NAME = "family_name";
+	public static final String FIELD_GENDER = "gender";
+	public static final String FIELD_BIRTHDATE = "birthdate";
+	public static final String FIELD_BIRTHDATE_ESTIMATED = "birthdate_estimated";
+	public static final String FIELD_AGE_YEARS = "age_years";
+	public static final String FIELD_DEAD = "dead";
+	public static final String FIELD_DEATH_DATE = "death_date";
+	public static final String FIELD_CAUSE_OF_DEATH_UUID = "cause_of_death_uuid";
+	public static final String FIELD_CAUSE_OF_DEATH_NAME = "cause_of_death_name";
+	public static final String FIELD_IDENTIFIERS = "identifiers";
+	public static final String FIELD_ADDRESSES = "addresses";
+	public static final String FIELD_PREFERRED = "preferred";
+	public static final String FIELD_ADDRESS1 = "address1";
+	public static final String FIELD_CITY_VILLAGE = "city_village";
+	public static final String FIELD_STATE_PROVINCE = "state_province";
+	public static final String FIELD_POSTAL_CODE = "postal_code";
+	public static final String FIELD_COUNTRY = "country";
+
 	public static final String INDEX_OBS = INDEX_PREFIX + "obs";
 	public static final String INDEX_CONDITION = INDEX_PREFIX + "condition";
 	public static final String INDEX_DIAGNOSIS = INDEX_PREFIX + "diagnosis";
