@@ -9,28 +9,22 @@
  */
 package org.openmrs.module.querystore.bootstrap;
 
-import org.openmrs.Obs;
+import org.openmrs.Visit;
 import org.openmrs.api.db.hibernate.DbSessionFactory;
 import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
-import org.openmrs.module.querystore.serialization.ObsRecordSerializer;
+import org.openmrs.module.querystore.serialization.VisitRecordSerializer;
 
-public class ObsBootstrapper extends HibernateTypeBootstrapper<Obs> {
+public class VisitBootstrapper extends HibernateTypeBootstrapper<Visit> {
 
-	private final ObsRecordSerializer serializer;
+	private final VisitRecordSerializer serializer;
 
-	public ObsBootstrapper(ObsRecordSerializer serializer, DbSessionFactory sessionFactory) {
+	public VisitBootstrapper(VisitRecordSerializer serializer, DbSessionFactory sessionFactory) {
 		super(sessionFactory);
 		this.serializer = serializer;
 	}
 
 	@Override
-	protected ClinicalRecordSerializer<Obs> getSerializer() {
+	protected ClinicalRecordSerializer<Visit> getSerializer() {
 		return serializer;
-	}
-
-	@Override
-	protected String cursorDateExpr() {
-		// Obs.hbm.xml does not map dateChanged (OpenMRS 2.8.x); cursor uses dateCreated alone.
-		return "e.dateCreated";
 	}
 }

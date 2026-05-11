@@ -25,8 +25,38 @@
     <bean id="querystore.serializer.obs"
           class="org.openmrs.module.querystore.serialization.ObsRecordSerializer"/>
 
+    <bean id="querystore.serializer.encounter"
+          class="org.openmrs.module.querystore.serialization.EncounterRecordSerializer"/>
+
+    <bean id="querystore.serializer.visit"
+          class="org.openmrs.module.querystore.serialization.VisitRecordSerializer"/>
+
+    <bean id="querystore.serializer.patient"
+          class="org.openmrs.module.querystore.serialization.PatientRecordSerializer"/>
+
     <bean id="querystore.serializer.condition"
           class="org.openmrs.module.querystore.serialization.ConditionRecordSerializer"/>
+
+    <bean id="querystore.serializer.diagnosis"
+          class="org.openmrs.module.querystore.serialization.DiagnosisRecordSerializer"/>
+
+    <bean id="querystore.serializer.allergy"
+          class="org.openmrs.module.querystore.serialization.AllergyRecordSerializer"/>
+
+    <bean id="querystore.serializer.drug_order"
+          class="org.openmrs.module.querystore.serialization.DrugOrderRecordSerializer"/>
+
+    <bean id="querystore.serializer.test_order"
+          class="org.openmrs.module.querystore.serialization.TestOrderRecordSerializer"/>
+
+    <bean id="querystore.serializer.referral_order"
+          class="org.openmrs.module.querystore.serialization.ReferralOrderRecordSerializer"/>
+
+    <bean id="querystore.serializer.medication_dispense"
+          class="org.openmrs.module.querystore.serialization.MedicationDispenseRecordSerializer"/>
+
+    <bean id="querystore.serializer.program"
+          class="org.openmrs.module.querystore.serialization.PatientProgramRecordSerializer"/>
 
     <bean id="queryStoreService"
           class="org.openmrs.module.querystore.api.impl.QueryStoreServiceImpl">
@@ -45,13 +75,96 @@
         <constructor-arg ref="dbSessionFactory"/>
     </bean>
 
+    <bean id="querystore.bootstrap.encounter"
+          class="org.openmrs.module.querystore.bootstrap.EncounterBootstrapper">
+        <constructor-arg ref="querystore.serializer.encounter"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.visit"
+          class="org.openmrs.module.querystore.bootstrap.VisitBootstrapper">
+        <constructor-arg ref="querystore.serializer.visit"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.patient"
+          class="org.openmrs.module.querystore.bootstrap.PatientBootstrapper">
+        <constructor-arg ref="querystore.serializer.patient"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.condition"
+          class="org.openmrs.module.querystore.bootstrap.ConditionBootstrapper">
+        <constructor-arg ref="querystore.serializer.condition"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.diagnosis"
+          class="org.openmrs.module.querystore.bootstrap.DiagnosisBootstrapper">
+        <constructor-arg ref="querystore.serializer.diagnosis"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.allergy"
+          class="org.openmrs.module.querystore.bootstrap.AllergyBootstrapper">
+        <constructor-arg ref="querystore.serializer.allergy"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.drug_order"
+          class="org.openmrs.module.querystore.bootstrap.DrugOrderBootstrapper">
+        <constructor-arg ref="querystore.serializer.drug_order"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.test_order"
+          class="org.openmrs.module.querystore.bootstrap.TestOrderBootstrapper">
+        <constructor-arg ref="querystore.serializer.test_order"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.referral_order"
+          class="org.openmrs.module.querystore.bootstrap.ReferralOrderBootstrapper">
+        <constructor-arg ref="querystore.serializer.referral_order"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.medication_dispense"
+          class="org.openmrs.module.querystore.bootstrap.MedicationDispenseBootstrapper">
+        <constructor-arg ref="querystore.serializer.medication_dispense"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="querystore.bootstrap.program"
+          class="org.openmrs.module.querystore.bootstrap.PatientProgramBootstrapper">
+        <constructor-arg ref="querystore.serializer.program"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
     <bean id="bootstrapService"
           class="org.openmrs.module.querystore.bootstrap.BootstrapServiceImpl">
         <property name="progressDao" ref="querystore.bootstrap.progressDao"/>
         <property name="queryStoreService" ref="queryStoreService"/>
         <property name="embeddingProvider" ref="querystore.embedding.dispatcher"/>
         <property name="bootstrappers">
+            <!--
+                Order matters operationally: obs typically dwarfs every other type combined (often
+                100-1000x), so it runs last. If a bootstrap is interrupted mid-obs, the 11 smaller
+                types are already projected and chartsearchai's queries against conditions, orders,
+                diagnoses, etc. all work; only obs is incomplete.
+            -->
             <list>
+                <ref bean="querystore.bootstrap.patient"/>
+                <ref bean="querystore.bootstrap.encounter"/>
+                <ref bean="querystore.bootstrap.visit"/>
+                <ref bean="querystore.bootstrap.condition"/>
+                <ref bean="querystore.bootstrap.diagnosis"/>
+                <ref bean="querystore.bootstrap.allergy"/>
+                <ref bean="querystore.bootstrap.drug_order"/>
+                <ref bean="querystore.bootstrap.test_order"/>
+                <ref bean="querystore.bootstrap.referral_order"/>
+                <ref bean="querystore.bootstrap.medication_dispense"/>
+                <ref bean="querystore.bootstrap.program"/>
                 <ref bean="querystore.bootstrap.obs"/>
             </list>
         </property>

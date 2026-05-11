@@ -14,10 +14,12 @@ import java.util.List;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.openmrs.BaseOpenmrsData;
 import org.openmrs.OpenmrsObject;
 import org.openmrs.module.querystore.api.QueryStoreService;
 import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
+import org.openmrs.module.querystore.serialization.AbstractRecordSerializer;
 import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
 
 /**
@@ -27,9 +29,11 @@ import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
  * {@link QueryStoreService#index(QueryDocument)} — which honors the conditional-upsert-by-version
  * SPI invariant so a slow scan can't overwrite a fresher concurrent AOP / event write.
  *
- * <p>Subclasses implement {@link #fetchPage}, {@link #getDateChanged}, and {@link #getUuid} for
- * their entity type. The {@link #run} loop persists the cursor after each page so an interrupted
- * scan resumes without re-projecting.
+ * <p>Subclasses implement {@link #fetchPage} and {@link #getSerializer} for their entity type;
+ * {@link #getResourceType}, {@link #getDateChanged}, and {@link #getUuid} default off the serializer
+ * and the {@link BaseOpenmrsData}/{@link OpenmrsObject} contracts and only need overriding for
+ * exotic types. The {@link #run} loop persists the cursor after each page so an interrupted scan
+ * resumes without re-projecting.
  */
 public abstract class TypeBootstrapper<T> {
 
@@ -38,7 +42,12 @@ public abstract class TypeBootstrapper<T> {
 	/** Page size for the paginated scan. Chosen to fit comfortably in memory across all types. */
 	protected static final int PAGE_SIZE = 200;
 
-	public abstract String getResourceType();
+	/** Defaults to the serializer's {@code resource_type} so a bootstrapper and its serializer can't
+	 *  disagree on the resource_type they're projecting. Override only when the bootstrapper needs
+	 *  a different name (no current use case). */
+	public String getResourceType() {
+		return getSerializer().getResourceType();
+	}
 
 	protected abstract ClinicalRecordSerializer<T> getSerializer();
 
@@ -50,7 +59,19 @@ public abstract class TypeBootstrapper<T> {
 	 */
 	protected abstract List<T> fetchPage(Instant afterDateChanged, String afterUuid, int pageSize);
 
-	protected abstract Instant getDateChanged(T entity);
+	/**
+	 * Returns the cursor timestamp for the entity. Default reads {@code dateChanged ?? dateCreated}
+	 * via {@link AbstractRecordSerializer#lastModifiedOf} for any {@link BaseOpenmrsData} record and
+	 * falls back to {@link Instant#EPOCH} (not null) so the cursor stays monotonic and a subsequent
+	 * page fetch doesn't drop back to "from the beginning" semantics.
+	 */
+	protected Instant getDateChanged(T entity) {
+		if (entity instanceof BaseOpenmrsData) {
+			Instant i = AbstractRecordSerializer.lastModifiedOf((BaseOpenmrsData) entity);
+			return i != null ? i : Instant.EPOCH;
+		}
+		return Instant.EPOCH;
+	}
 
 	/**
 	 * Returns the entity's UUID for cursor tie-breaking. Default reads it via
