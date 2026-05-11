@@ -55,6 +55,7 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.util.BytesRef;
 import org.openmrs.module.querystore.QueryStoreConstants;
 import org.openmrs.module.querystore.backend.BackendCapabilities;
+import org.openmrs.module.querystore.backend.BackendDocs;
 import org.openmrs.module.querystore.backend.BackendStore;
 import org.openmrs.module.querystore.backend.BulkWriteResult;
 import org.openmrs.module.querystore.backend.DocFailure;
@@ -137,7 +138,7 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 
 	@Override
 	public WriteResult upsert(QueryDocument doc) {
-		validate(doc);
+		BackendDocs.validate(doc);
 		IndexWriter writer = schemaManager.ensureWriter(doc.getResourceType());
 		try {
 			applyConditionalUpsert(writer, doc);
@@ -175,7 +176,7 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 	public BulkWriteResult bulkUpsert(List<QueryDocument> docs) {
 		Map<String, List<QueryDocument>> byType = new LinkedHashMap<>();
 		for (QueryDocument doc : docs) {
-			validate(doc);
+			BackendDocs.validate(doc);
 			byType.computeIfAbsent(doc.getResourceType(), k -> new ArrayList<>()).add(doc);
 		}
 		List<DocFailure> failures = new ArrayList<>();
@@ -234,7 +235,7 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 		int totalDeleted = 0;
 		TermQuery patientQuery = new TermQuery(new Term(LuceneFieldNames.PATIENT_UUID, patientUuid));
 		for (String indexName : indexNames) {
-			String resourceType = stripPrefix(indexName);
+			String resourceType = BackendDocs.stripPrefix(indexName);
 			IndexWriter writer = schemaManager.ensureWriter(resourceType);
 			int matchedHere = 0;
 			try {
@@ -478,7 +479,7 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 			// Filter pushdown for metadata is term-based per the SPI Filter shape; only flat
 			// scalars get indexed companions. Collections / maps stay in the JSON blob and can
 			// be read via document retrieval but are not directly filterable in v1.
-			if (value instanceof String || value instanceof Number || value instanceof Boolean) {
+			if (BackendDocs.isFilterableScalar(value)) {
 				target.add(new StringField(LuceneFieldNames.META_PREFIX + entry.getKey(),
 				        String.valueOf(value), Field.Store.NO));
 			}
@@ -493,7 +494,7 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 			}
 			List<String> types = new ArrayList<>(known.size());
 			for (String indexName : known) {
-				types.add(stripPrefix(indexName));
+				types.add(BackendDocs.stripPrefix(indexName));
 			}
 			return types;
 		}
@@ -586,14 +587,4 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 		return true;
 	}
 
-	private static String stripPrefix(String indexName) {
-		return StringUtils.removeStart(indexName, QueryStoreConstants.INDEX_PREFIX);
-	}
-
-	private static void validate(QueryDocument doc) {
-		if (doc == null || doc.getResourceType() == null || doc.getResourceUuid() == null
-		        || doc.getPatientUuid() == null) {
-			throw new IllegalArgumentException("QueryDocument must have resourceType, resourceUuid, and patientUuid");
-		}
-	}
 }

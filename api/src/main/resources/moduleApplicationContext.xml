@@ -20,12 +20,17 @@
           class="org.openmrs.module.querystore.backend.lucene.LuceneBackendStore"
           destroy-method="close"/>
 
+    <bean id="querystore.backend.elasticsearch"
+          class="org.openmrs.module.querystore.backend.elasticsearch.ElasticsearchBackendStore"
+          destroy-method="close"/>
+
     <bean id="querystore.backend.selector"
           class="org.openmrs.module.querystore.backend.BackendStoreSelector">
         <constructor-arg>
             <map>
                 <entry key="mysql" value-ref="querystore.backend.mysql"/>
                 <entry key="lucene" value-ref="querystore.backend.lucene"/>
+                <entry key="elasticsearch" value-ref="querystore.backend.elasticsearch"/>
             </map>
         </constructor-arg>
     </bean>

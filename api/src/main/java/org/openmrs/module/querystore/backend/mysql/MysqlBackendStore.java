@@ -35,8 +35,8 @@ import org.apache.commons.collections4.ListUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.openmrs.module.querystore.QueryStoreConstants;
 import org.openmrs.module.querystore.backend.BackendCapabilities;
+import org.openmrs.module.querystore.backend.BackendDocs;
 import org.openmrs.module.querystore.backend.BackendStore;
 import org.openmrs.module.querystore.backend.BulkWriteResult;
 import org.openmrs.module.querystore.backend.DocFailure;
@@ -110,7 +110,7 @@ public class MysqlBackendStore implements BackendStore {
 
 	@Override
 	public WriteResult upsert(QueryDocument doc) {
-		validate(doc);
+		BackendDocs.validate(doc);
 		schemaManager.ensureTable(doc.getResourceType());
 		String table = MysqlSchemaManager.tableName(doc.getResourceType());
 		try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(cachedUpsertSql(table))) {
@@ -146,7 +146,7 @@ public class MysqlBackendStore implements BackendStore {
 		// table; the alternative (per-doc upsert) pays a connection acquisition per row.
 		Map<String, List<QueryDocument>> byType = new LinkedHashMap<>();
 		for (QueryDocument doc : docs) {
-			validate(doc);
+			BackendDocs.validate(doc);
 			byType.computeIfAbsent(doc.getResourceType(), k -> new ArrayList<>()).add(doc);
 		}
 		List<DocFailure> failures = new ArrayList<>();
@@ -195,7 +195,7 @@ public class MysqlBackendStore implements BackendStore {
 				}
 				catch (SQLException e) {
 					log.warn("bulkDeleteByPatient failed for table " + table, e);
-					failures.add(new DocFailure(stripPrefix(table), patientUuid, e.getMessage(), isRetryable(e)));
+					failures.add(new DocFailure(BackendDocs.stripPrefix(table), patientUuid, e.getMessage(), isRetryable(e)));
 				}
 			}
 		}
@@ -379,7 +379,7 @@ public class MysqlBackendStore implements BackendStore {
 
 	private QueryDocument readDocument(String table, ResultSet rs, boolean includeEmbedding) throws SQLException {
 		QueryDocument doc = new QueryDocument();
-		doc.setResourceType(stripPrefix(table));
+		doc.setResourceType(BackendDocs.stripPrefix(table));
 		doc.setResourceUuid(rs.getString("resource_uuid"));
 		doc.setPatientUuid(rs.getString("patient_uuid"));
 		Date d = rs.getDate("record_date");
@@ -469,19 +469,8 @@ public class MysqlBackendStore implements BackendStore {
 		return o;
 	}
 
-	private static String stripPrefix(String table) {
-		return StringUtils.removeStart(table, QueryStoreConstants.INDEX_PREFIX);
-	}
-
 	private static boolean isRetryable(SQLException e) {
 		String state = e.getSQLState();
 		return state != null && (state.startsWith("08") || state.startsWith("40"));
-	}
-
-	private static void validate(QueryDocument doc) {
-		if (doc == null || doc.getResourceType() == null || doc.getResourceUuid() == null
-		        || doc.getPatientUuid() == null) {
-			throw new IllegalArgumentException("QueryDocument must have resourceType, resourceUuid, and patientUuid");
-		}
 	}
 }

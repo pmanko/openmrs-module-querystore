@@ -190,18 +190,19 @@ public final class QueryStoreConstants {
 
 	public static final String DEFAULT_BACKEND = BACKEND_MYSQL;
 
-	public static final String GP_ELASTICSEARCH_HOST = "querystore.elasticsearch.host";
-	public static final String GP_ELASTICSEARCH_PORT = "querystore.elasticsearch.port";
-	public static final String GP_ELASTICSEARCH_SCHEME = "querystore.elasticsearch.scheme";
+	/**
+	 * Runtime-property key carrying the Elasticsearch endpoint URI (e.g.
+	 * {@code http://es.internal:9200}). Lives in {@code openmrs-runtime.properties} rather than a
+	 * GP because the URI may eventually carry credentials, and GPs are visible in the admin UI.
+	 */
+	public static final String RP_ELASTICSEARCH_URI = "querystore.elasticsearch.uri";
+
 	public static final String GP_EMBEDDING_PROVIDER_BEAN = "querystore.embedding.providerBean";
 	public static final String GP_EMBEDDING_MODEL_FILE_PATH = "querystore.embedding.modelFilePath";
 	public static final String GP_EMBEDDING_QUERY_MODEL_FILE_PATH = "querystore.embedding.queryModelFilePath";
 	public static final String GP_EMBEDDING_VOCAB_FILE_PATH = "querystore.embedding.vocabFilePath";
 	public static final String GP_EMBEDDING_MAX_SEQUENCE_LENGTH = "querystore.embedding.maxSequenceLength";
 
-	public static final String DEFAULT_ELASTICSEARCH_HOST = "localhost";
-	public static final String DEFAULT_ELASTICSEARCH_PORT = "9200";
-	public static final String DEFAULT_ELASTICSEARCH_SCHEME = "http";
 	public static final String DEFAULT_EMBEDDING_PROVIDER_BEAN = "querystore.embedding.onnx";
 	public static final int DEFAULT_EMBEDDING_MAX_SEQUENCE_LENGTH = 512;
 
