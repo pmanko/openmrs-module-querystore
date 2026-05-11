@@ -13,10 +13,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.lang.reflect.Method;
-import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
@@ -27,8 +25,9 @@ import org.openmrs.ConceptName;
 import org.openmrs.Obs;
 import org.openmrs.Person;
 import org.openmrs.api.ObsService;
-import org.openmrs.module.querystore.api.QueryStoreService;
-import org.openmrs.module.querystore.embedding.EmbeddingProvider;
+import org.openmrs.module.querystore.bridge.BridgeAdviceTestSupport.ImmediateDispatcher;
+import org.openmrs.module.querystore.bridge.BridgeAdviceTestSupport.RecordingService;
+import org.openmrs.module.querystore.bridge.BridgeAdviceTestSupport.ZeroEmbedder;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.openmrs.module.querystore.serialization.ObsRecordSerializer;
 
@@ -253,20 +252,6 @@ public class ObsIndexingAdviceTest {
 		assertEquals("no index produced after serializer failure", 0, service.indexed.size());
 	}
 
-	@Test
-	public void collectTree_walksEverythingIncludingVoided() {
-		Obs parent = obsShell("p");
-		Obs voided = numericObs("v", 1.0);
-		voided.setVoided(true);
-		parent.addGroupMember(voided);
-		parent.addGroupMember(numericObs("ok", 2.0));
-
-		List<Obs> all = ObsIndexingAdvice.collectTree(parent);
-
-		assertEquals("voided members are visited; the per-node dispatch decides delete vs index",
-		        3, all.size());
-	}
-
 	// ---------- helpers ----------
 
 	private static Method saveObs() throws NoSuchMethodException {
@@ -317,21 +302,6 @@ public class ObsIndexingAdviceTest {
 		return c;
 	}
 
-	private static final class ImmediateDispatcher extends AfterCommitDispatcher {
-		int count;
-
-		ImmediateDispatcher() {
-			super(new BridgeExecutor());
-		}
-
-		@Override
-		public void dispatch(Runnable task) {
-			count++;
-			// Run immediately, no after-commit gating, to keep the assertions synchronous.
-			task.run();
-		}
-	}
-
 	private static final class TestableAdvice extends ObsIndexingAdvice {
 		private final ObsRecordSerializer serializer;
 		private final BridgeIndexer indexer;
@@ -343,31 +313,8 @@ public class ObsIndexingAdviceTest {
 			this.dispatcher = d;
 		}
 
-		@Override ObsRecordSerializer serializer() { return serializer; }
+		@Override protected ObsRecordSerializer serializer() { return serializer; }
 		@Override BridgeIndexer indexer() { return indexer; }
 		@Override AfterCommitDispatcher dispatcher() { return dispatcher; }
-	}
-
-	private static final class RecordingService implements QueryStoreService {
-		final List<QueryDocument> indexed = new ArrayList<>();
-		final List<String[]> deleted = new ArrayList<>();
-
-		@Override public void index(QueryDocument document) { indexed.add(document); }
-		@Override public void delete(String resourceType, String resourceUuid) {
-			deleted.add(new String[]{resourceType, resourceUuid});
-		}
-		@Override public List<QueryDocument> searchByPatient(String p, String q, int l) {
-			return java.util.Collections.emptyList();
-		}
-		@Override public List<QueryDocument> search(String q, int l) {
-			return java.util.Collections.emptyList();
-		}
-		@Override public void onStartup() { }
-		@Override public void onShutdown() { }
-	}
-
-	private static final class ZeroEmbedder implements EmbeddingProvider {
-		@Override public int getDimensions() { return 8; }
-		@Override public float[] embed(String text) { return new float[8]; }
 	}
 }

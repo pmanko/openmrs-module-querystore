@@ -29,6 +29,46 @@
         <point>org.openmrs.api.EncounterService</point>
         <class>org.openmrs.module.querystore.bridge.EncounterIndexingAdvice</class>
     </advice>
+    <advice>
+        <point>org.openmrs.api.ConditionService</point>
+        <class>org.openmrs.module.querystore.bridge.ConditionIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.DiagnosisService</point>
+        <class>org.openmrs.module.querystore.bridge.DiagnosisIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.VisitService</point>
+        <class>org.openmrs.module.querystore.bridge.VisitIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.PatientService</point>
+        <class>org.openmrs.module.querystore.bridge.AllergyIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.PatientService</point>
+        <class>org.openmrs.module.querystore.bridge.PatientIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.ProgramWorkflowService</point>
+        <class>org.openmrs.module.querystore.bridge.PatientProgramIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.MedicationDispenseService</point>
+        <class>org.openmrs.module.querystore.bridge.MedicationDispenseIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.OrderService</point>
+        <class>org.openmrs.module.querystore.bridge.DrugOrderIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.OrderService</point>
+        <class>org.openmrs.module.querystore.bridge.TestOrderIndexingAdvice</class>
+    </advice>
+    <advice>
+        <point>org.openmrs.api.OrderService</point>
+        <class>org.openmrs.module.querystore.bridge.ReferralOrderIndexingAdvice</class>
+    </advice>
 
     <updateURL>https://modules.openmrs.org/modules/download/${project.parent.artifactId}/update.rdf</updateURL>
 

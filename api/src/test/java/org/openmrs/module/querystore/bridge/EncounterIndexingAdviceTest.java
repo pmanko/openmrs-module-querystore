@@ -12,9 +12,7 @@ package org.openmrs.module.querystore.bridge;
 import static org.junit.Assert.assertEquals;
 
 import java.lang.reflect.Method;
-import java.util.ArrayList;
 import java.util.Date;
-import java.util.List;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -22,8 +20,9 @@ import org.openmrs.Encounter;
 import org.openmrs.EncounterType;
 import org.openmrs.Patient;
 import org.openmrs.api.EncounterService;
-import org.openmrs.module.querystore.api.QueryStoreService;
-import org.openmrs.module.querystore.embedding.EmbeddingProvider;
+import org.openmrs.module.querystore.bridge.BridgeAdviceTestSupport.ImmediateDispatcher;
+import org.openmrs.module.querystore.bridge.BridgeAdviceTestSupport.RecordingService;
+import org.openmrs.module.querystore.bridge.BridgeAdviceTestSupport.ZeroEmbedder;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.openmrs.module.querystore.serialization.EncounterRecordSerializer;
 
@@ -230,20 +229,6 @@ public class EncounterIndexingAdviceTest {
 		return enc;
 	}
 
-	private static final class ImmediateDispatcher extends AfterCommitDispatcher {
-		int count;
-
-		ImmediateDispatcher() {
-			super(new BridgeExecutor());
-		}
-
-		@Override
-		public void dispatch(Runnable task) {
-			count++;
-			task.run();
-		}
-	}
-
 	private static class TestableAdvice extends EncounterIndexingAdvice {
 		private final EncounterRecordSerializer serializer;
 		private final BridgeIndexer indexer;
@@ -255,31 +240,8 @@ public class EncounterIndexingAdviceTest {
 			this.dispatcher = d;
 		}
 
-		@Override EncounterRecordSerializer serializer() { return serializer; }
+		@Override protected EncounterRecordSerializer serializer() { return serializer; }
 		@Override BridgeIndexer indexer() { return indexer; }
 		@Override AfterCommitDispatcher dispatcher() { return dispatcher; }
-	}
-
-	private static final class RecordingService implements QueryStoreService {
-		final List<QueryDocument> indexed = new ArrayList<>();
-		final List<String[]> deleted = new ArrayList<>();
-
-		@Override public void index(QueryDocument document) { indexed.add(document); }
-		@Override public void delete(String resourceType, String resourceUuid) {
-			deleted.add(new String[]{resourceType, resourceUuid});
-		}
-		@Override public List<QueryDocument> searchByPatient(String p, String q, int l) {
-			return java.util.Collections.emptyList();
-		}
-		@Override public List<QueryDocument> search(String q, int l) {
-			return java.util.Collections.emptyList();
-		}
-		@Override public void onStartup() { }
-		@Override public void onShutdown() { }
-	}
-
-	private static final class ZeroEmbedder implements EmbeddingProvider {
-		@Override public int getDimensions() { return 8; }
-		@Override public float[] embed(String text) { return new float[8]; }
 	}
 }
