@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Overrides the log4j2.xml inherited from the openmrs-api test-jar, whose root logger is OFF.
+  Keep the noisy Hibernate/openmrs.api/openmrs.test loggers silenced exactly as upstream does,
+  but enable INFO for the eval test package so its per-case recall lines reach surefire's
+  stdout. Picked up ahead of log4j2.xml because log4j2 prefers *-test.xml on the test
+  classpath. Scope intentionally narrow: production-code slf4j callers (OnnxEmbeddingProvider
+  etc.) stay silent during unrelated test runs and only the eval namespace adds output.
+-->
+<Configuration xmlns="http://logging.apache.org/log4j/2.0/config">
+	<Appenders>
+		<Console name="CONSOLE" target="SYSTEM_OUT">
+			<PatternLayout pattern="%p - %C{1}.%M(%L) |%d{ISO8601}| %m%n" />
+		</Console>
+	</Appenders>
+	<Loggers>
+		<Logger name="org.hibernate.tool.hbm2ddl.SchemaExport" level="OFF" />
+		<Logger name="org.openmrs.api" level="OFF" />
+		<Logger name="org.openmrs.test" level="OFF" />
+		<Logger name="org.hibernate.SQL" level="OFF" />
+		<Logger name="org.openmrs.module.querystore.eval" level="INFO" additivity="false">
+			<AppenderRef ref="CONSOLE" />
+		</Logger>
+		<Root level="OFF">
+			<AppenderRef ref="CONSOLE" />
+		</Root>
+	</Loggers>
+</Configuration>
