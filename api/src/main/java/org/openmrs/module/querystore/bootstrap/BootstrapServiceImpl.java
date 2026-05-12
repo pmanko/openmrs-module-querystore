@@ -87,7 +87,8 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 
 	/** Test hook to inject providers without a live OpenMRS Spring context. Validation happens at
 	 *  discovery time (per-provider, with skip-on-failure isolation) so this seam can also be used
-	 *  to wire in deliberately-malformed providers when exercising the isolation behavior. */
+	 *  to wire in deliberately-malformed providers when exercising the isolation behavior.
+	 *  Package-private — tests live alongside the implementation; production code uses Spring discovery. */
 	void setProvidersOverride(List<ResourceTypeProvider> providers) {
 		this.providersOverride = providers;
 	}

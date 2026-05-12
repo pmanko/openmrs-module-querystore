@@ -1148,6 +1148,8 @@ The interface bundles three things and only three things — the resource-type n
 
 **Run order: core first, providers after.** `BootstrapServiceImpl` iterates core bootstrappers (in their configured order, ending in obs) and then providers (in the order Spring returns them). Deferring providers until after the long-running core obs scan is the wrong default in theory but right in practice: providers tend to be small (appointments, billing) and core obs dwarfs them, so what gets delayed by ordering is small to begin with and what gets prioritised by ordering is the slowest scan.
 
+**Worked example for provider authors.** [`docs/spi-providers.md`](spi-providers.md) is the step-by-step walkthrough — serializer, bootstrapper, AOP advice, provider bean, Spring wiring, post-install backfill convention. The walkthrough is verified by `ProviderEndToEndTest`, which builds a `billing_bill` provider from scratch and asserts discovery, prefixed-index routing, cross-type search, patient-scoped retrieval, and patient cascade.
+
 ### Consequences
 - Modules wanting to contribute clinical data depend on querystore (transitively or directly). Deployments that don't install querystore lose any module-contributed indexing — same property as [Decision 2](#decision-2-module-not-core)'s "not every deployment needs it" applied recursively.
 - A module rename (changing its moduleid) would require re-creating its index under the new name and re-syncing. Moduleid changes are rare and disruptive in OpenMRS generally, so this is an acceptable consequence of using moduleid for namespacing rather than a separate, mutable identifier.
