@@ -9,7 +9,6 @@
  */
 package org.openmrs.module.querystore.bootstrap;
 
-import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -20,7 +19,8 @@ import java.util.Calendar;
 import java.util.List;
 import java.util.TimeZone;
 
-import javax.sql.DataSource;
+import org.openmrs.api.db.hibernate.DbSessionFactory;
+import org.openmrs.module.querystore.backend.JdbcSupport;
 
 /**
  * JDBC DAO for the {@code querystore_bootstrap_progress} table — the persistence layer the
@@ -36,38 +36,44 @@ public class BootstrapProgressDao {
 	private static final String COLUMNS = "resource_type, status, cursor_date_changed, cursor_uuid, "
 	        + "documents_indexed, started_at, completed_at, failure_message";
 
-	private final DataSource dataSource;
+	private final DbSessionFactory sessionFactory;
 
-	public BootstrapProgressDao(DataSource dataSource) {
-		this.dataSource = dataSource;
+	public BootstrapProgressDao(DbSessionFactory sessionFactory) {
+		this.sessionFactory = sessionFactory;
 	}
 
 	public BootstrapProgress find(String resourceType) {
-		try (Connection conn = dataSource.getConnection();
-		        PreparedStatement ps = conn.prepareStatement(
-		            "SELECT " + COLUMNS + " FROM querystore_bootstrap_progress WHERE resource_type = ?")) {
-			ps.setString(1, resourceType);
-			try (ResultSet rs = ps.executeQuery()) {
-				return rs.next() ? read(rs) : null;
-			}
+		try {
+			return JdbcSupport.inTransaction(sessionFactory, conn -> {
+				try (PreparedStatement ps = conn.prepareStatement(
+				    "SELECT " + COLUMNS + " FROM querystore_bootstrap_progress WHERE resource_type = ?")) {
+					ps.setString(1, resourceType);
+					try (ResultSet rs = ps.executeQuery()) {
+						return rs.next() ? read(rs) : null;
+					}
+				}
+			});
 		}
-		catch (SQLException e) {
+		catch (RuntimeException e) {
 			throw new IllegalStateException("Could not read bootstrap progress for " + resourceType, e);
 		}
 	}
 
 	public List<BootstrapProgress> findAll() {
-		try (Connection conn = dataSource.getConnection();
-		        PreparedStatement ps = conn.prepareStatement(
-		            "SELECT " + COLUMNS + " FROM querystore_bootstrap_progress ORDER BY resource_type");
-		        ResultSet rs = ps.executeQuery()) {
-			List<BootstrapProgress> out = new ArrayList<>();
-			while (rs.next()) {
-				out.add(read(rs));
-			}
-			return out;
+		try {
+			return JdbcSupport.inTransaction(sessionFactory, conn -> {
+				List<BootstrapProgress> out = new ArrayList<>();
+				try (PreparedStatement ps = conn.prepareStatement(
+				    "SELECT " + COLUMNS + " FROM querystore_bootstrap_progress ORDER BY resource_type");
+				        ResultSet rs = ps.executeQuery()) {
+					while (rs.next()) {
+						out.add(read(rs));
+					}
+				}
+				return out;
+			});
 		}
-		catch (SQLException e) {
+		catch (RuntimeException e) {
 			throw new IllegalStateException("Could not read bootstrap progress", e);
 		}
 	}
@@ -82,26 +88,30 @@ public class BootstrapProgressDao {
 		        + "started_at = VALUES(started_at), "
 		        + "completed_at = VALUES(completed_at), "
 		        + "failure_message = VALUES(failure_message)";
-		try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-			ps.setString(1, progress.getResourceType());
-			ps.setString(2, progress.getStatus().name());
-			setInstant(ps, 3, progress.getCursorDateChanged());
-			if (progress.getCursorUuid() != null) {
-				ps.setString(4, progress.getCursorUuid());
-			} else {
-				ps.setNull(4, Types.CHAR);
-			}
-			ps.setLong(5, progress.getDocumentsIndexed());
-			setInstant(ps, 6, progress.getStartedAt());
-			setInstant(ps, 7, progress.getCompletedAt());
-			if (progress.getFailureMessage() != null) {
-				ps.setString(8, progress.getFailureMessage());
-			} else {
-				ps.setNull(8, Types.VARCHAR);
-			}
-			ps.executeUpdate();
+		try {
+			JdbcSupport.inTransaction(sessionFactory, conn -> {
+				try (PreparedStatement ps = conn.prepareStatement(sql)) {
+					ps.setString(1, progress.getResourceType());
+					ps.setString(2, progress.getStatus().name());
+					setInstant(ps, 3, progress.getCursorDateChanged());
+					if (progress.getCursorUuid() != null) {
+						ps.setString(4, progress.getCursorUuid());
+					} else {
+						ps.setNull(4, Types.CHAR);
+					}
+					ps.setLong(5, progress.getDocumentsIndexed());
+					setInstant(ps, 6, progress.getStartedAt());
+					setInstant(ps, 7, progress.getCompletedAt());
+					if (progress.getFailureMessage() != null) {
+						ps.setString(8, progress.getFailureMessage());
+					} else {
+						ps.setNull(8, Types.VARCHAR);
+					}
+					ps.executeUpdate();
+				}
+			});
 		}
-		catch (SQLException e) {
+		catch (RuntimeException e) {
 			throw new IllegalStateException("Could not save bootstrap progress for " + progress.getResourceType(), e);
 		}
 	}

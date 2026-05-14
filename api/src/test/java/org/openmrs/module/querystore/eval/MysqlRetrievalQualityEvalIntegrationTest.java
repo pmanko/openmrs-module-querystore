@@ -12,11 +12,12 @@ package org.openmrs.module.querystore.eval;
 import java.util.ArrayList;
 import java.util.List;
 
-import com.mysql.cj.jdbc.MysqlDataSource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.openmrs.api.db.hibernate.DbSessionFactory;
 import org.openmrs.module.querystore.api.impl.QueryStoreServiceImpl;
 import org.openmrs.module.querystore.backend.mysql.MysqlBackendStore;
+import org.openmrs.module.querystore.backend.mysql.TestSessionFactories;
 import org.openmrs.module.querystore.embedding.OnnxEmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.slf4j.Logger;
@@ -42,6 +43,8 @@ public class MysqlRetrievalQualityEvalIntegrationTest extends AbstractRetrievalQ
 
 	private MySQLContainer<?> mysql;
 
+	private DbSessionFactory sessionFactory;
+
 	private MysqlBackendStore backend;
 
 	@Override
@@ -63,11 +66,8 @@ public class MysqlRetrievalQualityEvalIntegrationTest extends AbstractRetrievalQ
 		        .withPassword("test");
 		mysql.start();
 
-		MysqlDataSource dataSource = new MysqlDataSource();
-		dataSource.setURL(mysql.getJdbcUrl());
-		dataSource.setUser(mysql.getUsername());
-		dataSource.setPassword(mysql.getPassword());
-		backend = new MysqlBackendStore(dataSource);
+		sessionFactory = TestSessionFactories.forContainer(mysql);
+		backend = new MysqlBackendStore(sessionFactory);
 
 		provider = new OnnxEmbeddingProvider(MODEL_PATH, VOCAB_PATH);
 
@@ -92,6 +92,9 @@ public class MysqlRetrievalQualityEvalIntegrationTest extends AbstractRetrievalQ
 	public void tearDownClass() {
 		if (provider != null) {
 			provider.close();
+		}
+		if (sessionFactory != null) {
+			sessionFactory.getHibernateSessionFactory().close();
 		}
 		if (mysql != null) {
 			mysql.stop();

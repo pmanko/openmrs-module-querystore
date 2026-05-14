@@ -22,12 +22,11 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
-import javax.sql.DataSource;
-
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.openmrs.api.db.hibernate.DbSessionFactory;
 import org.openmrs.module.querystore.backend.BackendCapabilities;
 import org.openmrs.module.querystore.backend.BulkWriteResult;
 import org.openmrs.module.querystore.backend.Filter;
@@ -37,8 +36,6 @@ import org.openmrs.module.querystore.backend.SearchResult;
 import org.openmrs.module.querystore.backend.WriteResult;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.testcontainers.containers.MySQLContainer;
-
-import com.mysql.cj.jdbc.MysqlDataSource;
 
 /**
  * Integration test for {@link MysqlBackendStore} against a real MySQL 8 server via Testcontainers.
@@ -50,7 +47,7 @@ public class MysqlBackendStoreIntegrationTest {
 
 	private static MySQLContainer<?> mysql;
 
-	private static DataSource dataSource;
+	private static DbSessionFactory sessionFactory;
 
 	private static MysqlBackendStore backend;
 
@@ -59,17 +56,15 @@ public class MysqlBackendStoreIntegrationTest {
 		mysql = new MySQLContainer<>("mysql:8.0").withDatabaseName("openmrs_test").withUsername("test")
 		        .withPassword("test");
 		mysql.start();
-
-		MysqlDataSource ds = new MysqlDataSource();
-		ds.setURL(mysql.getJdbcUrl());
-		ds.setUser(mysql.getUsername());
-		ds.setPassword(mysql.getPassword());
-		dataSource = ds;
-		backend = new MysqlBackendStore(dataSource);
+		sessionFactory = TestSessionFactories.forContainer(mysql);
+		backend = new MysqlBackendStore(sessionFactory);
 	}
 
 	@AfterClass
 	public static void stopContainer() {
+		if (sessionFactory != null) {
+			sessionFactory.getHibernateSessionFactory().close();
+		}
 		if (mysql != null) {
 			mysql.stop();
 		}

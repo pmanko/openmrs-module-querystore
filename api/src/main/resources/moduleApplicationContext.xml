@@ -13,7 +13,7 @@
 
     <bean id="querystore.backend.mysql"
           class="org.openmrs.module.querystore.backend.mysql.MysqlBackendStore">
-        <constructor-arg ref="dataSource"/>
+        <constructor-arg ref="dbSessionFactory"/>
     </bean>
 
     <bean id="querystore.backend.lucene"
@@ -89,7 +89,7 @@
 
     <bean id="querystore.bootstrap.progressDao"
           class="org.openmrs.module.querystore.bootstrap.BootstrapProgressDao">
-        <constructor-arg ref="dataSource"/>
+        <constructor-arg ref="dbSessionFactory"/>
     </bean>
 
     <bean id="querystore.bootstrap.obs"

@@ -14,8 +14,6 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-import java.sql.Connection;
-import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -26,25 +24,24 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 
-import javax.sql.DataSource;
-
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.openmrs.api.db.hibernate.DbSessionFactory;
 import org.openmrs.module.querystore.api.QueryStoreService;
 import org.openmrs.module.querystore.api.impl.QueryStoreServiceImpl;
 import org.openmrs.module.querystore.backend.Filter;
+import org.openmrs.module.querystore.backend.JdbcSupport;
 import org.openmrs.module.querystore.backend.SchemaSpec;
 import org.openmrs.module.querystore.backend.SearchRequest;
 import org.openmrs.module.querystore.backend.SearchResult;
 import org.openmrs.module.querystore.backend.mysql.MysqlBackendStore;
+import org.openmrs.module.querystore.backend.mysql.TestSessionFactories;
 import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
 import org.testcontainers.containers.MySQLContainer;
-
-import com.mysql.cj.jdbc.MysqlDataSource;
 
 /**
  * End-to-end bootstrap exercised against a real MySQL via Testcontainers. Validates the
@@ -68,7 +65,7 @@ public class BootstrapIntegrationTest {
 
 	private static MySQLContainer<?> mysql;
 
-	private static DataSource dataSource;
+	private static DbSessionFactory sessionFactory;
 
 	private static MysqlBackendStore backend;
 
@@ -77,43 +74,46 @@ public class BootstrapIntegrationTest {
 	private static BootstrapProgressDao progressDao;
 
 	@BeforeClass
-	public static void startContainer() throws SQLException {
+	public static void startContainer() {
 		mysql = new MySQLContainer<>("mysql:8.0").withDatabaseName("openmrs_test")
 		        .withUsername("test").withPassword("test");
 		mysql.start();
 
-		MysqlDataSource ds = new MysqlDataSource();
-		ds.setURL(mysql.getJdbcUrl());
-		ds.setUser(mysql.getUsername());
-		ds.setPassword(mysql.getPassword());
-		dataSource = ds;
-		backend = new MysqlBackendStore(dataSource);
+		sessionFactory = TestSessionFactories.forContainer(mysql);
+		backend = new MysqlBackendStore(sessionFactory);
 		QueryStoreServiceImpl svc = new QueryStoreServiceImpl();
 		svc.setBackend(backend);
 		// Service-layer embedding is unused on the write path here — bootstrap embeds before
 		// service.index(); leaving the provider null keeps search BM25-only, which is fine.
 		queryStoreService = svc;
-		progressDao = new BootstrapProgressDao(dataSource);
+		progressDao = new BootstrapProgressDao(sessionFactory);
 
-		try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
-			stmt.executeUpdate(PROGRESS_DDL);
-		}
+		JdbcSupport.inTransaction(sessionFactory, conn -> {
+			try (Statement stmt = conn.createStatement()) {
+				stmt.executeUpdate(PROGRESS_DDL);
+			}
+		});
 	}
 
 	@AfterClass
 	public static void stopContainer() {
+		if (sessionFactory != null) {
+			sessionFactory.getHibernateSessionFactory().close();
+		}
 		if (mysql != null) {
 			mysql.stop();
 		}
 	}
 
 	@Before
-	public void resetState() throws SQLException {
+	public void resetState() {
 		backend.deleteSchema("test");
 		backend.ensureSchema("test", SchemaSpec.builder(8).build());
-		try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
-			stmt.executeUpdate("DELETE FROM querystore_bootstrap_progress");
-		}
+		JdbcSupport.inTransaction(sessionFactory, conn -> {
+			try (Statement stmt = conn.createStatement()) {
+				stmt.executeUpdate("DELETE FROM querystore_bootstrap_progress");
+			}
+		});
 	}
 
 	@Test

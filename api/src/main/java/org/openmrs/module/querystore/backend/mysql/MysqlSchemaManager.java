@@ -17,10 +17,11 @@ import java.sql.Statement;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
-import javax.sql.DataSource;
-
+import org.openmrs.api.db.hibernate.DbSessionFactory;
 import org.openmrs.module.querystore.QueryStoreConstants;
+import org.openmrs.module.querystore.backend.JdbcSupport;
 
 /**
  * Creates and drops per-type tables ({@code querystore_<type>}) in the OpenMRS database. Tables are
@@ -30,14 +31,18 @@ import org.openmrs.module.querystore.QueryStoreConstants;
  */
 final class MysqlSchemaManager {
 
-	private final DataSource dataSource;
+	// Resource-type names are validated on every upsert / search path; precompile so the hot path
+	// doesn't recompile the same regex per call.
+	private static final Pattern RESOURCE_TYPE_PATTERN = Pattern.compile("[a-z][a-z0-9_]*");
+
+	private final DbSessionFactory sessionFactory;
 
 	// v1 single-JVM assumption: `knownTables` reflects DDL issued by this JVM. A sibling node
 	// creating a table elsewhere is invisible until `listAllTables()` is called explicitly.
 	private final Set<String> knownTables = ConcurrentHashMap.newKeySet();
 
-	MysqlSchemaManager(DataSource dataSource) {
-		this.dataSource = dataSource;
+	MysqlSchemaManager(DbSessionFactory sessionFactory) {
+		this.sessionFactory = sessionFactory;
 	}
 
 	/** Idempotently creates the {@code querystore_<resourceType>} table if missing. */
@@ -46,24 +51,30 @@ final class MysqlSchemaManager {
 		if (knownTables.contains(table)) {
 			return;
 		}
-		try (Connection conn = dataSource.getConnection()) {
-			if (!tableExists(conn, table)) {
-				createTable(conn, table);
-			}
+		try {
+			JdbcSupport.inTransaction(sessionFactory, conn -> {
+				if (!tableExists(conn, table)) {
+					createTable(conn, table);
+				}
+			});
 			knownTables.add(table);
 		}
-		catch (SQLException e) {
+		catch (RuntimeException e) {
 			throw new IllegalStateException("Could not ensure schema for " + table, e);
 		}
 	}
 
 	void dropTable(String resourceType) {
 		String table = tableName(resourceType);
-		try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
-			stmt.executeUpdate("DROP TABLE IF EXISTS " + table);
+		try {
+			JdbcSupport.inTransaction(sessionFactory, conn -> {
+				try (Statement stmt = conn.createStatement()) {
+					stmt.executeUpdate("DROP TABLE IF EXISTS " + table);
+				}
+			});
 			knownTables.remove(table);
 		}
-		catch (SQLException e) {
+		catch (RuntimeException e) {
 			throw new IllegalStateException("Could not drop " + table, e);
 		}
 	}
@@ -84,16 +95,18 @@ final class MysqlSchemaManager {
 	 */
 	Set<String> listAllTables() {
 		Set<String> tables = new HashSet<>();
-		try (Connection conn = dataSource.getConnection()) {
-			DatabaseMetaData md = conn.getMetaData();
-			try (ResultSet rs = md.getTables(conn.getCatalog(), null, QueryStoreConstants.INDEX_PREFIX + "%",
-			    new String[] { "TABLE" })) {
-				while (rs.next()) {
-					tables.add(rs.getString("TABLE_NAME").toLowerCase());
+		try {
+			JdbcSupport.inTransaction(sessionFactory, conn -> {
+				DatabaseMetaData md = conn.getMetaData();
+				try (ResultSet rs = md.getTables(conn.getCatalog(), null, QueryStoreConstants.INDEX_PREFIX + "%",
+				    new String[] { "TABLE" })) {
+					while (rs.next()) {
+						tables.add(rs.getString("TABLE_NAME").toLowerCase());
+					}
 				}
-			}
+			});
 		}
-		catch (SQLException e) {
+		catch (RuntimeException e) {
 			throw new IllegalStateException("Could not enumerate querystore tables", e);
 		}
 		knownTables.addAll(tables);
@@ -101,7 +114,7 @@ final class MysqlSchemaManager {
 	}
 
 	static String tableName(String resourceType) {
-		if (resourceType == null || !resourceType.matches("[a-z][a-z0-9_]*")) {
+		if (resourceType == null || !RESOURCE_TYPE_PATTERN.matcher(resourceType).matches()) {
 			throw new IllegalArgumentException("Invalid resource type (must match [a-z][a-z0-9_]*): " + resourceType);
 		}
 		return QueryStoreConstants.INDEX_PREFIX + resourceType;
