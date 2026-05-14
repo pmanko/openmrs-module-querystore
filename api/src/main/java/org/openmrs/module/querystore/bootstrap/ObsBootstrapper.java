@@ -33,4 +33,12 @@ public class ObsBootstrapper extends HibernateTypeBootstrapper<Obs> {
 		// Obs.hbm.xml does not map dateChanged (OpenMRS 2.8.x); cursor uses dateCreated alone.
 		return "e.dateCreated";
 	}
+
+	@Override
+	protected String patientAssociationExpr() {
+		// Obs has only a Person association, not a Patient. Patient extends Person and shares the
+		// Person UUID, so filtering by e.person.uuid resolves to the same UUID a patient-scoped
+		// caller passes in.
+		return "e.person.uuid";
+	}
 }

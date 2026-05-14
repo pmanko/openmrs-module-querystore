@@ -30,6 +30,25 @@ public interface BootstrapService extends OpenmrsService {
 	 *  run was interrupted; restarts from the beginning only if no progress row exists. */
 	void bootstrap(String resourceType);
 
+	/**
+	 * Synchronously projects every clinical record belonging to {@code patientUuid} into the read
+	 * store across every registered resource type, using the same serializers, embedder, and write
+	 * path the per-type bootstrap uses. Scoped to a single patient — distinct from {@link #bootstrap}'s
+	 * global scan. Used by the lazy-projection path on cold {@code searchByPatient} (ADR Open
+	 * Question: Initial backfill / bootstrap, "Lazy per-patient projection").
+	 *
+	 * <p>Idempotent: repeated calls write the same documents and rely on the Decision 3
+	 * version-protection invariant for races with concurrent steady-state writes. Concurrent calls
+	 * for the same patient serialize on a per-patient lock; concurrent calls for different patients
+	 * run in parallel. Per-record and per-type failures are isolated and logged; the method returns
+	 * after attempting every type.
+	 *
+	 * <p>Persists no progress row — the per-patient cursor lives only for the call. A bootstrapper
+	 * that declares no per-patient story (the {@link TypeBootstrapper#fetchPageForPatient} default
+	 * throws) is skipped at debug-log level instead of failing the whole call.
+	 */
+	void ensureIndexed(String patientUuid);
+
 	List<BootstrapProgress> getStatus();
 
 	BootstrapProgress getStatus(String resourceType);

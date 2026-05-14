@@ -152,7 +152,7 @@ public class BootstrapServiceImplTest {
 		CountDownLatch t1MayProceed = new CountDownLatch(1);
 		AtomicInteger fetchCount = new AtomicInteger();
 
-		BlockingBootstrapper b = new BlockingBootstrapper(t1EnteredFetch, t1MayProceed, fetchCount);
+		BlockingBootstrapper b = new BlockingBootstrapper(t1EnteredFetch, t1MayProceed, fetchCount, false);
 		service.setBootstrappers(Collections.singletonList(b));
 
 		Thread t1 = new Thread(() -> service.bootstrap("test"));
@@ -354,6 +354,145 @@ public class BootstrapServiceImplTest {
 		assertEquals("no progress row created for dropped provider", null, dao.find("billing_bill"));
 	}
 
+	@Test
+	public void ensureIndexed_iteratesEveryRegisteredType() {
+		EmptyPageBootstrapper obs = new EmptyPageBootstrapper("obs");
+		EmptyPageBootstrapper enc = new EmptyPageBootstrapper("encounter");
+		service.setBootstrappers(Arrays.asList(obs, enc));
+
+		service.ensureIndexed("patient-uuid");
+
+		assertEquals(1, obs.fetchForPatientCount);
+		assertEquals("patient-uuid", obs.lastPatientUuid);
+		assertEquals(1, enc.fetchForPatientCount);
+		assertEquals("patient-uuid", enc.lastPatientUuid);
+		assertEquals("global cursor untouched — per-patient path persists no progress",
+		        null, dao.find("obs"));
+	}
+
+	@Test
+	public void ensureIndexed_perTypeFailureIsolated() {
+		EmptyPageBootstrapper failing = new EmptyPageBootstrapper("obs");
+		failing.perPatientFailure = new RuntimeException("boom");
+		EmptyPageBootstrapper ok = new EmptyPageBootstrapper("encounter");
+		service.setBootstrappers(Arrays.asList(failing, ok));
+
+		service.ensureIndexed("patient-uuid");
+
+		assertEquals(1, failing.fetchForPatientCount);
+		assertEquals("non-failing type still ran after the failure",
+		        1, ok.fetchForPatientCount);
+	}
+
+	@Test
+	public void ensureIndexed_skipsBootstrapperWithoutPerPatientImpl() {
+		// A bootstrapper that doesn't override fetchPageForPatient throws UnsupportedOperationException
+		// — the per-patient loop must treat it as a per-type skip (logged), not abort the whole call.
+		TypeBootstrapper<Object> noPerPatient = new TypeBootstrapper<Object>() {
+			@Override public String getResourceType() { return "no_per_patient"; }
+			@Override protected ClinicalRecordSerializer<Object> getSerializer() { return null; }
+			@Override protected List<Object> fetchPage(Instant a, String u, int p) {
+				return Collections.emptyList();
+			}
+		};
+		EmptyPageBootstrapper ok = new EmptyPageBootstrapper("encounter");
+		service.setBootstrappers(Arrays.<TypeBootstrapper<?>>asList(noPerPatient, ok));
+
+		service.ensureIndexed("patient-uuid");
+
+		assertEquals("well-formed sibling still ran", 1, ok.fetchForPatientCount);
+	}
+
+	@Test
+	public void ensureIndexed_nullPatientUuid_isNoOp() {
+		EmptyPageBootstrapper obs = new EmptyPageBootstrapper("obs");
+		service.setBootstrappers(Collections.singletonList(obs));
+
+		service.ensureIndexed(null);
+		service.ensureIndexed("");
+
+		assertEquals("null/empty patient uuid is a no-op", 0, obs.fetchForPatientCount);
+	}
+
+	@Test
+	public void ensureIndexed_includesProviderBootstrappers() {
+		EmptyPageBootstrapper core = new EmptyPageBootstrapper("obs");
+		EmptyPageBootstrapper providerBs = new EmptyPageBootstrapper("appointments_appointment");
+		service.setBootstrappers(Collections.singletonList(core));
+		service.setProvidersOverride(Collections.<ResourceTypeProvider>singletonList(
+		        new TestProvider("appointments_appointment", providerBs)));
+
+		service.ensureIndexed("patient-uuid");
+
+		assertEquals(1, core.fetchForPatientCount);
+		assertEquals("provider's bootstrapper got the per-patient call too",
+		        1, providerBs.fetchForPatientCount);
+	}
+
+	@Test
+	public void ensureIndexed_concurrentCallsForSamePatient_serialize() throws InterruptedException {
+		// Mirrors bootstrap_concurrentCallsForSameType_serialize. The cross-JVM race is absorbed by
+		// the Decision 3 version invariant; this lock just prevents redundant projection work in one JVM.
+		CountDownLatch t1EnteredFetch = new CountDownLatch(1);
+		CountDownLatch t1MayProceed = new CountDownLatch(1);
+		AtomicInteger fetchCount = new AtomicInteger();
+
+		BlockingBootstrapper b = new BlockingBootstrapper(t1EnteredFetch, t1MayProceed, fetchCount, true);
+		service.setBootstrappers(Collections.singletonList(b));
+
+		Thread t1 = new Thread(() -> service.ensureIndexed("patient-uuid"));
+		t1.start();
+		assertTrue("first thread reached fetchPageForPatient", t1EnteredFetch.await(2, TimeUnit.SECONDS));
+
+		Thread t2 = new Thread(() -> service.ensureIndexed("patient-uuid"));
+		t2.start();
+		Thread.sleep(150);
+		assertEquals("second thread is blocked on the per-patient lock; only one fetch in flight",
+		        1, fetchCount.get());
+
+		t1MayProceed.countDown();
+		t1.join(2000);
+		t2.join(2000);
+		assertEquals("both callers completed; second ran sequentially after first released the lock",
+		        2, fetchCount.get());
+	}
+
+	@Test
+	public void ensureIndexed_concurrentCallsForDifferentPatients_runInParallel() throws InterruptedException {
+		// Different patient UUIDs hit different lock entries, so the calls do not serialize.
+		CountDownLatch bothEnteredFetch = new CountDownLatch(2);
+		CountDownLatch mayProceed = new CountDownLatch(1);
+
+		EmptyPageBootstrapper b = new EmptyPageBootstrapper("obs") {
+			@Override
+			protected List<Object> fetchPageForPatient(String patientUuid, Instant a, String u, int p) {
+				bothEnteredFetch.countDown();
+				try {
+					if (!mayProceed.await(2, TimeUnit.SECONDS)) {
+						fail("test setup deadlock: mayProceed never released");
+					}
+				}
+				catch (InterruptedException ie) {
+					Thread.currentThread().interrupt();
+				}
+				return Collections.emptyList();
+			}
+		};
+		service.setBootstrappers(Collections.singletonList(b));
+
+		Thread t1 = new Thread(() -> service.ensureIndexed("patient-A"));
+		Thread t2 = new Thread(() -> service.ensureIndexed("patient-B"));
+		t1.start();
+		t2.start();
+
+		assertTrue("both threads entered fetchPageForPatient concurrently (different patient locks)",
+		        bothEnteredFetch.await(2, TimeUnit.SECONDS));
+
+		mayProceed.countDown();
+		t1.join(2000);
+		t2.join(2000);
+	}
+
 	// ---------- fakes ----------
 
 	/**
@@ -365,9 +504,12 @@ public class BootstrapServiceImplTest {
 	private static class EmptyPageBootstrapper extends TypeBootstrapper<Object> {
 		private final String type;
 		int fetchCount;
+		int fetchForPatientCount;
+		String lastPatientUuid;
 		Instant lastAfterDateChanged;
 		String lastAfterUuid;
 		RuntimeException failure;
+		RuntimeException perPatientFailure;
 		java.util.function.Consumer<String> onFetch;
 
 		EmptyPageBootstrapper(String type) { this.type = type; }
@@ -390,22 +532,43 @@ public class BootstrapServiceImplTest {
 			}
 			return Collections.emptyList();
 		}
+
+		@Override
+		protected List<Object> fetchPageForPatient(String patientUuid, Instant afterDateChanged, String afterUuid,
+		                                           int pageSize) {
+			fetchForPatientCount++;
+			lastPatientUuid = patientUuid;
+			lastAfterDateChanged = afterDateChanged;
+			lastAfterUuid = afterUuid;
+			if (onFetch != null) {
+				onFetch.accept(type);
+			}
+			if (perPatientFailure != null) {
+				throw perPatientFailure;
+			}
+			return Collections.emptyList();
+		}
 	}
 
 	/**
-	 * Bootstrapper whose first invocation parks at a latch — lets the test verify that a second
-	 * concurrent call waits for the lock rather than running in parallel.
+	 * Bootstrapper whose first invocation parks at a latch — lets a test verify that a second
+	 * concurrent call waits for a lock rather than running in parallel. {@code blockOnPerPatient}
+	 * selects which entry point blocks ({@code fetchPage} vs {@code fetchPageForPatient}); the
+	 * other returns an empty page immediately so a single test can exercise just one path.
 	 */
 	private static final class BlockingBootstrapper extends TypeBootstrapper<Object> {
 		private final CountDownLatch entered;
 		private final CountDownLatch mayProceed;
 		private final AtomicInteger fetchCount;
+		private final boolean blockOnPerPatient;
 		private boolean firstCall = true;
 
-		BlockingBootstrapper(CountDownLatch entered, CountDownLatch mayProceed, AtomicInteger fetchCount) {
+		BlockingBootstrapper(CountDownLatch entered, CountDownLatch mayProceed, AtomicInteger fetchCount,
+		                     boolean blockOnPerPatient) {
 			this.entered = entered;
 			this.mayProceed = mayProceed;
 			this.fetchCount = fetchCount;
+			this.blockOnPerPatient = blockOnPerPatient;
 		}
 
 		@Override public String getResourceType() { return "test"; }
@@ -415,6 +578,15 @@ public class BootstrapServiceImplTest {
 
 		@Override
 		protected List<Object> fetchPage(Instant afterDateChanged, String afterUuid, int pageSize) {
+			return blockOnPerPatient ? Collections.emptyList() : park();
+		}
+
+		@Override
+		protected List<Object> fetchPageForPatient(String patientUuid, Instant a, String u, int p) {
+			return blockOnPerPatient ? park() : Collections.emptyList();
+		}
+
+		private List<Object> park() {
 			fetchCount.incrementAndGet();
 			if (firstCall) {
 				firstCall = false;

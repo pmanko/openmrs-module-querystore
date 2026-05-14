@@ -38,6 +38,13 @@ public interface QueryStoreService extends OpenmrsService {
 
 	/**
 	 * Hybrid (BM25 + semantic) search within a patient's chart.
+	 *
+	 * <p>Cold-patient side effect: when no documents are indexed for {@code patientUuid}, the call
+	 * synchronously projects that patient's clinical data before running the search (ADR Open
+	 * Question: Initial backfill / bootstrap, "Lazy per-patient projection"). First touch on a
+	 * never-indexed patient can therefore block for seconds while serialization and embedding run;
+	 * subsequent calls return at steady-state latency. Consumers needing predictable response on
+	 * every call should pre-bootstrap or schedule periodic backfills.
 	 */
 	@Authorized(PrivilegeConstants.GET_PATIENTS)
 	List<QueryDocument> searchByPatient(String patientUuid, String query, int limit);

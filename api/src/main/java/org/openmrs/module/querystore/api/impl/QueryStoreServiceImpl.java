@@ -16,12 +16,14 @@ import java.util.List;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.openmrs.api.context.Context;
 import org.openmrs.api.impl.BaseOpenmrsService;
 import org.openmrs.module.querystore.api.QueryStoreService;
 import org.openmrs.module.querystore.backend.BackendStore;
 import org.openmrs.module.querystore.backend.Filter;
 import org.openmrs.module.querystore.backend.SearchRequest;
 import org.openmrs.module.querystore.backend.SearchResult;
+import org.openmrs.module.querystore.bootstrap.BootstrapService;
 import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 
@@ -39,12 +41,22 @@ public class QueryStoreServiceImpl extends BaseOpenmrsService implements QuerySt
 
 	private EmbeddingProvider embeddingProvider;
 
+	// Test seam: when non-null, replaces the Context.getService(BootstrapService.class) lookup so
+	// unit tests can pin the auto-index path without a live OpenMRS Spring context. Production
+	// wiring leaves this null and resolves through Context — see ensureIndexedSafely. Package-private
+	// to match the seam shape used in BootstrapServiceImpl.providersOverride.
+	private BootstrapService bootstrapServiceOverride;
+
 	public void setBackend(BackendStore backend) {
 		this.backend = backend;
 	}
 
 	public void setEmbeddingProvider(EmbeddingProvider embeddingProvider) {
 		this.embeddingProvider = embeddingProvider;
+	}
+
+	void setBootstrapServiceOverride(BootstrapService bootstrapService) {
+		this.bootstrapServiceOverride = bootstrapService;
 	}
 
 	@Override
@@ -75,7 +87,33 @@ public class QueryStoreServiceImpl extends BaseOpenmrsService implements QuerySt
 		if (backend == null || patientUuid == null) {
 			return Collections.emptyList();
 		}
+		if (!backend.existsByPatient(patientUuid)) {
+			ensureIndexedSafely(patientUuid);
+		}
 		return runHybrid(query, limit, Filter.patientScope(patientUuid));
+	}
+
+	/** Lazy lookup avoids a Spring circular dependency: {@code BootstrapService} depends on
+	 *  {@link QueryStoreService}, so resolving the reverse direction at wiring time would surface
+	 *  the cycle in bean construction. Context lookup defers it to call time, when both beans are
+	 *  fully wired. An unavailable service (no Spring context in test envs; narrow activation
+	 *  window) throws from Context.getService and is absorbed by the catch — the search still runs
+	 *  and returns whatever the backend has. */
+	private void ensureIndexedSafely(String patientUuid) {
+		try {
+			BootstrapService bootstrapService = bootstrapServiceOverride;
+			if (bootstrapService == null) {
+				bootstrapService = Context.getService(BootstrapService.class);
+			}
+			bootstrapService.ensureIndexed(patientUuid);
+		}
+		catch (RuntimeException e) {
+			// Index-failure must not block search; whatever did get indexed (or what was already
+			// present) is still searchable. Empty results are the same outcome as before this
+			// feature shipped.
+			log.warn("Auto-index for patient " + patientUuid
+			        + " failed; serving search with whatever is indexed", e);
+		}
 	}
 
 	@Override

@@ -85,6 +85,56 @@ public class BootstrappersTest {
 	}
 
 	@Test
+	public void hibernateBootstrapper_firstPagePerPatientHql_shape() {
+		String hql = HibernateTypeBootstrapper.firstPagePerPatientHql("Encounter",
+		        "COALESCE(e.dateChanged, e.dateCreated)", "e.patient.uuid");
+		assertTrue("entity name present", hql.contains("FROM Encounter e"));
+		assertTrue("voided filter present", hql.contains("WHERE e.voided = false"));
+		assertTrue("patient association filter present", hql.contains("AND e.patient.uuid = :patientUuid"));
+		assertTrue("order clause present",
+		        hql.contains("ORDER BY COALESCE(e.dateChanged, e.dateCreated) ASC, e.uuid ASC"));
+	}
+
+	@Test
+	public void hibernateBootstrapper_afterCursorPerPatientHql_shape() {
+		String hql = HibernateTypeBootstrapper.afterCursorPerPatientHql("Encounter",
+		        "COALESCE(e.dateChanged, e.dateCreated)", "e.patient.uuid");
+		assertTrue("patient filter present", hql.contains("AND e.patient.uuid = :patientUuid"));
+		assertTrue("strictly-greater cursor branch present",
+		        hql.contains("COALESCE(e.dateChanged, e.dateCreated) > :cursor"));
+		assertTrue("equal-cursor uuid tie-breaker present",
+		        hql.contains("COALESCE(e.dateChanged, e.dateCreated) = :cursor AND e.uuid > :afterUuid"));
+	}
+
+	@Test
+	public void obsBootstrapper_overrides_patientAssociationExpr_to_person() {
+		// Obs has no patient association — Hibernate would throw on e.patient.uuid. The Person/Patient
+		// UUID coincidence is what makes filtering by e.person.uuid resolve correctly.
+		assertEquals("e.person.uuid",
+		        new ObsBootstrapper(new ObsRecordSerializer(), null).patientAssociationExpr());
+	}
+
+	@Test
+	public void patientBootstrapper_overrides_patientAssociationExpr_to_uuid() {
+		// Patient is the entity itself; filter by uuid, not by a patient association.
+		assertEquals("e.uuid",
+		        new PatientBootstrapper(new PatientRecordSerializer(), null).patientAssociationExpr());
+	}
+
+	@Test
+	public void other_bootstrappers_keep_default_patientAssociationExpr() {
+		// Spot-check three of the ten "has-a-patient" types — defaults inherited from
+		// HibernateTypeBootstrapper resolve to e.patient.uuid as expected.
+		String defaultExpr = "e.patient.uuid";
+		assertEquals(defaultExpr,
+		        new EncounterBootstrapper(new EncounterRecordSerializer(), null).patientAssociationExpr());
+		assertEquals(defaultExpr,
+		        new ConditionBootstrapper(new ConditionRecordSerializer(), null).patientAssociationExpr());
+		assertEquals(defaultExpr,
+		        new DrugOrderBootstrapper(new DrugOrderRecordSerializer(), null).patientAssociationExpr());
+	}
+
+	@Test
 	public void obs_and_order_subtypes_override_cursorDateExpr_to_dateCreated() {
 		// Obs.hbm.xml and Order.hbm.xml don't map dateChanged; the HQL must use dateCreated alone
 		// for these 4 bootstrappers or Hibernate throws QueryException at first fetch.

@@ -60,6 +60,21 @@ public abstract class TypeBootstrapper<T> {
 	protected abstract List<T> fetchPage(Instant afterDateChanged, String afterUuid, int pageSize);
 
 	/**
+	 * Patient-scoped variant of {@link #fetchPage}: returns up to {@code pageSize} records belonging
+	 * to {@code patientUuid} whose effective date is strictly after the cursor, ordered ascending
+	 * with {@code uuid} as tie-breaker. Used by the lazy-per-patient projection path on cold-search
+	 * (ADR Open Question: Initial backfill / bootstrap, "Lazy per-patient projection"). The default
+	 * throws so a bootstrapper that has no per-patient story (e.g., reference-data types contributed
+	 * via the SPI that don't carry a patient association) surfaces the no-op clearly; types that
+	 * carry patient data override.
+	 */
+	protected List<T> fetchPageForPatient(String patientUuid, Instant afterDateChanged, String afterUuid,
+	                                      int pageSize) {
+		throw new UnsupportedOperationException(
+		        "Per-patient fetch not implemented for " + getResourceType());
+	}
+
+	/**
 	 * Returns the cursor timestamp for the entity. Default reads {@code dateChanged ?? dateCreated}
 	 * via {@link AbstractRecordSerializer#lastModifiedOf} for any {@link BaseOpenmrsData} record and
 	 * falls back to {@link Instant#EPOCH} (not null) so the cursor stays monotonic and a subsequent
@@ -118,22 +133,39 @@ public abstract class TypeBootstrapper<T> {
 		}
 	}
 
+	/**
+	 * Patient-scoped variant of {@link #run}: walks {@link #fetchPageForPatient} until exhausted and
+	 * projects each record through the serializer + embedder + write path. No progress row is
+	 * persisted — the per-patient path is invoked from the auto-index path on cold search and its
+	 * cursor lives only for the duration of the call. Per-record failures are isolated by
+	 * {@link #projectOne}; a fetch-side failure propagates.
+	 */
+	public final void runForPatient(String patientUuid, QueryStoreService service, EmbeddingProvider embedder) {
+		Instant cursor = null;
+		String cursorUuid = null;
+		while (true) {
+			List<T> page = fetchPageForPatient(patientUuid, cursor, cursorUuid, PAGE_SIZE);
+			if (page.isEmpty()) {
+				break;
+			}
+			for (T entity : page) {
+				try {
+					projectOne(entity, service, embedder);
+				}
+				finally {
+					cursor = getDateChanged(entity);
+					cursorUuid = getUuid(entity);
+				}
+			}
+		}
+	}
+
 	private void indexOne(T entity, BootstrapProgress progress, QueryStoreService service,
 	                      EmbeddingProvider embedder) {
 		try {
-			QueryDocument doc = getSerializer().serialize(entity);
-			if (doc != null) {
-				doc.setEmbedding(embedder.embed(doc.getText()));
-				service.index(doc);
+			if (projectOne(entity, service, embedder)) {
 				progress.setDocumentsIndexed(progress.getDocumentsIndexed() + 1);
 			}
-		}
-		catch (RuntimeException e) {
-			// Per-entity skip on failure: a poison record (one that consistently fails to serialize,
-			// embed, or index) must not permanently stall the bootstrap. The full stacktrace is
-			// logged so an admin can investigate, and the cursor still advances past the entity in
-			// the finally below so retry doesn't replay the same failure forever.
-			log.warn("Skipping " + getResourceType() + "/" + getUuid(entity) + " due to failure", e);
 		}
 		finally {
 			// Advance the cursor whether or not a document was produced (null-serializing records
@@ -142,5 +174,23 @@ public abstract class TypeBootstrapper<T> {
 			progress.setCursorDateChanged(getDateChanged(entity));
 			progress.setCursorUuid(getUuid(entity));
 		}
+	}
+
+	/** Serialize → embed → index a single entity, returning true when a non-null document was
+	 *  written. Per-entity skip on failure: a poison record must not stall a scan (the {@link #run}
+	 *  cursor advances past it; {@link #runForPatient} likewise advances its local cursor). */
+	private boolean projectOne(T entity, QueryStoreService service, EmbeddingProvider embedder) {
+		try {
+			QueryDocument doc = getSerializer().serialize(entity);
+			if (doc != null) {
+				doc.setEmbedding(embedder.embed(doc.getText()));
+				service.index(doc);
+				return true;
+			}
+		}
+		catch (RuntimeException e) {
+			log.warn("Skipping " + getResourceType() + "/" + getUuid(entity) + " due to failure", e);
+		}
+		return false;
 	}
 }

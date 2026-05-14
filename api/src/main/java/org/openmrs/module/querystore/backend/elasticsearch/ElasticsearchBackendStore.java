@@ -243,6 +243,29 @@ public class ElasticsearchBackendStore implements BackendStore, Closeable {
 	}
 
 	@Override
+	public boolean existsByPatient(String patientUuid) {
+		if (StringUtils.isBlank(patientUuid)) {
+			return false;
+		}
+		try {
+			// Single wildcard count short-circuited via terminateAfter=1 — ES stops scanning shards
+			// as soon as one document matches. allowNoIndices / ignoreUnavailable preserve the "no
+			// indexes yet" semantics consistent with the other backends.
+			co.elastic.clients.elasticsearch.core.CountResponse resp = client().count(c -> c
+			        .index(QueryStoreConstants.INDEX_PREFIX + "*")
+			        .query(Query.of(q -> q.term(t -> t.field(ElasticsearchFieldNames.PATIENT_UUID).value(patientUuid))))
+			        .terminateAfter(1L)
+			        .allowNoIndices(true)
+			        .ignoreUnavailable(true));
+			return resp.count() > 0L;
+		}
+		catch (ElasticsearchException | IOException e) {
+			log.warn("existsByPatient failed for " + patientUuid, e);
+			return false;
+		}
+	}
+
+	@Override
 	public SearchResult bm25(SearchRequest req) {
 		if (StringUtils.isBlank(req.getQueryText()) || req.getLimit() <= 0) {
 			return SearchResult.empty();

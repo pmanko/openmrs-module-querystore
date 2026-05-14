@@ -260,6 +260,34 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 	}
 
 	@Override
+	public boolean existsByPatient(String patientUuid) {
+		if (StringUtils.isBlank(patientUuid)) {
+			return false;
+		}
+		Set<String> indexNames = schemaManager.knownIndexNames();
+		if (indexNames.isEmpty()) {
+			indexNames = schemaManager.listAllIndexes();
+		}
+		if (indexNames.isEmpty()) {
+			return false;
+		}
+		TermQuery patientQuery = new TermQuery(new Term(LuceneFieldNames.PATIENT_UUID, patientUuid));
+		for (String indexName : indexNames) {
+			String resourceType = BackendDocs.stripPrefix(indexName);
+			IndexWriter writer = schemaManager.ensureWriter(resourceType);
+			try {
+				if (countMatching(writer, patientQuery) > 0) {
+					return true;
+				}
+			}
+			catch (IOException e) {
+				log.warn("existsByPatient probe failed for " + indexName, e);
+			}
+		}
+		return false;
+	}
+
+	@Override
 	public SearchResult bm25(SearchRequest req) {
 		if (StringUtils.isBlank(req.getQueryText()) || req.getLimit() <= 0) {
 			return SearchResult.empty();

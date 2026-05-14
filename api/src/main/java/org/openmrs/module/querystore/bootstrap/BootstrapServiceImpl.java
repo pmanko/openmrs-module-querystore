@@ -53,6 +53,13 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 	// protection, but the progress bookkeeping silently corrupts.
 	private final Map<String, Object> typeLocks = new ConcurrentHashMap<>();
 
+	// Per-patient lock so concurrent ensureIndexed(uuid) calls for the same patient serialize. The
+	// cross-JVM race is absorbed by the Decision 3 version invariant (conditional upsert on
+	// last_modified); this lock prevents redundant projection work within one JVM. Map grows by one
+	// entry per ever-touched patient and is bounded in practice by deployment patient count — see
+	// the ADR "Lazy per-patient projection" sub-question for the trade-off discussion.
+	private final Map<String, Object> patientLocks = new ConcurrentHashMap<>();
+
 	private BootstrapProgressDao progressDao;
 
 	private QueryStoreService queryStoreService;
@@ -112,6 +119,36 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 	}
 
 	@Override
+	public void ensureIndexed(String patientUuid) {
+		if (patientUuid == null || patientUuid.isEmpty()) {
+			return;
+		}
+		Object lock = patientLocks.computeIfAbsent(patientUuid, k -> new Object());
+		synchronized (lock) {
+			Map<String, ResourceTypeProvider> providers = discoverProviders();
+			for (String resourceType : allResourceTypes(providers)) {
+				try {
+					runOneForPatient(resourceType, patientUuid, providers);
+				}
+				catch (UnsupportedOperationException noPerPatientImpl) {
+					// Bootstrapper declared no per-patient story (TypeBootstrapper.fetchPageForPatient
+					// default throw). Legitimate no-op for reference-data SPI types that don't carry a
+					// patient association — log at debug so a deployment with several such providers
+					// doesn't spam warnings on every cold searchByPatient.
+					if (log.isDebugEnabled()) {
+						log.debug("Skipping " + resourceType + " for patient " + patientUuid
+						        + " — no per-patient projection implemented");
+					}
+				}
+				catch (RuntimeException e) {
+					log.warn("Per-patient projection of " + resourceType + " for patient " + patientUuid
+					        + " failed; continuing with remaining types", e);
+				}
+			}
+		}
+	}
+
+	@Override
 	public List<BootstrapProgress> getStatus() {
 		return progressDao.findAll();
 	}
@@ -146,6 +183,18 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 			}
 			bootstrapper.run(progress, queryStoreService, embeddingProvider, progressDao);
 		}
+	}
+
+	private void runOneForPatient(String resourceType, String patientUuid,
+	                              Map<String, ResourceTypeProvider> providers) {
+		// Callers iterate allResourceTypes, which already filters providers with a null bootstrapper
+		// — so for every resourceType reaching here, the core map or the provider's bootstrapper
+		// resolves non-null. No null guards needed.
+		TypeBootstrapper<?> bootstrapper = bootstrappers.get(resourceType);
+		if (bootstrapper == null) {
+			bootstrapper = providers.get(resourceType).getBootstrapper();
+		}
+		bootstrapper.runForPatient(patientUuid, queryStoreService, embeddingProvider);
 	}
 
 	/** Core types first (insertion order), then providers with a non-null bootstrapper. The map is

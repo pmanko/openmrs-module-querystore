@@ -137,6 +137,30 @@ public class ElasticsearchBackendStoreIntegrationTest {
 	}
 
 	@Test
+	public void existsByPatient_returnsFalseForUnknownPatient() {
+		assertFalse(backend.existsByPatient("nobody"));
+	}
+
+	@Test
+	public void existsByPatient_returnsTrueAfterUpsert() {
+		backend.upsert(doc("obs", "patient-A", "Temperature 38.5", null));
+		assertTrue(backend.existsByPatient("patient-A"));
+		assertFalse(backend.existsByPatient("patient-B"));
+	}
+
+	@Test
+	public void existsByPatient_findsHitInAnyType() {
+		backend.upsert(doc("condition", "patient-A", "Type 2 Diabetes", null));
+		assertTrue(backend.existsByPatient("patient-A"));
+	}
+
+	@Test
+	public void existsByPatient_falseForNullOrBlank() {
+		assertFalse(backend.existsByPatient(null));
+		assertFalse(backend.existsByPatient(""));
+	}
+
+	@Test
 	public void bulkDeleteByPatientRemovesAcrossTypes() {
 		backend.upsert(doc("obs", "patient-A", "Temperature: 38.5", null));
 		backend.upsert(doc("condition", "patient-A", "Type 2 Diabetes", null));

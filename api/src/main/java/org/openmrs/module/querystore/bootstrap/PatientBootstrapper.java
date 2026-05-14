@@ -38,4 +38,11 @@ public class PatientBootstrapper extends HibernateTypeBootstrapper<Patient> {
 	protected ClinicalRecordSerializer<Patient> getSerializer() {
 		return serializer;
 	}
+
+	@Override
+	protected String patientAssociationExpr() {
+		// Patient is the entity itself — no patient association to traverse. Filter by uuid; the
+		// per-patient page returns at most one row.
+		return "e.uuid";
+	}
 }

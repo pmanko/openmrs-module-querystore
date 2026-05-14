@@ -75,6 +75,17 @@ public interface BackendStore {
 
 	// ---------- reads ----------
 
+	/**
+	 * Returns true when any document keyed by {@code patient_uuid} exists in any per-type store.
+	 * Honors the second SPI invariant (patient-scoped reads sub-linear) and is permitted to
+	 * short-circuit on the first hit across types. Returns {@code false} for the steady-state
+	 * "no data" case (no documents, or no per-type stores yet) silently; transient backend errors
+	 * (connection lost, broken index) are logged and also surface as {@code false}. Callers
+	 * (auto-index on cold search) treat both as "fall through to indexing," which converges to the
+	 * same result whether the backend was empty or transiently unhealthy.
+	 */
+	boolean existsByPatient(String patientUuid);
+
 	SearchResult bm25(SearchRequest req);
 
 	SearchResult knn(SearchRequest req);

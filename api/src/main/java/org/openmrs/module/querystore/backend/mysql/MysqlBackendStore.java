@@ -210,6 +210,45 @@ public class MysqlBackendStore implements BackendStore {
 	}
 
 	@Override
+	public boolean existsByPatient(String patientUuid) {
+		if (StringUtils.isBlank(patientUuid)) {
+			return false;
+		}
+		// Hot path on every searchByPatient: prefer the cache populated by ensureTable. A cold JVM
+		// (no schema work yet) falls back to the metadata probe. Mirrors resolveTables — same
+		// staleness trade-off, same fallback.
+		Set<String> tables = schemaManager.getKnownTables();
+		if (tables.isEmpty()) {
+			tables = schemaManager.listAllTables();
+		}
+		if (tables.isEmpty()) {
+			return false;
+		}
+		try (Connection conn = dataSource.getConnection()) {
+			for (String table : tables) {
+				try (PreparedStatement ps = conn.prepareStatement(
+				    "SELECT 1 FROM " + table + " WHERE patient_uuid = ? LIMIT 1")) {
+					ps.setString(1, patientUuid);
+					try (ResultSet rs = ps.executeQuery()) {
+						if (rs.next()) {
+							return true;
+						}
+					}
+				}
+				catch (SQLException e) {
+					// One table failing (locked, schema mid-migration) should not poison the probe; the
+					// auto-index caller's contract is "missing data triggers indexing, which converges."
+					log.warn("existsByPatient probe failed for table " + table, e);
+				}
+			}
+		}
+		catch (SQLException e) {
+			log.warn("existsByPatient could not acquire connection for " + patientUuid, e);
+		}
+		return false;
+	}
+
+	@Override
 	public SearchResult bm25(SearchRequest req) {
 		if (StringUtils.isBlank(req.getQueryText()) || req.getLimit() <= 0) {
 			return SearchResult.empty();

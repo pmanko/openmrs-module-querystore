@@ -44,6 +44,22 @@ public abstract class HibernateTypeBootstrapper<T> extends TypeBootstrapper<T> {
 		return "COALESCE(e.dateChanged, e.dateCreated)";
 	}
 
+	/**
+	 * HQL expression resolving the entity's patient UUID, referenced as {@code e.<path>.uuid}. Used
+	 * by the per-patient fetch path on lazy projection (ADR Open Question: Initial backfill /
+	 * bootstrap). Default {@code e.patient.uuid} fits every type whose Hibernate mapping exposes a
+	 * {@code patient} association ({@link org.openmrs.Encounter}, {@link org.openmrs.Visit}, all
+	 * {@link org.openmrs.Order} subtypes, {@link org.openmrs.Condition}, {@link org.openmrs.Diagnosis},
+	 * {@link org.openmrs.Allergy}, {@link org.openmrs.PatientProgram},
+	 * {@link org.openmrs.MedicationDispense}). {@link org.openmrs.Obs} has no {@code patient}
+	 * association — only {@code person} — and overrides to {@code e.person.uuid}; the Person/Patient
+	 * UUID coincidence (Patient extends Person) is what makes the filter resolve correctly.
+	 * {@link org.openmrs.Patient} is itself the entity and overrides to {@code e.uuid}.
+	 */
+	protected String patientAssociationExpr() {
+		return "e.patient.uuid";
+	}
+
 	@Override
 	protected final List<T> fetchPage(Instant afterDateChanged, String afterUuid, int pageSize) {
 		Class<T> entityType = getSerializer().getSupportedType();
@@ -64,6 +80,27 @@ public abstract class HibernateTypeBootstrapper<T> extends TypeBootstrapper<T> {
 		return q.list();
 	}
 
+	@Override
+	protected final List<T> fetchPageForPatient(String patientUuid, Instant afterDateChanged, String afterUuid,
+	                                            int pageSize) {
+		Class<T> entityType = getSerializer().getSupportedType();
+		String entityName = entityType.getSimpleName();
+		String dateExpr = cursorDateExpr();
+		String patientExpr = patientAssociationExpr();
+		Session session = sessionFactory.getHibernateSessionFactory().getCurrentSession();
+		Query<T> q;
+		if (afterDateChanged == null) {
+			q = session.createQuery(firstPagePerPatientHql(entityName, dateExpr, patientExpr), entityType);
+		} else {
+			q = session.createQuery(afterCursorPerPatientHql(entityName, dateExpr, patientExpr), entityType);
+			q.setParameter("cursor", Date.from(afterDateChanged));
+			q.setParameter("afterUuid", afterUuid != null ? afterUuid : "");
+		}
+		q.setParameter("patientUuid", patientUuid);
+		q.setMaxResults(pageSize);
+		return q.list();
+	}
+
 	// Package-private so a unit test can pin the HQL shape without invoking Hibernate.
 	static String firstPageHql(String entityName, String dateExpr) {
 		return "FROM " + entityName + " e WHERE e.voided = false "
@@ -74,6 +111,20 @@ public abstract class HibernateTypeBootstrapper<T> extends TypeBootstrapper<T> {
 		// COALESCE in WHERE so a record whose dateChanged is null still progresses past the cursor on
 		// dateCreated alone; the uuid tie-breaker handles records sharing the same effective timestamp.
 		return "FROM " + entityName + " e WHERE e.voided = false AND ("
+		        + dateExpr + " > :cursor "
+		        + "OR (" + dateExpr + " = :cursor AND e.uuid > :afterUuid)) "
+		        + "ORDER BY " + dateExpr + " ASC, e.uuid ASC";
+	}
+
+	static String firstPagePerPatientHql(String entityName, String dateExpr, String patientExpr) {
+		return "FROM " + entityName + " e WHERE e.voided = false "
+		        + "AND " + patientExpr + " = :patientUuid "
+		        + "ORDER BY " + dateExpr + " ASC, e.uuid ASC";
+	}
+
+	static String afterCursorPerPatientHql(String entityName, String dateExpr, String patientExpr) {
+		return "FROM " + entityName + " e WHERE e.voided = false "
+		        + "AND " + patientExpr + " = :patientUuid AND ("
 		        + dateExpr + " > :cursor "
 		        + "OR (" + dateExpr + " = :cursor AND e.uuid > :afterUuid)) "
 		        + "ORDER BY " + dateExpr + " ASC, e.uuid ASC";
