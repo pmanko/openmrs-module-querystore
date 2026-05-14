@@ -22,6 +22,12 @@ Run review passes until structural concerns converge. Each pass:
 - Two consecutive passes return only cosmetic items (e.g., test assertion tightening, import ordering).
 - The pass starts re-flagging items prior passes addressed.
 
+**Transition gate** (forcing function — say this out loud in the report before moving to Phase 2):
+
+> "Phase 1 stopping condition met: [last pass returned no further review value | last two consecutive passes returned only cosmetic items | last pass started re-flagging prior items]."
+
+If you cannot truthfully complete that sentence, the slice is NOT ready for Phase 2 — run another Phase 1 pass. Two passes both finding substantive issues is a signal to keep going, not stop. Pass count is not the threshold; convergence is.
+
 ## Phase 2: Polish (/simplify style)
 
 Run simplify passes until polish opportunities converge. Each pass:
@@ -36,6 +42,12 @@ Run simplify passes until polish opportunities converge. Each pass:
 - Two consecutive passes return "nothing actionable" or only sub-noise-floor stylistic items.
 - Agents start re-flagging items prior passes addressed (context-drift signal).
 - All remaining findings are below the noise floor: micro-optimizations, naming preferences, debatable style.
+
+**Stopping gate** (say this out loud in the final report before declaring `/harden` done):
+
+> "Phase 2 stopping condition met: [last two consecutive passes returned nothing actionable / only sub-noise-floor items | agents re-flagging prior items | all remaining findings below the noise floor]."
+
+If you cannot truthfully complete that sentence, run another Phase 2 pass. Same rule as Phase 1: pass count is not the threshold; convergence is.
 
 ## Re-entry
 
