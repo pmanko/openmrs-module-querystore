@@ -39,7 +39,7 @@ Authorization and the v1 consumer API surface are settled by [Decision 14](./adr
 
 These are not querystore gaps — they are migration work on the chartsearchai side.
 
-1. **Per-type indices vs. single shared index.** querystore is `openmrs_obs`, `openmrs_condition`, etc. ([Decision 4](./adr.md#decision-4-per-type-indices-over-a-single-index)). chartsearchai's retrieval layer either queries the wildcard `openmrs_*` (recommended; promoted to the official cross-type convention by [Decision 13](./adr.md#decision-13-module-extension-spi-service-provider-interface-for-custom-resource-types)) or updates to multi-index queries.
+1. **Per-type indices vs. single shared index.** querystore is `querystore_obs`, `querystore_condition`, etc. ([Decision 4](./adr.md#decision-4-per-type-indices-over-a-single-index)). chartsearchai's retrieval layer either queries the wildcard `querystore_*` (recommended; promoted to the official cross-type convention by [Decision 13](./adr.md#decision-13-module-extension-spi-service-provider-interface-for-custom-resource-types)) or updates to multi-index queries.
 2. **Embedding model alignment.** querystore embeds at index time with the model picked under [Decision 8](./adr.md#decision-8-locale-specific-serialization-with-multilingual-embeddings) (multilingual-e5 class). chartsearchai must switch its query-time embedder to the same model — the embedding-model contract from [Decision 13](./adr.md#decision-13-module-extension-spi-service-provider-interface-for-custom-resource-types) applies to every consumer. Embeddings from different models are not comparable; mismatch produces silently broken kNN results.
 
 ## Backend tier selection
@@ -74,6 +74,6 @@ These are layered above the index. The migration touches retrieval (where the in
 
 1. Resolve querystore open questions 1–4 above — design and ship.
 2. chartsearchai switches its query-time embedding model to querystore's choice (test fixture and config change; small).
-3. chartsearchai swaps its retrieval layer to query `openmrs_*` via the `QueryStoreService` Java surface ([Decision 14](./adr.md#decision-14-authorization-and-consumer-api-surface)) against querystore.
+3. chartsearchai swaps its retrieval layer to query `querystore_*` via the `QueryStoreService` Java surface ([Decision 14](./adr.md#decision-14-authorization-and-consumer-api-surface)) against querystore.
 4. chartsearchai removes its AOP indexing code and `chartsearchai-patient-records` index.
 5. Validate with chartsearchai's existing eval dataset (153 records, query-recall benchmarks) against the new pipeline.

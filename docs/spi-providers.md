@@ -18,9 +18,9 @@ What you _do not_ build: schema migrations, table/index creation, embedding, sea
 ## What you get for free
 
 - **Schema lifecycle.** All three reference backends (MySQL, Lucene, Elasticsearch) lazy-create your per-type table/index on first write. No Liquibase, no per-tier mapping.
-- **Cross-type search.** `QueryStoreService.search(...)` already enumerates every `openmrs_*` store. The moment your provider's first document lands, it's part of the cross-type query surface.
+- **Cross-type search.** `QueryStoreService.search(...)` already enumerates every `querystore_*` store. The moment your provider's first document lands, it's part of the cross-type query surface.
 - **Patient-scoped retrieval.** `QueryStoreService.searchByPatient(uuid, q, limit)` filters by your documents' `patient_uuid` field uniformly.
-- **Patient cascade.** `BackendStore.bulkDeleteByPatient(uuid)` — used by void / merge paths — iterates every `openmrs_*` store, including yours.
+- **Patient cascade.** `BackendStore.bulkDeleteByPatient(uuid)` — used by void / merge paths — iterates every `querystore_*` store, including yours.
 - **Embedding.** `BridgeIndexer` (steady-state writes) and `BootstrapServiceImpl` (initial backfill) embed your documents' `text` field with the deployment-configured `EmbeddingProvider`.
 - **Authorization.** Consumer reads go through `QueryStoreService`'s `@Authorized(GET_PATIENTS)` surface. Your provider writes; you do not gate access.
 
@@ -37,7 +37,7 @@ Your resource type name must be `<moduleid>_<type>`, lowercase, with internal se
 - `billing_payment_method`
 - `radiology_imaging_study`
 
-The corresponding index is `openmrs_<moduleid>_<type>` per ADR Decision 4. Querystore validates this at discovery; a malformed name causes your provider bean to be logged and skipped while well-formed peers continue.
+The corresponding index is `querystore_<moduleid>_<type>` per ADR Decision 4. Querystore validates this at discovery; a malformed name causes your provider bean to be logged and skipped while well-formed peers continue.
 
 ## Step 1 — serializer
 
@@ -236,7 +236,7 @@ After your module loads and bootstraps:
 
 1. **Discovery.** `Context.getRegisteredComponents(ResourceTypeProvider.class)` should include your bean. If it doesn't, check that the bean is declared in `moduleApplicationContext.xml` and that the module loaded without errors.
 
-2. **Index creation.** The backend creates `openmrs_billing_bill` on the first write — a Lucene directory under `<appdata>/querystore/lucene/`, a MySQL table `openmrs_billing_bill`, or an Elasticsearch index `openmrs_billing_bill`.
+2. **Index creation.** The backend creates `querystore_billing_bill` on the first write — a Lucene directory under `<appdata>/querystore/lucene/`, a MySQL table `querystore_billing_bill`, or an Elasticsearch index `querystore_billing_bill`.
 
 3. **Bootstrap progress.** `BootstrapService.getStatus("billing_bill")` returns a `BootstrapProgress` with `COMPLETED` status and a non-zero `documentsIndexed` count.
 
