@@ -17,6 +17,9 @@ import org.openmrs.api.context.Daemon;
 import org.openmrs.module.BaseModuleActivator;
 import org.openmrs.module.DaemonToken;
 import org.openmrs.module.DaemonTokenAware;
+import org.openmrs.module.querystore.api.impl.QueryStoreServiceImpl;
+import org.openmrs.module.querystore.backend.BackendStore;
+import org.openmrs.module.querystore.backend.BackendStoreSelector;
 import org.openmrs.module.querystore.bootstrap.BootstrapService;
 
 public class QueryStoreActivator extends BaseModuleActivator implements DaemonTokenAware {
@@ -33,9 +36,27 @@ public class QueryStoreActivator extends BaseModuleActivator implements DaemonTo
 	@Override
 	public void started() {
 		log.info("Query Store module started");
+		wireBackend(
+		    Context.getRegisteredComponent("querystore.backend.selector", BackendStoreSelector.class),
+		    Context.getRegisteredComponent("queryStoreService", QueryStoreServiceImpl.class));
 		if (isAutostartEnabled(Context.getAdministrationService())) {
 			triggerBootstrap();
 		}
+	}
+
+	/**
+	 * Reads {@code querystore.backend} via {@link BackendStoreSelector} and injects the chosen
+	 * {@link BackendStore} into the service. Done here rather than at Spring wiring time because
+	 * reading a GP during bean construction self-deadlocks against {@code ServiceContext}'s
+	 * in-progress refresh (issue #10). Any failure (missing selector bean, unknown GP value with no
+	 * default candidate wired) propagates out and fails module startup — preferable to silently
+	 * leaving {@code backend == null}, which the service's null-checks would mask as
+	 * empty-result-forever. The service is looked up via {@code getRegisteredComponent} (raw Spring
+	 * bean) rather than {@code Context.getService} (AOP proxy implementing only the interface) so
+	 * the {@code setBackend} internal seam stays reachable without a {@code ClassCastException}.
+	 */
+	void wireBackend(BackendStoreSelector selector, QueryStoreServiceImpl service) {
+		service.setBackend(selector.getStore());
 	}
 
 	@Override

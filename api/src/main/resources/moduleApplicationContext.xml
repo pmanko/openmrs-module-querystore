@@ -35,10 +35,6 @@
         </constructor-arg>
     </bean>
 
-    <bean id="querystore.backend"
-          factory-bean="querystore.backend.selector"
-          factory-method="getStore"/>
-
     <bean id="querystore.embedding.onnx"
           class="org.openmrs.module.querystore.embedding.OnnxEmbeddingProvider"/>
 
@@ -83,7 +79,12 @@
 
     <bean id="queryStoreService"
           class="org.openmrs.module.querystore.api.impl.QueryStoreServiceImpl">
-        <property name="backend" ref="querystore.backend"/>
+        <!--
+            The backend is wired by QueryStoreActivator.started() after Spring context refresh
+            completes: BackendStoreSelector reads the querystore.backend GP via
+            AdministrationService, and reading GPs during bean construction self-deadlocks because
+            ServiceContext.getService() blocks while refresh is still in progress (issue #10).
+        -->
         <property name="embeddingProvider" ref="querystore.embedding.dispatcher"/>
     </bean>
 

@@ -20,11 +20,14 @@ import org.openmrs.module.querystore.QueryStoreConstants;
 
 /**
  * Picks the active {@link BackendStore} based on the {@code querystore.backend} global property per
- * ADR Decision 3. Spring wires every candidate backend bean into this selector at module startup;
- * the selector reads the GP via {@link AdministrationService} and exposes the chosen one as the
- * single {@code querystore.backend} bean consumed by {@code QueryStoreService}. Unknown values
- * fall back to {@link QueryStoreConstants#DEFAULT_BACKEND} with a logged warning rather than
- * failing module startup, so an admin can correct the GP and restart.
+ * ADR Decision 3. Spring wires every candidate backend bean into this selector at context-refresh
+ * time; {@code QueryStoreActivator.started()} then calls {@link #getStore()} to read the GP via
+ * {@link AdministrationService} and inject the chosen backend into the service. The lookup runs
+ * after Spring context refresh completes — calling it during bean construction self-deadlocks
+ * because {@code ServiceContext.getService()} blocks on the in-progress refresh (issue #10).
+ * Unknown GP values fall back to {@link QueryStoreConstants#DEFAULT_BACKEND} with a logged warning,
+ * so an admin can correct the GP and restart. Startup only fails when the default candidate itself
+ * is missing from the wiring, which is a misconfiguration rather than a recoverable runtime state.
  */
 public class BackendStoreSelector {
 
@@ -43,9 +46,9 @@ public class BackendStoreSelector {
 	}
 
 	/**
-	 * Resolves the active backend at bean-construction time. Called via {@code factory-method} from
-	 * Spring; the returned instance becomes the {@code querystore.backend} bean wired into the
-	 * service layer.
+	 * Resolves the active backend by reading the {@code querystore.backend} GP. Must be called after
+	 * Spring context refresh completes (typically from {@code QueryStoreActivator.started()}) — see
+	 * the class-level javadoc for the deadlock that prompted this constraint.
 	 */
 	public BackendStore getStore() {
 		String chosen = resolveBackendName();
@@ -65,22 +68,12 @@ public class BackendStoreSelector {
 	}
 
 	private static String resolveBackendName() {
-		// AdministrationService is registered with the core context before any module context
-		// loads, so this call is safe at module bean init — but defend against test contexts
-		// that bypass the framework by treating any lookup failure as "use the default".
-		try {
-			AdministrationService admin = Context.getAdministrationService();
-			if (admin != null) {
-				String value = admin.getGlobalProperty(QueryStoreConstants.GP_BACKEND,
-				    QueryStoreConstants.DEFAULT_BACKEND);
-				if (value != null && !value.trim().isEmpty()) {
-					return value.trim().toLowerCase();
-				}
-			}
+		AdministrationService admin = Context.getAdministrationService();
+		String value = admin.getGlobalProperty(QueryStoreConstants.GP_BACKEND,
+		    QueryStoreConstants.DEFAULT_BACKEND);
+		if (value == null || value.trim().isEmpty()) {
+			return QueryStoreConstants.DEFAULT_BACKEND;
 		}
-		catch (RuntimeException e) {
-			log.warn("Could not read " + QueryStoreConstants.GP_BACKEND + " GP; using default", e);
-		}
-		return QueryStoreConstants.DEFAULT_BACKEND;
+		return value.trim().toLowerCase();
 	}
 }

@@ -13,11 +13,16 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import org.junit.Before;
 import org.junit.Test;
 import org.openmrs.api.AdministrationService;
+import org.openmrs.module.querystore.api.impl.QueryStoreServiceImpl;
+import org.openmrs.module.querystore.backend.BackendStore;
+import org.openmrs.module.querystore.backend.BackendStoreSelector;
+import org.openmrs.module.querystore.model.QueryDocument;
 
 public class QueryStoreActivatorTest {
 
@@ -53,5 +58,24 @@ public class QueryStoreActivatorTest {
 		when(admin.getGlobalPropertyValue(eq(QueryStoreConstants.GP_BOOTSTRAP_AUTOSTART), eq(Boolean.FALSE)))
 		        .thenReturn(Boolean.FALSE);
 		assertFalse(activator.isAutostartEnabled(admin));
+	}
+
+	@Test
+	public void wireBackend_injectsSelectorsChoiceIntoTheServiceImpl() {
+		// Pins the issue #10 contract: the activator resolves the selector's chosen backend and
+		// hands it directly to the impl, with no proxy-cast in between. Asserts by observation —
+		// after wiring, a subsequent index() call must reach the chosen backend.
+		BackendStoreSelector selector = mock(BackendStoreSelector.class);
+		BackendStore chosen = mock(BackendStore.class);
+		when(selector.getStore()).thenReturn(chosen);
+		QueryStoreServiceImpl service = new QueryStoreServiceImpl();
+
+		activator.wireBackend(selector, service);
+
+		QueryDocument doc = new QueryDocument();
+		doc.setResourceType("obs");
+		doc.setResourceUuid("u-1");
+		service.index(doc);
+		verify(chosen).upsert(doc);
 	}
 }
