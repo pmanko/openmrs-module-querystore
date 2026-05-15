@@ -214,6 +214,13 @@
             <list>
                 <value>org.openmrs.module.querystore.api.QueryStoreService</value>
                 <ref bean="queryStoreService"/>
+            </list>
+        </property>
+    </bean>
+
+    <bean parent="serviceContext">
+        <property name="moduleService">
+            <list>
                 <value>org.openmrs.module.querystore.bootstrap.BootstrapService</value>
                 <ref bean="bootstrapService"/>
             </list>
