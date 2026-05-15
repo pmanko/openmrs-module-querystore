@@ -107,6 +107,7 @@ public class ElasticsearchBackendStore implements BackendStore, Closeable {
 	@Override
 	public WriteResult upsert(QueryDocument doc) {
 		BackendDocs.validate(doc);
+		ensureIndexFor(doc);
 		String index = ElasticsearchSchemaManager.indexName(doc.getResourceType());
 		Map<String, Object> source = toSource(doc);
 		try {
@@ -343,9 +344,18 @@ public class ElasticsearchBackendStore implements BackendStore, Closeable {
 		return clientFactory.getClient();
 	}
 
+	// Without this, ES dynamic mapping types patient_uuid as `text` and the bare-field `term` filter silently matches zero.
+	private void ensureIndexFor(QueryDocument doc) {
+		if (doc.getEmbedding() == null) {
+			return;
+		}
+		schemaManager.ensureIndex(doc.getResourceType(), doc.getEmbedding().length);
+	}
+
 	private int executeBulkUpsert(List<QueryDocument> docs, List<DocFailure> failures) {
 		List<BulkOperation> ops = new ArrayList<>(docs.size());
 		for (QueryDocument doc : docs) {
+			ensureIndexFor(doc);
 			String index = ElasticsearchSchemaManager.indexName(doc.getResourceType());
 			Map<String, Object> source = toSource(doc);
 			Long version = doc.getLastModified() == null ? null : doc.getLastModified().toEpochMilli();

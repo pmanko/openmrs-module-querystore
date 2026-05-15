@@ -446,6 +446,44 @@ public class ElasticsearchBackendStoreIntegrationTest {
 	}
 
 	@Test
+	public void upsertCreatesIndexWithKeywordPatientUuidWhenSchemaAbsent() {
+		// Writing to a never-ensured index lets ES dynamic mapping type patient_uuid as `text`,
+		// against which the bare-field `term` filter silently matches zero docs. upsert must
+		// install the explicit `keyword` mapping before the first write.
+		backend.deleteSchema("obs");
+
+		QueryDocument doc = doc("obs", "patient-A", "Fasting blood glucose: 11.2 mmol/L",
+		        new float[] { 1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f });
+		assertTrue(backend.upsert(doc).isSucceeded());
+
+		SearchResult result = backend.bm25(SearchRequest.builder().resourceType("obs").queryText("glucose")
+		        .limit(10).filter(Filter.patientScope("patient-A")).build());
+		assertEquals("patient_uuid must be a keyword field so the patient-scope term filter matches",
+		    1, result.getHits().size());
+		assertEquals("patient-A", result.getHits().get(0).getDocument().getPatientUuid());
+	}
+
+	@Test
+	public void bulkUpsertCreatesIndexWithKeywordPatientUuidWhenSchemaAbsent() {
+		// Bulk-write parity for the same dynamic-mapping trap covered by the single-write test:
+		// executeBulkUpsert must also install the explicit `keyword` mapping before the first write.
+		backend.deleteSchema("obs");
+
+		List<QueryDocument> batch = new ArrayList<>();
+		for (int i = 0; i < 3; i++) {
+			batch.add(doc("obs", "patient-A", "Sample " + i,
+			        new float[] { 1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f }));
+		}
+		BulkWriteResult res = backend.bulkUpsert(batch);
+		assertEquals(3, res.getSucceeded());
+
+		SearchResult result = backend.bm25(SearchRequest.builder().resourceType("obs").queryText("Sample")
+		        .limit(10).filter(Filter.patientScope("patient-A")).build());
+		assertEquals("bulk-written docs must be reachable by patient-scope filter",
+		    3, result.getHits().size());
+	}
+
+	@Test
 	public void patientScopedReadIsSubLinear() {
 		// Embedding null: see bulkUpsertCountsPerDocumentOutcomes — cosine rejects zero magnitude
 		// and this test only exercises BM25 patient-scope pushdown.
