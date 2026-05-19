@@ -1,7 +1,7 @@
 ---
 name: harden
 description: Run iterative /review and /simplify passes on the current slice in two phases until both converge. Use when the user wants to harden a code slice end-to-end without manually orchestrating the review/simplify dance. Trigger phrases include "harden this", "polish until done", "iterate until convergence", "harden".
-version: 0.3.0
+version: 0.4.0
 ---
 
 # Harden
@@ -76,7 +76,7 @@ If Phase 2 surfaces a *structural* concern (not polish — e.g., a real correctn
 After stopping, summarize:
 - Total passes per phase.
 - What was changed across them (one bullet per real fix, separated by phase).
-- Why any remaining flagged items were skipped.
+- **For every deferred item, a concrete failure-mode sentence in the form "if we ship without this, X breaks because Y."** A deferral without that sentence is not a deferral — it is an unanalyzed item. Re-read and either apply or write the sentence. Group sentences by item; do not collapse multiple deferrals into a single label like "remaining items below noise floor."
 - Current build / test status.
 - Recommended next action (commit + push, or move on).
 
@@ -89,6 +89,21 @@ After stopping, summarize:
 - **Don't promote architectural concerns** into in-pass fixes. Items like "this Hibernate proxy hits the DB at backfill scale" are real but belong in the indexer/sync layer, not in the slice being polished — flag and defer.
 - **Don't review the slice in isolation.** Integration bugs hide outside the file diff — at trigger boundaries (a sibling service mutates state without notifying you), classloader boundaries (an optional dep's absence breaks static class resolution), and lifecycle boundaries (a consumer scans before you register). Every Phase 1 pass MUST trace at least one level out on each integration thread (trigger paths, optional deps, lifecycle order, state propagation). The slice's correctness contract spans its boundaries — a fix that lives in a sibling service is still a Phase 1 finding when the slice surfaces or depends on the bug. See "Trace outward" in Phase 1.
 - **Don't batch-defer "Minor" items by severity label.** Severity labels are an agent's guess, not a verdict. Before deferring any finding, write the concrete failure mode out loud: "if we ship without this, X breaks because Y." If you can't complete that sentence, you don't yet understand the severity — re-read the finding, trace its consequence, and either apply the fix or write down what you'd need to know to defer it. This rule is load-bearing: agents routinely under-label correctness fixes as Minor (e.g. unclosed `AutoCloseable`s, leaked test state) because the code-pattern looks small.
+
+  **Sub-rules to keep the failure-mode sentence honest:**
+
+  - **Anti-tell phrases.** These are smoke that hides the failure-mode question. If you reach for one, stop and write the failure mode instead — none of these are failure modes:
+    - "matches the existing pattern" / "matches the ADR's example" — illustrative code is not a constraint; the agent's specific recommendation for your slice overrides general convention.
+    - "below noise floor" / "sub-noise-floor" — a label, not a consequence.
+    - "stylistic preference" / "debatable style" — restate as a failure mode and recheck.
+    - "borderline" — pick a side and write the sentence for that side.
+    - "low risk" without naming the risk — name what could go wrong, who would notice, and how.
+
+  - **Silent-failure upgrade.** When the failure mode is "the system produces wrong output without throwing," upgrade the severity one level. Silent corruption is harder to detect than a crash, and the cost to discover it is paid by users, not CI. A typo'd metadata key, a dropped field, a stale denormalized value — these don't crash; they leak.
+
+  - **Conflation check.** If you're rejecting a finding because of scope inflation ("extracting 30+ constants would be too much"), re-read the agent's exact wording. Are you rejecting the agent's recommendation, or an inflated version you constructed? Agents often recommend a *targeted* fix; rejecting the *maximalist* fix is rejecting a strawman. The agent's narrow scope is the deferral candidate, not your expansion of it.
+
+  - **Conditional-recommendation check.** If the agent's recommendation contains a conditional ("skip — but if X, reconsider"), evaluate the conditional explicitly in the report. Don't treat a conditional skip as a flat skip. If you don't know whether the conditional applies, find out before deferring.
 
 ## When NOT to use this skill
 
