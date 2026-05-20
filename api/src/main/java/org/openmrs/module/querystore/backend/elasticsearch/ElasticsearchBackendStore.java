@@ -218,6 +218,8 @@ public class ElasticsearchBackendStore implements BackendStore, Closeable {
 		try {
 			DeleteByQueryResponse resp = client().deleteByQuery(d -> d
 			        .index(QueryStoreConstants.INDEX_PREFIX + "*")
+			        .allowNoIndices(true)
+			        .ignoreUnavailable(true)
 			        .query(Query.of(q -> q.term(t -> t.field(ElasticsearchFieldNames.PATIENT_UUID).value(patientUuid))))
 			        .refresh(true)
 			        .waitForCompletion(true)

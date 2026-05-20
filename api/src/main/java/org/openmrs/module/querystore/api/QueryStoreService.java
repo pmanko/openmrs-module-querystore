@@ -37,6 +37,15 @@ public interface QueryStoreService extends OpenmrsService {
 	void delete(String resourceType, String resourceUuid);
 
 	/**
+	 * Removes every document keyed by {@code patientUuid} across every per-type index. Internal:
+	 * invoked by the patient-purge bridge advice (and any future REST/admin caller) when a
+	 * patient is purged from core so the read-store doesn't retain PHI past the core deletion.
+	 * Iterates the cross-session-merged set of indexes/tables on the configured backend, mirroring
+	 * the discovery contract of {@code searchByPatient} and {@code existsByPatient}.
+	 */
+	void bulkDeleteByPatient(String patientUuid);
+
+	/**
 	 * Hybrid (BM25 + semantic) search within a patient's chart.
 	 *
 	 * <p>Cold-patient side effect: when no documents are indexed for {@code patientUuid}, the call

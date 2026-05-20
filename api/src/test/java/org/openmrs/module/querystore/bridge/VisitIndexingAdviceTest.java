@@ -60,6 +60,8 @@ public class VisitIndexingAdviceTest {
 		advice.afterReturning(null, VisitService.class.getMethod("purgeVisit", Visit.class),
 		        new Object[]{v}, null);
 		assertEquals(1, service.deleted.size());
+		assertEquals("non-patient purge must not trigger cross-type bulk-delete",
+		        0, service.bulkDeletedPatients.size());
 	}
 
 	@Test

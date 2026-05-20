@@ -43,4 +43,13 @@ public class BridgeIndexer {
 	public void delete(String resourceType, String resourceUuid) {
 		queryStoreService.delete(resourceType, resourceUuid);
 	}
+
+	/**
+	 * Cross-type sweep of every per-type-store document keyed by {@code patientUuid}. Used by the
+	 * {@link PatientIndexingAdvice} purge path so a core {@code purgePatient} call removes the
+	 * patient's full read-store footprint, not just the {@code querystore_patient} row.
+	 */
+	public void bulkDeleteByPatient(String patientUuid) {
+		queryStoreService.bulkDeleteByPatient(patientUuid);
+	}
 }

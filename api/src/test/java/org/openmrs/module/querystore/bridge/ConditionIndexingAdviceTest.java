@@ -68,6 +68,8 @@ public class ConditionIndexingAdviceTest {
 		Condition c = condition("c-3", false);
 		advice.afterReturning(null, method("purgeCondition"), new Object[]{c}, null);
 		assertEquals(1, service.deleted.size());
+		assertEquals("non-patient purge must not trigger cross-type bulk-delete",
+		        0, service.bulkDeletedPatients.size());
 	}
 
 	@Test

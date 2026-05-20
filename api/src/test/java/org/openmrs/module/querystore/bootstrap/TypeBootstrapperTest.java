@@ -296,6 +296,7 @@ public class TypeBootstrapperTest {
 		final List<QueryDocument> indexed = new ArrayList<>();
 		@Override public void index(QueryDocument document) { indexed.add(document); }
 		@Override public void delete(String resourceType, String resourceUuid) { /* unused */ }
+		@Override public void bulkDeleteByPatient(String patientUuid) { /* unused */ }
 		@Override public List<QueryDocument> searchByPatient(String p, String q, int l) { return Collections.emptyList(); }
 		@Override public List<QueryDocument> search(String q, int l) { return Collections.emptyList(); }
 		@Override public void onStartup() { /* unused */ }

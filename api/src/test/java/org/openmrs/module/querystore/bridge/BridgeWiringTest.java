@@ -125,6 +125,7 @@ public class BridgeWiringTest {
 
 		@Override public synchronized void index(QueryDocument document) { indexed.add(document); }
 		@Override public void delete(String resourceType, String resourceUuid) { }
+		@Override public void bulkDeleteByPatient(String patientUuid) { }
 		@Override public List<QueryDocument> searchByPatient(String p, String q, int l) {
 			return Collections.emptyList();
 		}

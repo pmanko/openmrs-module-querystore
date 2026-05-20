@@ -66,6 +66,8 @@ public class AllergyIndexingAdviceTest {
 		        PatientService.class.getMethod("removeAllergy", Allergy.class, String.class),
 		        new Object[]{a, "reason"}, null);
 		assertEquals(1, service.deleted.size());
+		assertEquals("non-patient purge must not trigger cross-type bulk-delete",
+		        0, service.bulkDeletedPatients.size());
 	}
 
 	@Test

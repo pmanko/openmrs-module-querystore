@@ -37,11 +37,18 @@ final class BridgeAdviceTestSupport {
 
 		final List<String[]> deleted = new ArrayList<>();
 
+		final List<String> bulkDeletedPatients = new ArrayList<>();
+
 		@Override public void index(QueryDocument document) { indexed.add(document); }
 
 		@Override
 		public void delete(String resourceType, String resourceUuid) {
 			deleted.add(new String[]{resourceType, resourceUuid});
+		}
+
+		@Override
+		public void bulkDeleteByPatient(String patientUuid) {
+			bulkDeletedPatients.add(patientUuid);
 		}
 
 		@Override public List<QueryDocument> searchByPatient(String p, String q, int l) {

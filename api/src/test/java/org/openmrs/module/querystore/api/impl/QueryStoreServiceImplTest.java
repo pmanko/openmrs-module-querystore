@@ -65,6 +65,41 @@ public class QueryStoreServiceImplTest {
 	}
 
 	@Test
+	public void bulkDeleteByPatient_delegatesToBackend() {
+		FakeBackendStore backend = new FakeBackendStore(false);
+		service.setBackend(backend);
+
+		service.bulkDeleteByPatient("patient-9");
+
+		assertEquals("service must forward the patient uuid to the backend",
+		        1, backend.bulkDeleteByPatientCount.get());
+		assertEquals("patient-9", backend.bulkDeleteByPatientUuids.get(0));
+	}
+
+	@Test
+	public void bulkDeleteByPatient_toleratesNullUuid() {
+		// Mirrors delete(): a null caller (probably a misconfigured advice) must not throw —
+		// the dispatcher's swallow guard would log it but the per-document loop would still be
+		// interrupted. Return silently so subsequent calls in the same after-commit task survive.
+		FakeBackendStore backend = new FakeBackendStore(false);
+		service.setBackend(backend);
+
+		service.bulkDeleteByPatient(null);
+
+		assertEquals("must not call backend on null uuid",
+		        0, backend.bulkDeleteByPatientCount.get());
+	}
+
+	@Test
+	public void bulkDeleteByPatient_unwiredBackend_returnsQuietly() {
+		// No backend set (e.g. wireBackend hasn't run yet, or the configured backend bean failed
+		// to load). The call must not NPE — log the warn and return so the dispatcher can move on
+		// to the next document in the after-commit task.
+		service.bulkDeleteByPatient("patient-9");
+		// No assertion possible without a logger spy; passing is "no exception thrown."
+	}
+
+	@Test
 	public void searchByPatient_coldPatient_triggersEnsureIndexedOnce() {
 		FakeBackendStore backend = new FakeBackendStore(false);
 		RecordingBootstrapService bootstrap = new RecordingBootstrapService();
@@ -145,6 +180,8 @@ public class QueryStoreServiceImplTest {
 		final AtomicInteger hybridCount = new AtomicInteger();
 		final AtomicInteger bm25Count = new AtomicInteger();
 		final AtomicInteger knnCount = new AtomicInteger();
+		final AtomicInteger bulkDeleteByPatientCount = new AtomicInteger();
+		final java.util.List<String> bulkDeleteByPatientUuids = new java.util.ArrayList<>();
 
 		FakeBackendStore(boolean existsByPatientReturn) {
 			this.existsByPatientReturn = existsByPatientReturn;
@@ -161,7 +198,11 @@ public class QueryStoreServiceImplTest {
 		@Override public WriteResult delete(String resourceType, String resourceUuid) { return null; }
 		@Override public BulkWriteResult bulkUpsert(List<QueryDocument> docs) { return null; }
 		@Override public BulkWriteResult bulkDelete(String resourceType, List<String> uuids) { return null; }
-		@Override public BulkWriteResult bulkDeleteByPatient(String patientUuid) { return null; }
+		@Override public BulkWriteResult bulkDeleteByPatient(String patientUuid) {
+			bulkDeleteByPatientCount.incrementAndGet();
+			bulkDeleteByPatientUuids.add(patientUuid);
+			return null;
+		}
 		@Override public SearchResult bm25(SearchRequest req) { bm25Count.incrementAndGet(); return SearchResult.empty(); }
 		@Override public SearchResult knn(SearchRequest req) { knnCount.incrementAndGet(); return SearchResult.empty(); }
 		@Override public SearchResult hybrid(SearchRequest req) { hybridCount.incrementAndGet(); return SearchResult.empty(); }

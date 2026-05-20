@@ -75,6 +75,8 @@ public class TestOrderIndexingAdviceTest {
 		        OrderService.class.getMethod("purgeOrder", Order.class),
 		        new Object[]{order}, null);
 		assertEquals(1, service.deleted.size());
+		assertEquals("non-patient purge must not trigger cross-type bulk-delete",
+		        0, service.bulkDeletedPatients.size());
 	}
 
 	private static TestOrder testOrder(String uuid, boolean voided) {

@@ -25,7 +25,20 @@ import org.openmrs.module.querystore.serialization.PatientRecordSerializer;
  * question (see {@code docs/adr.md#patient-merge-handling}) covers re-indexing and cross-patient
  * UUID rewrites on merge, which is structurally larger than this advice's scope. Until that lands,
  * a merged patient's read-store documents are reconciled by the bootstrap.
- * <pre>Removal trigger: TBD (events-first patient subscriber)</pre>
+ *
+ * <p><b>Bypass surface.</b> The cross-type purge sweep wired via
+ * {@link #bulkDeletePatientUuidFor(org.openmrs.Patient)} fires only when a patient is removed
+ * through {@link org.openmrs.api.PatientService#purgePatient(org.openmrs.Patient)}. A removal that
+ * bypasses {@code PatientService} (raw SQL, a sibling module reaching into the DAO, or
+ * {@link org.openmrs.api.PersonService#purgePerson(org.openmrs.Person)} on a person-who-is-a-patient
+ * after the patient row was independently removed) is not advised; the patient's cross-type
+ * read-store documents survive until the bootstrap reconciles them. Tracked under the "Sync
+ * reliability and reconciliation" ADR open question; the canonical core entry point remains
+ * {@code purgePatient}.
+ * <pre>Removal trigger: TBD (events-first patient subscriber). The replacement must preserve BOTH
+ * the per-row delete on querystore_patient AND the cross-type bulkDeleteByPatient sweep wired
+ * via {@link #bulkDeletePatientUuidFor(org.openmrs.Patient)} — dropping either re-opens the PHI
+ * leak this advice was extended to close.</pre>
  */
 public class PatientIndexingAdvice extends AbstractIndexingAdvice<Patient> {
 
@@ -53,5 +66,17 @@ public class PatientIndexingAdvice extends AbstractIndexingAdvice<Patient> {
 	@Override
 	protected Set<String> purgeMethods() {
 		return PURGE_METHODS;
+	}
+
+	/**
+	 * On {@code purgePatient}, sweep every per-type-store document keyed by this patient's uuid.
+	 * The per-row delete on {@code querystore_patient} (driven by {@link AbstractIndexingAdvice}'s
+	 * default purge handling) only removes the patient document itself; without this hook, every
+	 * obs / encounter / condition / drug_order / etc. for the patient_uuid would persist in the
+	 * read-store past the core deletion — a PHI leak.
+	 */
+	@Override
+	protected String bulkDeletePatientUuidFor(Patient root) {
+		return root.getUuid();
 	}
 }

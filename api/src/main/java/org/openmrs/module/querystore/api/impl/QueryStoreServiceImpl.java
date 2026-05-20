@@ -83,6 +83,18 @@ public class QueryStoreServiceImpl extends BaseOpenmrsService implements QuerySt
 	}
 
 	@Override
+	public void bulkDeleteByPatient(String patientUuid) {
+		if (patientUuid == null) {
+			return;
+		}
+		if (backend == null) {
+			log.warn("No BackendStore wired; ignoring bulkDeleteByPatient call for " + patientUuid);
+			return;
+		}
+		backend.bulkDeleteByPatient(patientUuid);
+	}
+
+	@Override
 	public List<QueryDocument> searchByPatient(String patientUuid, String query, int limit) {
 		if (backend == null || patientUuid == null) {
 			return Collections.emptyList();

@@ -112,7 +112,13 @@ public abstract class AbstractIndexingAdvice<T extends BaseOpenmrsData> implemen
 			}
 		}
 
-		if (toIndex.isEmpty() && toDelete.isEmpty()) {
+		// Cross-type sweep hook: subclasses whose purge means "this patient is gone from core,
+		// remove every per-type-store document keyed by their patient_uuid" return the uuid here.
+		// Default null: no cross-type sweep — purging an obs/encounter/condition/etc. only removes
+		// that one row. Currently only PatientIndexingAdvice opts in.
+		String bulkDeletePatientUuid = purge ? bulkDeletePatientUuidFor(root) : null;
+
+		if (toIndex.isEmpty() && toDelete.isEmpty() && bulkDeletePatientUuid == null) {
 			return;
 		}
 		String resourceType = ser.getResourceType();
@@ -136,6 +142,15 @@ public abstract class AbstractIndexingAdvice<T extends BaseOpenmrsData> implemen
 				catch (RuntimeException e) {
 					log.warn("Bridge skipping delete for " + resourceType + "/" + uuid
 					        + " due to failure", e);
+				}
+			}
+			if (bulkDeletePatientUuid != null) {
+				try {
+					indexer.bulkDeleteByPatient(bulkDeletePatientUuid);
+				}
+				catch (RuntimeException e) {
+					log.warn("Bridge skipping bulk-delete-by-patient for "
+					        + bulkDeletePatientUuid + " due to failure", e);
 				}
 			}
 		});
@@ -178,6 +193,27 @@ public abstract class AbstractIndexingAdvice<T extends BaseOpenmrsData> implemen
 	 */
 	protected List<T> collectTree(T root) {
 		return Collections.singletonList(root);
+	}
+
+	/**
+	 * Subclass hook: when this advice fires for a purge method, also bulk-delete every per-type-
+	 * store document keyed by the returned {@code patient_uuid}. Default {@code null}: purge
+	 * removes only the entity's own row, no cross-type sweep.
+	 *
+	 * <p>Currently only {@link PatientIndexingAdvice} overrides — a core {@code purgePatient} call
+	 * removes the patient from OpenMRS, so the read-store must follow and erase every obs,
+	 * encounter, condition, drug_order, etc. keyed by that patient_uuid to honour the underlying
+	 * deletion's privacy intent. Voiding a patient is NOT a deletion (the chart stays searchable
+	 * for audit/recovery), so the hook is consulted only when the advised method is in
+	 * {@link #purgeMethods()}.
+	 *
+	 * <p>Returning a non-null uuid causes {@link BridgeIndexer#bulkDeleteByPatient(String)} to
+	 * fire after the per-row delete on the dispatcher's after-commit thread. Per-document failures
+	 * inside the bulk delete are swallowed by the backend's own per-table/-index catch so a stale
+	 * lock on one type doesn't poison the rest of the sweep.
+	 */
+	protected String bulkDeletePatientUuidFor(T root) {
+		return null;
 	}
 
 	BridgeIndexer indexer() {

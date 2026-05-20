@@ -455,10 +455,9 @@ public class LuceneBackendStoreTest {
 		// silently leaves PHI in any index inherited from a prior JVM whose writer hasn't been
 		// opened this session — every type with no current-session activity stays unpurged.
 		//
-		// NOTE: bulkDeleteByPatient has no production AOP trigger today — PatientIndexingAdvice
-		// only issues a single-row delete on patient purge. This test pins the SPI contract for
-		// any future caller (REST endpoint, admin script, broadened PatientIndexingAdvice) so
-		// they inherit the cross-session fix without rediscovering the bug.
+		// Production trigger: PatientIndexingAdvice's bulkDeletePatientUuidFor hook fires this
+		// SPI on every core purgePatient call. This test pins the backend contract — that the
+		// sweep finds on-disk indexes from prior JVMs as well as the in-memory writers cache.
 		backend.upsert(doc("obs", "patient-A", "prior session obs", null));
 		backend.close();
 

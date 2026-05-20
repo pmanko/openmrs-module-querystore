@@ -63,6 +63,8 @@ public class PatientProgramIndexingAdviceTest {
 		        ProgramWorkflowService.class.getMethod("purgePatientProgram", PatientProgram.class),
 		        new Object[]{pp}, null);
 		assertEquals(1, service.deleted.size());
+		assertEquals("non-patient purge must not trigger cross-type bulk-delete",
+		        0, service.bulkDeletedPatients.size());
 	}
 
 	@Test

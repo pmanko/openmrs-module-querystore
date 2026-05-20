@@ -17,12 +17,11 @@ import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_SYNONYMS;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 
 import org.junit.Before;
 import org.junit.Test;
-import org.openmrs.module.querystore.api.QueryStoreService;
+import org.openmrs.module.querystore.bridge.BridgeAdviceTestSupport.RecordingService;
 import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 
@@ -84,20 +83,11 @@ public class BridgeIndexerTest {
 		assertEquals("u-3", service.deleted.get(0)[1]);
 	}
 
-	private static final class RecordingService implements QueryStoreService {
-		final List<QueryDocument> indexed = new ArrayList<>();
-		final List<String[]> deleted = new ArrayList<>();
-
-		@Override public void index(QueryDocument document) { indexed.add(document); }
-		@Override public void delete(String resourceType, String resourceUuid) {
-			deleted.add(new String[]{resourceType, resourceUuid});
-		}
-		@Override public List<QueryDocument> searchByPatient(String p, String q, int l) {
-			return Collections.emptyList();
-		}
-		@Override public List<QueryDocument> search(String q, int l) { return Collections.emptyList(); }
-		@Override public void onStartup() { }
-		@Override public void onShutdown() { }
+	@Test
+	public void bulkDeleteByPatient_forwardsToService() {
+		indexer.bulkDeleteByPatient("patient-9");
+		assertEquals(1, service.bulkDeletedPatients.size());
+		assertEquals("patient-9", service.bulkDeletedPatients.get(0));
 	}
 
 	private static final class CountingEmbedder implements EmbeddingProvider {

@@ -65,6 +65,8 @@ public class MedicationDispenseIndexingAdviceTest {
 		                MedicationDispense.class),
 		        new Object[]{md}, null);
 		assertEquals(1, service.deleted.size());
+		assertEquals("non-patient purge must not trigger cross-type bulk-delete",
+		        0, service.bulkDeletedPatients.size());
 	}
 
 	private static MedicationDispense md(String uuid, boolean voided) {

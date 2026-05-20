@@ -66,6 +66,8 @@ public class DiagnosisIndexingAdviceTest {
 		        DiagnosisService.class.getMethod("purgeDiagnosis", Diagnosis.class),
 		        new Object[]{d}, null);
 		assertEquals(1, service.deleted.size());
+		assertEquals("non-patient purge must not trigger cross-type bulk-delete",
+		        0, service.bulkDeletedPatients.size());
 	}
 
 	@Test

@@ -100,6 +100,8 @@ public class ObsIndexingAdviceTest {
 
 		assertEquals(1, service.deleted.size());
 		assertEquals("u-3", service.deleted.get(0)[1]);
+		assertEquals("non-patient purge must not trigger cross-type bulk-delete",
+		        0, service.bulkDeletedPatients.size());
 	}
 
 	@Test
