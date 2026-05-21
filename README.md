@@ -2,29 +2,50 @@
 
 **Module ID:** `querystore`
 
-An OpenMRS module that maintains an optimized read-side projection of clinical data, following the Command Query Responsibility Segregation (CQRS) pattern. It synchronizes data from the OpenMRS transactional database into a purpose-built query store designed for AI applications, analytics, reporting, and any downstream system that needs to consume clinical data efficiently.
+An OpenMRS module that maintains an optimized read-side projection of clinical data, following the Command Query Responsibility Segregation (CQRS) pattern. It synchronizes data from the OpenMRS transactional database into a purpose-built read store designed for **semantic search, free-text retrieval, and embedding-ranked (kNN) clinical search** — the query shapes that transactional SQL and flattened analytical layers like MambaETL do not address.
 
 ## Table of Contents
 
 1. [Why a Query Store?](#why-a-query-store)
-2. [Why a Module and Not in Core?](#why-a-module-and-not-in-core)
-3. [Architecture](#architecture)
-4. [Data Model](#data-model)
-5. [Supported Clinical Data Types](#supported-clinical-data-types)
-6. [Extending with Custom Resource Types](#extending-with-custom-resource-types)
-7. [Text Serialization](#text-serialization)
-8. [Design Decisions](#design-decisions)
-9. [License](#license)
+2. [Scope](#scope)
+3. [Why a Module and Not in Core?](#why-a-module-and-not-in-core)
+4. [Architecture](#architecture)
+5. [Data Model](#data-model)
+6. [Supported Clinical Data Types](#supported-clinical-data-types)
+7. [Extending with Custom Resource Types](#extending-with-custom-resource-types)
+8. [Text Serialization](#text-serialization)
+9. [Design Decisions](#design-decisions)
+10. [License](#license)
 
 ## Why a Query Store?
 
-OpenMRS core uses a normalized relational database (MySQL) optimized for transactional clinical workflows — recording observations, placing orders, managing patient programs. These normalized structures are not well-suited for:
+OpenMRS core uses a normalized relational database (MySQL) optimized for transactional clinical workflows — recording observations, placing orders, managing patient programs. These normalized structures are not well-suited for the semantic / free-text / kNN retrieval shape:
 
-- **AI/ML applications** such as patient chart search (semantic and keyword), risk prediction, clinical NLP, and cohort building
-- **Analytics and reporting** that require scanning large volumes of data across patients
-- **Full-text and semantic search** over clinical records
+- **Patient chart search** combining keyword (BM25) and semantic (embedding kNN) ranking
+- **Clinical NLP and AI/ML pipelines** that consume indexed clinical text directly
+- **Cross-type retrieval** of a patient's clinical record in a single query via the `querystore_*` wildcard
 
-A query store solves this by maintaining a separate, denormalized projection of clinical data optimized for reads. The transactional database remains the source of truth for writes; the query store serves reads.
+Querystore solves these specifically. The transactional database remains the source of truth for writes; querystore serves the read-side queries listed above. Structured analytical workloads — aggregations, cohort definitions, time-series reporting, "missing data" queries — are a separate query shape and are not what querystore is for; see [Scope](#scope) below for where those belong.
+
+## Scope
+
+Querystore is one of several read-side projections of OpenMRS clinical data. Each projection is built for a distinct query shape, and using the wrong one wastes effort.
+
+**What querystore is for:**
+- Semantic / free-text / embedding-ranked (kNN) retrieval over patient-scoped clinical data
+- Hybrid search (BM25 + vector similarity) over indexed clinical records
+- Cross-type retrieval across clinical resource types via the `querystore_*` wildcard
+
+**What querystore is not for:**
+
+| Use case | Where to look instead |
+|---|---|
+| Structured analytics, aggregations, cohort definitions, time-series reporting | Flattened analytical projections like MambaETL where deployed; otherwise the transactional DB or the OpenMRS Reporting module |
+| Dictionary lookups — concept synonyms across locales, definitions, code-system mappings, value-set expansion | OCL (Open Concept Lab) or FHIR terminology operations (`$lookup`, `$translate`, `$expand`); the FHIR2 module exposes these on every OpenMRS install |
+| "Never referenced" / missing-data queries (drugs never prescribed, locations with no encounters this quarter) | SQL against the transactional DB or an analytical projection — `LEFT JOIN ... IS NULL` / `NOT IN (...)` is both cheaper and more expressive than embedding similarity for finding absences |
+| Metadata catalog search for types with only a name + structured fields (e.g., `BillableService`, `OrderType`, `EncounterType`, `VisitType`, `PaymentMode`, `LocationTag`) | Core service APIs and SQL — embedding similarity doesn't add over an exact/fuzzy name match when the catalog carries no rich free text |
+
+Most OpenMRS metadata types fail the indexing criterion. Module authors considering a `ResourceTypeProvider` for a metadata type should first check [Decision 13's *Criteria for contributing a metadata resource type*](docs/adr.md#criteria-for-contributing-a-metadata-resource-type) — the iff rule that this Scope section condenses.
 
 ## Why a Module and Not in Core?
 
@@ -68,10 +89,9 @@ Query Store Backend (e.g., Elasticsearch)
     ▼
 Consumers
     ├── Patient chart search (hybrid keyword + semantic)
-    ├── Cross-patient search and cohort identification
-    ├── AI/ML pipelines (risk prediction, clinical NLP, outbreak detection)
-    ├── Reporting and dashboards
-    └── Research and analytics
+    ├── Cross-type clinical retrieval (querystore_* wildcard)
+    ├── AI agents and LLM pipelines consuming indexed clinical text
+    └── Clinical NLP over indexed records
 ```
 
 ## Data Model
