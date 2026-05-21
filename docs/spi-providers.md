@@ -24,6 +24,10 @@ What you _do not_ build: schema migrations, table/index creation, embedding, sea
 - **Embedding.** `BridgeIndexer` (steady-state writes) and `BootstrapServiceImpl` (initial backfill) embed your documents' `text` field with the deployment-configured `EmbeddingProvider`.
 - **Authorization.** Consumer reads go through `QueryStoreService`'s `@Authorized(GET_PATIENTS)` surface. Your provider writes; you do not gate access.
 
+## Prerequisite — confirm your type passes the indexing criterion
+
+Before following the steps below, confirm your resource type meets [Decision 13's *Criteria for contributing a metadata resource type*](./adr.md#criteria-for-contributing-a-metadata-resource-type). The walkthrough is the cheap part; deciding *whether* to index is the load-bearing decision. The criterion bites hardest for types extending `BaseOpenmrsMetadata` (catalog/reference data), where most candidates fail the iff rule — structured catalog filtering, "never referenced" queries, and aggregations are better served by SQL or a downstream analytical projection (e.g., MambaETL where deployed), and dictionary lookups belong in OCL / FHIR terminology services. Clinical-data types extending `BaseOpenmrsData` (the SPI's current type bound, see [issue #16](https://github.com/openmrs/openmrs-module-querystore/issues/16)) generally satisfy the criterion by carrying free-text clinical content over the patient record.
+
 ## Prerequisite — entity must extend `BaseOpenmrsData`
 
 Your domain entity must be a Hibernate-mapped subclass of `org.openmrs.BaseOpenmrsData`. The AOP advice base class (`AbstractIndexingAdvice<T extends BaseOpenmrsData>`) is bounded on this for two reasons: the per-node voided routing reads `getVoided()`, and the bootstrap cursor reads `getDateChanged() ?? getDateCreated()`. Domain entities that don't extend `BaseOpenmrsData` cannot use the SPI as-is — that's a deliberate scope limit, not an accident.
