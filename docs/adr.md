@@ -938,6 +938,18 @@ The embedding model identifier and its dimensions are part of the public contrac
 - Swapping the embedding provider is a re-index event — the new model produces different vectors for the same text, and existing kNN results become incomparable to fresh queries until the index is rebuilt. This couples to the [Embedding model versioning](#embedding-model-versioning) and [Re-index / alias strategy](#re-index--alias-strategy) open questions.
 - The provider SPI is independent of the backend SPI ([Decision 3](#decision-3-pluggable-backend-spi-with-three-reference-implementations)). Choice of MySQL/Lucene/Elasticsearch does not constrain choice of embedding provider, and vice versa.
 
+### Empirical validation (chartsearchai, May 2026)
+
+chartsearchai's [Decision 22](https://github.com/openmrs/openmrs-module-chartsearchai/blob/main/docs/adr.md#decision-22-e5-base-v2-for-the-querystore-backed-retrieval-path) is the first real-world consumer evaluation of this decision's multilingual constraint. On its LLM-as-filter consumer pattern — querystore returns the top-K, the local LLM does the filtering in the answer phase — chartsearchai compared three embedders on real patient charts at `chartsearchai.querystore.enabled=true` with `topK=30`:
+
+- `sentence-transformers/all-MiniLM-L6-v2` (384 dims, ~90MB) — missed colloquial-to-clinical bridges; "any heart issues?" returned 0 records for a patient with Cerebrovascular Accident in the chart.
+- `intfloat/e5-base-v2` (768 dims, ~440MB, via the self-contained `Xenova/e5-base-v2` ONNX export) — bridged the colloquial-to-clinical gap; the LLM correctly cited the CVA records on the same query.
+- `ncbi/MedCPT-*` (dual-encoder, 768 dims) — refused the bridge; its PubMed-trained clusters pedantically separated lay phrasing from clinical terms.
+
+The finding: with the LLM doing the filtering, the dominant retrieval failure mode is **vocabulary gaps** between how users phrase questions and how clinical records are written; the embedder's job in this regime is to put plausible candidates in the top-K, not to feed an adaptive-filtering pipeline. e5-base-v2's multilingual training surfaces those vocabulary bridges where L6-v2's tighter clusters miss them.
+
+The choice is consumer-side — querystore itself still prescribes no model, per the SPI design above — but the evaluation confirms that the multilingual constraint stated in this decision is load-bearing for clinical retrieval at LLM-as-filter altitudes, not a precaution. Deployments without their own evaluation criteria can use `e5-base-v2` as a known-good multilingual default; consumers with specific requirements (clinical-domain models, CPU-budget constraints, dual-encoder architectures) select via `querystore.embedding.providerBean`.
+
 ---
 
 ## Decision 9: Coded Fields — Store Both UUID and Name
