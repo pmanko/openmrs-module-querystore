@@ -50,6 +50,15 @@ final class ElasticsearchFieldNames {
 	 */
 	static final String DESCRIPTION = QueryStoreConstants.FIELD_DESCRIPTION;
 
+	/**
+	 * BM25-indexed companion of the {@code mapping_names} metadata list. Reference-term names
+	 * (LOINC, ICD-10, PIH, WHO-ATC, CIEL drug-class parents) bring external-authority vocabulary
+	 * into multi_match so a record whose preferred name lacks the category word still surfaces.
+	 * The structured list also lives in {@link #METADATA_JSON} for rehydration; this field
+	 * exists purely so BM25 can index it.
+	 */
+	static final String MAPPING_NAMES = QueryStoreConstants.FIELD_MAPPING_NAMES;
+
 	static final String EMBEDDING = "embedding";
 
 	static final String METADATA_JSON = "metadata_json";

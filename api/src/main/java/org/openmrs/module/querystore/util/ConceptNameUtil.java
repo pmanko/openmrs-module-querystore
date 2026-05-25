@@ -17,7 +17,9 @@ import java.util.TreeSet;
 
 import org.openmrs.Concept;
 import org.openmrs.ConceptDescription;
+import org.openmrs.ConceptMap;
 import org.openmrs.ConceptName;
+import org.openmrs.ConceptReferenceTerm;
 import org.openmrs.api.ConceptNameType;
 import org.openmrs.api.context.Context;
 import org.openmrs.util.LocaleUtility;
@@ -35,6 +37,16 @@ public final class ConceptNameUtil {
 	// Trades embedding-input length for BM25 vocabulary breadth — see Decision 6's SHORT-name
 	// promotion paragraph for the 4-patient eval that ratified raising this from 3 to 10.
 	private static final int MAX_NON_SHORT_SYNONYMS = 10;
+
+	/**
+	 * Cap on the number of reference-term names returned from {@link #getMappingNames}. A typical
+	 * CIEL concept has 3–8 populated mappings (LOINC, ICD-10, PIH, WHOATC, CIEL drug-class
+	 * parents); 10 is the same envelope as {@link #MAX_NON_SHORT_SYNONYMS}, picked so the BM25
+	 * mapping-names field doesn't dwarf the preferred name on concepts with pathological mapping
+	 * lists. Mapping names are BM25-only signal — they are NOT added to the embedding input — so
+	 * the cap is purely an index-size / IDF-normalisation guard, not an embedding-budget guard.
+	 */
+	public static final int MAX_MAPPING_NAMES = 10;
 
 	private ConceptNameUtil() {
 	}
@@ -168,6 +180,65 @@ public final class ConceptNameUtil {
 			}
 			result.add(name);
 			cap--;
+		}
+		return result;
+	}
+
+	/**
+	 * Returns the names of the concept's reference-term mappings — the external-authority labels
+	 * dictionary mapping authors curate (LOINC's "Urea nitrogen [Moles/volume] in Serum or Plasma",
+	 * ICD-10's "Chronic kidney disease, unspecified", PIH's "Chronic kidney disease", CIEL's
+	 * drug-class parents like "Heparins"). Same BM25-vocabulary-bridge mechanic as
+	 * {@link #getDescription}: names that contain category words (kidney, disease, serum,
+	 * plasma, fever) which the concept's preferred name doesn't carry surface the record on
+	 * those queries.
+	 *
+	 * <p>Returns empty when the concept is null, has no mappings, or none of its mappings carry
+	 * a populated reference-term name (the common case for SNOMED-mapped concepts on demo
+	 * deployments — SNOMED licensing prevents OCL from distributing names). Names are
+	 * de-duplicated (multiple sources commonly use the same wording), trimmed, alphabetically
+	 * sorted for indexer determinism, and capped at {@link #MAX_MAPPING_NAMES}. Retired/voided
+	 * mappings and retired terms are skipped — they should not bleed into the BM25 channel.
+	 *
+	 * <p>Per Decision 6 this field is BM25-only and is NOT included in
+	 * {@link org.openmrs.module.querystore.model.QueryDocument#getEmbeddingInput()} — the body
+	 * is long and vocabulary-overlaps across related concepts (the same asymmetric-bias concern
+	 * that excluded description from embedding input).
+	 */
+	public static List<String> getMappingNames(Concept concept) {
+		if (concept == null || concept.getConceptMappings() == null
+				|| concept.getConceptMappings().isEmpty()) {
+			return Collections.emptyList();
+		}
+		TreeSet<String> sorted = new TreeSet<>();
+		for (ConceptMap m : concept.getConceptMappings()) {
+			if (m == null) {
+				continue;
+			}
+			// ConceptMap has no retired/voided flag of its own — lifecycle is managed by the
+			// parent Concept; if the concept is being indexed we trust its mappings are live.
+			ConceptReferenceTerm term = m.getConceptReferenceTerm();
+			if (term == null || Boolean.TRUE.equals(term.getRetired())) {
+				continue;
+			}
+			String name = term.getName();
+			if (name == null) {
+				continue;
+			}
+			String trimmed = name.trim();
+			if (!trimmed.isEmpty()) {
+				sorted.add(trimmed);
+			}
+		}
+		if (sorted.isEmpty()) {
+			return Collections.emptyList();
+		}
+		List<String> result = new ArrayList<>(Math.min(sorted.size(), MAX_MAPPING_NAMES));
+		for (String n : sorted) {
+			if (result.size() >= MAX_MAPPING_NAMES) {
+				break;
+			}
+			result.add(n);
 		}
 		return result;
 	}

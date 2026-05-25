@@ -54,6 +54,16 @@ final class LuceneFieldNames {
 	static final String DESCRIPTION = QueryStoreConstants.FIELD_DESCRIPTION;
 
 	/**
+	 * BM25-indexed companion of the {@code mapping_names} metadata list. Reference-term names
+	 * (LOINC, ICD-10, PIH, WHO-ATC, CIEL drug-class parents) give the query parser external-
+	 * authority vocabulary the preferred name doesn't carry — e.g. "Chronic kidney insufficiency"
+	 * has an ICD-10 mapping named "Chronic kidney disease, unspecified" so a "kidney disease"
+	 * query surfaces the record via the mapping name. Stored {@code Field.Store.NO}; the
+	 * structured list lives in {@link #METADATA_JSON} for rehydration.
+	 */
+	static final String MAPPING_NAMES = QueryStoreConstants.FIELD_MAPPING_NAMES;
+
+	/**
 	 * Stored byte blob carrying the raw float32 embedding. Doubles as the source the brute-force
 	 * kNN scan iterates over — Lucene 8 ships no native HNSW kNN field, and the tier is pinned
 	 * to 8.11.2 to match core's transitive Lucene (see {@code LuceneBackendStore} class javadoc).

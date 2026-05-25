@@ -161,6 +161,7 @@ final class ElasticsearchSchemaManager {
 		properties.put(ElasticsearchFieldNames.TEXT, Property.of(p -> p.text(t -> t.analyzer("standard"))));
 		properties.put(ElasticsearchFieldNames.SYNONYMS, Property.of(p -> p.text(t -> t.analyzer("standard"))));
 		properties.put(ElasticsearchFieldNames.DESCRIPTION, Property.of(p -> p.text(t -> t.analyzer("standard"))));
+		properties.put(ElasticsearchFieldNames.MAPPING_NAMES, Property.of(p -> p.text(t -> t.analyzer("standard"))));
 		properties.put(ElasticsearchFieldNames.EMBEDDING, Property.of(p -> p.denseVector(v -> v
 		        .dims(embeddingDims)
 		        .index(true)

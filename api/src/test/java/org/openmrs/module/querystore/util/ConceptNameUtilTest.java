@@ -13,13 +13,17 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 import org.junit.Test;
 import org.openmrs.Concept;
 import org.openmrs.ConceptDescription;
+import org.openmrs.ConceptMap;
 import org.openmrs.ConceptName;
+import org.openmrs.ConceptReferenceTerm;
 import org.openmrs.api.ConceptNameType;
 
 public class ConceptNameUtilTest {
@@ -288,6 +292,157 @@ public class ConceptNameUtilTest {
 		c.addDescription(description("Persistently high arterial blood pressure.", Locale.ENGLISH));
 		assertEquals("Persistently high arterial blood pressure.",
 				ConceptNameUtil.getDescription(c));
+	}
+
+	@Test
+	public void getMappingNames_returnsEmpty_whenConceptNull() {
+		assertTrue(ConceptNameUtil.getMappingNames(null).isEmpty());
+	}
+
+	@Test
+	public void getMappingNames_returnsEmpty_whenNoMappings() {
+		// Common case in real data: ~13% of demo concepts have zero mappings. Empty return means
+		// putMappingNames skips writing the metadata key, keeping the doc compact.
+		Concept c = new Concept();
+		c.addName(preferredName("Asthma"));
+		assertTrue(ConceptNameUtil.getMappingNames(c).isEmpty());
+	}
+
+	@Test
+	public void getMappingNames_returnsEmpty_whenAllTermsLackNames() {
+		// SNOMED mappings on this demo are code-only (term.name is null across all 17,037 rows)
+		// because OCL doesn't redistribute SNOMED's PT/FSN. The slice must degrade to "no
+		// signal" rather than indexing null/empty strings into BM25.
+		Concept c = conceptWithMappings("Blood urea nitrogen",
+				mappingTo(term(null, "72341003")),
+				mappingTo(term("", "857")),
+				mappingTo(term("   ", "857")));
+		assertTrue(ConceptNameUtil.getMappingNames(c).isEmpty());
+	}
+
+	@Test
+	public void getMappingNames_returnsPopulatedNames_alphabeticallySorted() {
+		// Mirror the empirical data on the demo: BUN has LOINC, PIH, CIEL, SNOMED mappings.
+		// Three carry names (LOINC, PIH, CIEL), one does not (SNOMED). Result is alphabetic so
+		// indexer output is deterministic across runs.
+		Concept c = conceptWithMappings("Blood urea nitrogen",
+				mappingTo(term("Urea nitrogen [Moles/volume] in Serum or Plasma", "14937-7")),
+				mappingTo(term("Urea (BUN)", "857")),
+				mappingTo(term("Blood urea nitrogen", "857")),
+				mappingTo(term(null, "72341003")));
+
+		assertEquals(Arrays.asList(
+				"Blood urea nitrogen",
+				"Urea (BUN)",
+				"Urea nitrogen [Moles/volume] in Serum or Plasma"),
+				ConceptNameUtil.getMappingNames(c));
+	}
+
+	@Test
+	public void getMappingNames_trimsWhitespaceAndDropsBlanks() {
+		// Real-world data has been seen with names that are just whitespace (placeholder rows
+		// during bulk imports). Trim and drop so the BM25 channel doesn't index empty tokens.
+		Concept c = conceptWithMappings("Hypertension",
+				mappingTo(term("   Essential hypertension   ", "I10")),
+				mappingTo(term("\n\t  \n", "999")));
+
+		assertEquals(Arrays.asList("Essential hypertension"),
+				ConceptNameUtil.getMappingNames(c));
+	}
+
+	@Test
+	public void getMappingNames_dedupesSameStringAcrossSources() {
+		// PIH and CIEL frequently both ship the literal "Chronic kidney disease". TreeSet-based
+		// dedupe drops the duplicate so a single common phrase doesn't get double TF weight.
+		Concept c = conceptWithMappings("Chronic kidney insufficiency",
+				mappingTo(term("Chronic kidney disease", "3699")),
+				mappingTo(term("Chronic kidney disease", "N18.9")),
+				mappingTo(term("Chronic kidney disease, unspecified", "N18.9-alt")));
+
+		assertEquals(Arrays.asList(
+				"Chronic kidney disease",
+				"Chronic kidney disease, unspecified"),
+				ConceptNameUtil.getMappingNames(c));
+	}
+
+	@Test
+	public void getMappingNames_skipsRetiredReferenceTerms() {
+		// A retired reference term carries stale vocabulary by design. Excluding it keeps the
+		// BM25 channel current with the dictionary's living concept-to-code authority.
+		ConceptReferenceTerm liveTerm = term("Live mapping", "A00.0");
+		ConceptReferenceTerm retiredTerm = term("Stale mapping", "A00.1");
+		retiredTerm.setRetired(Boolean.TRUE);
+		Concept c = conceptWithMappings("Some condition",
+				mappingTo(liveTerm),
+				mappingTo(retiredTerm));
+
+		assertEquals(Arrays.asList("Live mapping"),
+				ConceptNameUtil.getMappingNames(c));
+	}
+
+	@Test
+	public void getMappingNames_capsAtMaxMappingNames() {
+		// Pathological concept with 15 distinct populated mapping names exercises the cap.
+		// Result keeps the alphabetically-first 10; locks the order so a refactor that
+		// switches data structures must preserve the determinism contract.
+		ConceptMap[] mappings = new ConceptMap[15];
+		for (int i = 0; i < 15; i++) {
+			char ch = (char) ('a' + i);
+			mappings[i] = mappingTo(term("name-" + ch, "Z" + i));
+		}
+		Concept c = conceptWithMappings("Pathological", mappings);
+
+		assertEquals(Arrays.asList(
+				"name-a", "name-b", "name-c", "name-d", "name-e",
+				"name-f", "name-g", "name-h", "name-i", "name-j"),
+				ConceptNameUtil.getMappingNames(c));
+	}
+
+	@Test
+	public void getMappingNames_exactlyCapEntries_keepsAllOfThem() {
+		// Boundary test for the cap loop. A refactor flipping the limit check off-by-one would
+		// either drop entry 10 or include entry 11; with exactly MAX_MAPPING_NAMES entries
+		// (10) the result must contain all of them.
+		ConceptMap[] mappings = new ConceptMap[10];
+		for (int i = 0; i < 10; i++) {
+			char ch = (char) ('a' + i);
+			mappings[i] = mappingTo(term("name-" + ch, "Z" + i));
+		}
+		Concept c = conceptWithMappings("Boundary", mappings);
+		assertEquals(10, ConceptNameUtil.getMappingNames(c).size());
+		assertEquals("name-j",
+				ConceptNameUtil.getMappingNames(c).get(9));
+	}
+
+	private static ConceptReferenceTerm term(String name, String code) {
+		ConceptReferenceTerm t = new ConceptReferenceTerm();
+		t.setName(name);
+		t.setCode(code);
+		// ConceptReferenceSource construction is heavyweight to stub; tests don't read source
+		// off the term so we leave conceptSource null. The slice never dereferences source from
+		// the term — it pulls names directly off the term itself.
+		return t;
+	}
+
+	private static ConceptMap mappingTo(ConceptReferenceTerm term) {
+		ConceptMap m = new ConceptMap();
+		m.setConceptReferenceTerm(term);
+		return m;
+	}
+
+	private static Concept conceptWithMappings(String preferred, ConceptMap... mappings) {
+		// Concept.addConceptMapping touches Context.getConceptService() through ConceptMap.equals
+		// on the LinkedHashSet add path — fine in production but breaks unit tests with no Spring
+		// context. Setting the mappings collection directly bypasses the set-equality path while
+		// preserving the iteration order the production code relies on.
+		Concept c = new Concept();
+		c.addName(preferredName(preferred));
+		Set<ConceptMap> set = new LinkedHashSet<>();
+		for (ConceptMap m : mappings) {
+			set.add(m);
+		}
+		c.setConceptMappings(set);
+		return c;
 	}
 
 	private static ConceptDescription description(String text, Locale locale) {

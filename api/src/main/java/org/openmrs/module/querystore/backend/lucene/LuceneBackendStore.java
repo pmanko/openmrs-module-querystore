@@ -481,6 +481,13 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 					descriptionBlob, Field.Store.NO));
 		}
 
+		String mappingNamesBlob = source.getMappingNamesText();
+		if (!mappingNamesBlob.isEmpty()) {
+			// Not stored — read path rehydrates from metadata_json. Indexed only for BM25.
+			target.add(new TextField(LuceneFieldNames.MAPPING_NAMES,
+					mappingNamesBlob, Field.Store.NO));
+		}
+
 		if (source.getEmbedding() != null) {
 			target.add(new StoredField(LuceneFieldNames.EMBEDDING_STORED,
 			        LuceneVectorCodec.encode(source.getEmbedding())));
@@ -567,6 +574,7 @@ public class LuceneBackendStore implements BackendStore, Closeable {
 		boosts.put(LuceneFieldNames.TEXT, 1.0f);
 		boosts.put(LuceneFieldNames.SYNONYMS, 1.0f);
 		boosts.put(LuceneFieldNames.DESCRIPTION, QueryStoreConstants.BM25_DESCRIPTION_BOOST);
+		boosts.put(LuceneFieldNames.MAPPING_NAMES, QueryStoreConstants.BM25_MAPPING_NAMES_BOOST);
 		BM25_FIELD_BOOSTS = Collections.unmodifiableMap(boosts);
 		BM25_FIELDS = BM25_FIELD_BOOSTS.keySet().toArray(new String[0]);
 	}

@@ -49,6 +49,7 @@ public final class QueryStoreConstants {
 	public static final String FIELD_CONCEPT_CLASS = "concept_class";
 	public static final String FIELD_SYNONYMS = "synonyms";
 	public static final String FIELD_DESCRIPTION = "description";
+	public static final String FIELD_MAPPING_NAMES = "mapping_names";
 
 	/**
 	 * BM25 query-time boost applied to the description field across all backends. Less than 1.0
@@ -61,6 +62,18 @@ public final class QueryStoreConstants {
 	 * literal in two places would silently drift over time.
 	 */
 	public static final float BM25_DESCRIPTION_BOOST = 0.5f;
+
+	/**
+	 * BM25 boost on the mapping-names field. Same rationale and band as
+	 * {@link #BM25_DESCRIPTION_BOOST}: a single concept can carry up to {@link
+	 * org.openmrs.module.querystore.util.ConceptNameUtil#MAX_MAPPING_NAMES} reference-term names
+	 * (LOINC / ICD-10 / PIH / WHO-ATC / CIEL class parents), which is more aggregate text per
+	 * record than the preferred name. Boost matches description's 0.5 because mapping names and
+	 * descriptions are the same shape of signal: external-authority vocabulary that should
+	 * surface a record on category-word queries without dominating preferred-name matches on
+	 * short queries.
+	 */
+	public static final float BM25_MAPPING_NAMES_BOOST = 0.5f;
 
 	public static final String FIELD_VALUE_NUMERIC = "value_numeric";
 	public static final String FIELD_VALUE_CODED_UUID = "value_coded_uuid";

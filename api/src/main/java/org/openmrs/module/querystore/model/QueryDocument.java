@@ -10,6 +10,7 @@
 package org.openmrs.module.querystore.model;
 
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_DESCRIPTION;
+import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_MAPPING_NAMES;
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_OBS_GROUP_CONCEPT_NAME;
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_SYNONYMS;
 
@@ -187,6 +188,32 @@ public class QueryDocument {
 					sb.append(' ');
 				}
 				sb.append(synonym);
+			}
+		}
+		return sb.toString();
+	}
+
+	/**
+	 * Space-joined reference-term mapping names suitable for BM25 indexing as a top-level
+	 * companion of {@link #text} (Lucene and Elasticsearch tiers). Returns the empty string
+	 * when the {@code mapping_names} metadata is absent, not a List, or contains only
+	 * null/empty entries. Same shape as {@link #getSynonymsText()} so the Lucene serializer
+	 * uses one filter pattern for both. Per Decision 6 this is NOT added to
+	 * {@link #getEmbeddingInput()} — the per-record body is long and vocabulary-overlaps
+	 * across related concepts (the same asymmetric-bias rule applied to description).
+	 */
+	public String getMappingNamesText() {
+		Object names = metadata.get(FIELD_MAPPING_NAMES);
+		if (!(names instanceof List)) {
+			return "";
+		}
+		StringBuilder sb = new StringBuilder();
+		for (Object n : (List<?>) names) {
+			if (n instanceof String && !((String) n).isEmpty()) {
+				if (sb.length() > 0) {
+					sb.append(' ');
+				}
+				sb.append(n);
 			}
 		}
 		return sb.toString();

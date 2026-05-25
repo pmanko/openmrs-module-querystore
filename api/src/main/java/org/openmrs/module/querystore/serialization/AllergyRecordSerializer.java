@@ -106,6 +106,7 @@ public class AllergyRecordSerializer extends AbstractRecordSerializer<Allergy> {
 				doc.putMetadata(FIELD_SYNONYMS, synonyms);
 			}
 			putDescription(doc, codedAllergen);
+			putMappingNames(doc, codedAllergen);
 		} else {
 			doc.putMetadata(FIELD_ALLERGEN_NON_CODED, displayName);
 		}

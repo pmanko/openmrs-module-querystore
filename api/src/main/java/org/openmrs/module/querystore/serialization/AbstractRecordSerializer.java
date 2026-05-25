@@ -20,6 +20,7 @@ import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_FORM_NAME;
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_FORM_UUID;
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_LOCATION_NAME;
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_LOCATION_UUID;
+import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_MAPPING_NAMES;
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_PROVIDER_NAME;
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_PROVIDER_UUID;
 import static org.openmrs.module.querystore.QueryStoreConstants.FIELD_SYNONYMS;
@@ -118,6 +119,7 @@ public abstract class AbstractRecordSerializer<T> implements ClinicalRecordSeria
 			doc.putMetadata(FIELD_SYNONYMS, synonyms);
 		}
 		putDescription(doc, concept);
+		putMappingNames(doc, concept);
 	}
 
 	/**
@@ -132,6 +134,20 @@ public abstract class AbstractRecordSerializer<T> implements ClinicalRecordSeria
 		String description = ConceptNameUtil.getDescription(concept);
 		if (!description.isEmpty()) {
 			doc.putMetadata(FIELD_DESCRIPTION, description);
+		}
+	}
+
+	/**
+	 * Writes the concept's reference-term mapping names (LOINC / ICD-10 / PIH / WHO-ATC / CIEL
+	 * drug-class parents) into {@link QueryStoreConstants#FIELD_MAPPING_NAMES} as a list of
+	 * strings. Same shape and extraction rationale as {@link #putDescription}: a separate
+	 * BM25-only channel populated from external-authority vocabulary the preferred name lacks.
+	 * No-op on null concept or when no mapping carries a populated reference-term name.
+	 */
+	protected final void putMappingNames(QueryDocument doc, Concept concept) {
+		List<String> names = ConceptNameUtil.getMappingNames(concept);
+		if (!names.isEmpty()) {
+			doc.putMetadata(FIELD_MAPPING_NAMES, names);
 		}
 	}
 

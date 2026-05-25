@@ -277,16 +277,19 @@ public class ElasticsearchBackendStore implements BackendStore, Closeable {
 		}
 		List<String> indexes = resolveIndexes(req);
 		Query filter = ElasticsearchFilterTranslator.toQuery(req.getFilters());
-		// multi_match OR-fans across [text, synonyms, description^boost] so an alternate-term or
-		// category-word query surfaces docs whose preferred name doesn't carry the matching term
-		// (e.g. "kidney" hits Blood urea nitrogen via its description) per ADR Decision 6. The
-		// description boost is shared with the Lucene tier via QueryStoreConstants so the two
-		// backends can't silently drift.
+		// multi_match OR-fans across [text, synonyms, description^boost, mapping_names^boost] so
+		// an alternate-term or category-word query surfaces docs whose preferred name doesn't
+		// carry the matching term (e.g. "kidney" hits Blood urea nitrogen via its description;
+		// "kidney disease" hits Chronic kidney insufficiency via its ICD-10 mapping name) per
+		// ADR Decision 6. Boosts are shared with the Lucene tier via QueryStoreConstants so the
+		// two backends can't silently drift.
 		Query bm25 = Query.of(q -> q.multiMatch(m -> m
 		        .fields(ElasticsearchFieldNames.TEXT,
 		                ElasticsearchFieldNames.SYNONYMS,
 		                ElasticsearchFieldNames.DESCRIPTION + "^"
-		                        + QueryStoreConstants.BM25_DESCRIPTION_BOOST)
+		                        + QueryStoreConstants.BM25_DESCRIPTION_BOOST,
+		                ElasticsearchFieldNames.MAPPING_NAMES + "^"
+		                        + QueryStoreConstants.BM25_MAPPING_NAMES_BOOST)
 		        .query(req.getQueryText())));
 		Query combined = filter == null ? bm25
 		        : Query.of(q -> q.bool(b -> b.must(bm25).filter(filter)));
@@ -472,6 +475,13 @@ public class ElasticsearchBackendStore implements BackendStore, Closeable {
 			// metadata_json for rehydration. Description is not added to the embedding input —
 			// see ConceptNameUtil.getDescription for the rationale.
 			source.put(ElasticsearchFieldNames.DESCRIPTION, descriptionBlob);
+		}
+		String mappingNamesBlob = doc.getMappingNamesText();
+		if (!mappingNamesBlob.isEmpty()) {
+			// Top-level text field used by BM25's multi_match; the structured list also lives in
+			// metadata_json for rehydration. Mapping names are not added to the embedding input —
+			// see ConceptNameUtil.getMappingNames for the rationale.
+			source.put(ElasticsearchFieldNames.MAPPING_NAMES, mappingNamesBlob);
 		}
 		if (doc.getEmbedding() != null) {
 			// Jackson serializes float[] directly as a JSON number array (no per-element boxing).
