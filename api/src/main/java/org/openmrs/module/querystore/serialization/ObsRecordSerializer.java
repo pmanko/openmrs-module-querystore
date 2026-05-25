@@ -126,10 +126,7 @@ public class ObsRecordSerializer extends AbstractRecordSerializer<Obs> {
 		Double valueNumeric = obs.getValueNumeric();
 		if (valueNumeric != null) {
 			doc.putMetadata(FIELD_VALUE_NUMERIC, valueNumeric);
-			// Single ConceptNumeric resolution per numeric obs — reused for units AND for the
-			// reference-range abnormal flag below so we don't pay two service lookups per record.
-			ConceptNumeric cn = resolveConceptNumeric(concept, datatype);
-			String units = cn != null ? cn.getUnits() : null;
+			String units = getUnits(concept, datatype);
 			if (units != null && !units.isEmpty()) {
 				doc.putMetadata(FIELD_UNITS, units);
 			}
@@ -141,10 +138,6 @@ public class ObsRecordSerializer extends AbstractRecordSerializer<Obs> {
 			sb.append(valueNumeric);
 			if (units != null && !units.isEmpty()) {
 				sb.append(' ').append(units);
-			}
-			String abnormalSuffix = abnormalRangeSuffix(cn, valueNumeric);
-			if (!abnormalSuffix.isEmpty()) {
-				sb.append(' ').append(abnormalSuffix);
 			}
 			return sb.toString();
 		}
@@ -218,82 +211,21 @@ public class ObsRecordSerializer extends AbstractRecordSerializer<Obs> {
 		}
 	}
 
-	/**
-	 * Resolves a {@link ConceptNumeric} typed view of the obs's concept when the concept is
-	 * numeric, falling back through Hibernate's joined-table inheritance via a service lookup
-	 * when the concept arrives as a plain {@link Concept} proxy. Returns null for non-numeric
-	 * concepts. One lookup per numeric obs — reused by callers that need both units and the
-	 * reference ranges.
-	 */
-	private ConceptNumeric resolveConceptNumeric(Concept concept, ConceptDatatype datatype) {
+	private String getUnits(Concept concept, ConceptDatatype datatype) {
 		if (concept == null) {
 			return null;
 		}
 		if (concept instanceof ConceptNumeric) {
-			return (ConceptNumeric) concept;
+			return ((ConceptNumeric) concept).getUnits();
 		}
+		// Hibernate proxies don't pass instanceof; resolve via the concept service when the
+		// datatype is numeric.
 		if (datatype != null && datatype.isNumeric()) {
-			return Context.getConceptService().getConceptNumeric(concept.getConceptId());
+			ConceptNumeric cn = Context.getConceptService().getConceptNumeric(concept.getConceptId());
+			if (cn != null) {
+				return cn.getUnits();
+			}
 		}
 		return null;
-	}
-
-	/**
-	 * Returns the abnormal-range suffix for a numeric value (e.g. {@code "(HIGH; normal 60-115)"}),
-	 * or the empty string when no flag applies. Severity precedence: critical bands override the
-	 * normal bands, so a value above {@code hiCritical} reads as {@code "CRITICAL HIGH"} rather
-	 * than {@code "HIGH"}. When the concept has reference bands on only one side (e.g. an upper
-	 * critical but no critical-low), values on the unbanded side fall through unflagged — the
-	 * convention is "don't invent a band the dictionary didn't define."
-	 *
-	 * <p>Why this lives in the indexed text rather than in {@link #FIELD_INTERPRETATION}: a small
-	 * LLM (Gemma 4 E2B/E4B) reasoning from the chart benefits from seeing "146.5 umol/L (HIGH;
-	 * normal 60-115)" inline at the citation point — answering "anything abnormal?" without
-	 * needing to cross-walk a numeric to a separate interpretation field or carry the normal
-	 * range in its own pretrained medical knowledge. The metadata {@code interpretation} field
-	 * is set elsewhere (per-obs {@link Obs#getInterpretation()}) and is the source-clinician's
-	 * judgement; this suffix is the dictionary-driven reference-range computation. Both can
-	 * coexist on the same record.
-	 */
-	private static String abnormalRangeSuffix(ConceptNumeric cn, double value) {
-		if (cn == null) {
-			return "";
-		}
-		Double hiCritical = cn.getHiCritical();
-		Double lowCritical = cn.getLowCritical();
-		Double hiNormal = cn.getHiNormal();
-		Double lowNormal = cn.getLowNormal();
-		String severity;
-		if (hiCritical != null && value > hiCritical) {
-			severity = "CRITICAL HIGH";
-		} else if (lowCritical != null && value < lowCritical) {
-			severity = "CRITICAL LOW";
-		} else if (hiNormal != null && value > hiNormal) {
-			severity = "HIGH";
-		} else if (lowNormal != null && value < lowNormal) {
-			severity = "LOW";
-		} else {
-			return "";
-		}
-		StringBuilder out = new StringBuilder("(").append(severity);
-		if (lowNormal != null && hiNormal != null) {
-			out.append("; normal ").append(formatRangeNumber(lowNormal))
-					.append("-").append(formatRangeNumber(hiNormal));
-		}
-		out.append(")");
-		return out.toString();
-	}
-
-	/**
-	 * Formats a reference-range bound as a compact decimal string. Whole-number values render
-	 * without the trailing {@code .0} so {@code "normal 60-115"} appears instead of
-	 * {@code "normal 60.0-115.0"} — easier for both the LLM and human readers, no information
-	 * loss. Non-integer bounds keep their full precision.
-	 */
-	private static String formatRangeNumber(double v) {
-		if (v == Math.floor(v) && !Double.isInfinite(v)) {
-			return Long.toString((long) v);
-		}
-		return Double.toString(v);
 	}
 }
