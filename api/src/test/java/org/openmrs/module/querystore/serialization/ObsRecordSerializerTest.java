@@ -72,6 +72,108 @@ public class ObsRecordSerializerTest {
 	}
 
 	@Test
+	public void serialize_numericValue_appendsHighFlagWhenAboveHiNormal() {
+		// The kidney-query win the slice is built for: small LLMs benefit from inline "is this
+		// abnormal?" signal without having to know the normal range from pretraining. Without
+		// this assertion, a future refactor that drops the abnormalRangeSuffix call from the
+		// numeric branch would silently revert to bare-number text and the LLM loses the cue.
+		ConceptNumeric concept = new ConceptNumeric();
+		concept.addName(conceptName("Serum creatinine"));
+		concept.setUnits("umol/L");
+		concept.setHiNormal(115.0);
+		concept.setLowNormal(60.0);
+		Obs obs = obs(concept);
+		obs.setValueNumeric(146.5);
+
+		QueryDocument doc = serializer.serialize(obs);
+
+		assertEquals("Serum creatinine: 146.5 umol/L (HIGH; normal 60-115)", doc.getText());
+	}
+
+	@Test
+	public void serialize_numericValue_appendsLowFlagWhenBelowLowNormal() {
+		ConceptNumeric concept = new ConceptNumeric();
+		concept.addName(conceptName("Haemoglobin"));
+		concept.setUnits("g/dL");
+		concept.setHiNormal(17.5);
+		concept.setLowNormal(13.5);
+		Obs obs = obs(concept);
+		obs.setValueNumeric(8.2);
+
+		QueryDocument doc = serializer.serialize(obs);
+
+		assertEquals("Haemoglobin: 8.2 g/dL (LOW; normal 13.5-17.5)", doc.getText());
+	}
+
+	@Test
+	public void serialize_numericValue_criticalOverridesNormal() {
+		// Severity precedence locked: critical-high takes priority over plain HIGH so a value
+		// that crosses both thresholds reads as CRITICAL HIGH. Without this, a future change to
+		// the if/else chain could silently demote critical readings.
+		ConceptNumeric concept = new ConceptNumeric();
+		concept.addName(conceptName("Serum potassium"));
+		concept.setUnits("mmol/L");
+		concept.setLowNormal(3.5);
+		concept.setHiNormal(5.0);
+		concept.setHiCritical(6.5);
+		Obs obs = obs(concept);
+		obs.setValueNumeric(7.2);
+
+		QueryDocument doc = serializer.serialize(obs);
+
+		assertEquals("Serum potassium: 7.2 mmol/L (CRITICAL HIGH; normal 3.5-5)", doc.getText());
+	}
+
+	@Test
+	public void serialize_numericValue_inNormalRange_noFlagAppended() {
+		ConceptNumeric concept = new ConceptNumeric();
+		concept.addName(conceptName("Serum creatinine"));
+		concept.setUnits("umol/L");
+		concept.setHiNormal(115.0);
+		concept.setLowNormal(60.0);
+		Obs obs = obs(concept);
+		obs.setValueNumeric(85.0);
+
+		QueryDocument doc = serializer.serialize(obs);
+
+		assertEquals("Serum creatinine: 85.0 umol/L", doc.getText());
+	}
+
+	@Test
+	public void serialize_numericValue_noReferenceRanges_noFlagAppended() {
+		// CIEL concepts without filled-in reference ranges are common. The serializer must NOT
+		// invent a flag — bare value text is the right output. Otherwise we'd produce
+		// "Pulse: 72.0 (NORMAL; ...)" with no actual band, which is misleading.
+		ConceptNumeric concept = new ConceptNumeric();
+		concept.addName(conceptName("Pulse"));
+		concept.setUnits("/min");
+		Obs obs = obs(concept);
+		obs.setValueNumeric(72.0);
+
+		QueryDocument doc = serializer.serialize(obs);
+
+		assertEquals("Pulse: 72.0 /min", doc.getText());
+	}
+
+	@Test
+	public void serialize_numericValue_onlyHiNormalSet_lowSideUnflagged() {
+		// Asymmetric reference bands (e.g. only a hi_normal, no low_normal) are real in CIEL.
+		// Values on the unbanded side must fall through unflagged — the convention is "don't
+		// invent a band the dictionary didn't define."
+		ConceptNumeric concept = new ConceptNumeric();
+		concept.addName(conceptName("Blood pressure"));
+		concept.setUnits("mmHg");
+		concept.setHiNormal(140.0);
+		Obs obs = obs(concept);
+		obs.setValueNumeric(60.0);
+
+		QueryDocument doc = serializer.serialize(obs);
+
+		// 60 < no low band → unflagged. The HIGH path is exercised by the dedicated test.
+		assertEquals("Blood pressure: 60.0 mmHg", doc.getText());
+	}
+
+	@Test
 	public void serialize_valueModifier_includedInText() {
 		ConceptNumeric concept = new ConceptNumeric();
 		concept.addName(conceptName("Viral Load"));
