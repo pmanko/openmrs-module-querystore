@@ -11,7 +11,9 @@ package org.openmrs.module.querystore.api.impl;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.logging.Log;
@@ -48,6 +50,24 @@ public class QueryStoreServiceImpl extends BaseOpenmrsService implements QuerySt
 	// wiring leaves this null and resolves through Context — see ensureIndexedSafely. Package-private
 	// to match the seam shape used in BootstrapServiceImpl.providersOverride.
 	private BootstrapService bootstrapServiceOverride;
+
+	// Query-embedding LRU. The ONNX query encoder dominates per-search latency on the hot path
+	// (measured ~40-80 ms warm, ~3-4 s cold on the L6-v2 model). The same query string is reused
+	// across patients within a session — UI default questions, repeat searches — so a small LRU
+	// keyed by (modelName, query) eliminates the duplicate encode without changing retrieval
+	// semantics. Bounded so a runaway caller cannot exhaust heap; access-ordered LinkedHashMap
+	// under a synchronized wrapper is sufficient for the few-hundred-entries / few-QPS hot path.
+	private static final int QUERY_EMBED_CACHE_MAX = 256;
+
+	private final Map<String, float[]> queryEmbedCache = Collections.synchronizedMap(
+	        new LinkedHashMap<String, float[]>(64, 0.75f, true) {
+		        private static final long serialVersionUID = 1L;
+
+		        @Override
+		        protected boolean removeEldestEntry(Map.Entry<String, float[]> eldest) {
+			        return size() > QUERY_EMBED_CACHE_MAX;
+		        }
+	        });
 
 	public void setBackend(BackendStore backend) {
 		this.backend = backend;
@@ -203,9 +223,31 @@ public class QueryStoreServiceImpl extends BaseOpenmrsService implements QuerySt
 			req.filter(scope);
 		}
 		if (embeddingProvider != null) {
-			req.queryVector(embeddingProvider.embedQuery(query));
+			req.queryVector(embedQueryCached(query));
 		}
 		return toDocuments(backend.hybrid(req.build()));
+	}
+
+	/**
+	 * Returns the dense vector for {@code query}, reusing a previously-computed result when the
+	 * same string has been embedded by the same model. Cache key includes the model name so an
+	 * embedding-provider switch (see {@code querystore.embedding.providerBean} GP and
+	 * {@link org.openmrs.module.querystore.embedding.ConfiguredEmbeddingProvider}) does not return
+	 * a vector from the previous model. The cache is a small bounded LRU; queries beyond
+	 * {@link #QUERY_EMBED_CACHE_MAX} oldest entries fall back to a live ONNX encode.
+	 */
+	private float[] embedQueryCached(String query) {
+		String modelName = embeddingProvider.getModelName();
+		String key = (modelName == null ? "" : modelName) + ' ' + query;
+		float[] cached = queryEmbedCache.get(key);
+		if (cached != null) {
+			return cached;
+		}
+		float[] vec = embeddingProvider.embedQuery(query);
+		if (vec != null) {
+			queryEmbedCache.put(key, vec);
+		}
+		return vec;
 	}
 
 	private static List<QueryDocument> toDocuments(SearchResult result) {

@@ -34,6 +34,7 @@ import org.openmrs.module.querystore.backend.SearchResult;
 import org.openmrs.module.querystore.backend.WriteResult;
 import org.openmrs.module.querystore.bootstrap.BootstrapService;
 import org.openmrs.module.querystore.bootstrap.BootstrapProgress;
+import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 
 public class QueryStoreServiceImplTest {
@@ -342,6 +343,58 @@ public class QueryStoreServiceImplTest {
 		assertEquals(1, backend.findAllByPatientCount.get());
 	}
 
+	// ---------- query-embedding cache ----------
+
+	@Test
+	public void searchByPatient_repeatedQuery_reusesCachedEmbedding() {
+		// The ONNX query encoder is the dominant cost on the prefilter path (measured 40-80 ms warm,
+		// 3-4 s cold). Same query string + same model -> reuse the float[]. A regression that drops
+		// the cache would call embedQuery twice and fail this assertion.
+		FakeBackendStore backend = new FakeBackendStore(true);
+		CountingEmbeddingProvider provider = new CountingEmbeddingProvider("model-A");
+		service.setBackend(backend);
+		service.setEmbeddingProvider(provider);
+		service.setBootstrapServiceOverride(new RecordingBootstrapService());
+
+		service.searchByPatient("patient-uuid", "diabetes", 10);
+		service.searchByPatient("patient-uuid", "diabetes", 10);
+
+		assertEquals("identical query must only be encoded once", 1, provider.embedQueryCount.get());
+	}
+
+	@Test
+	public void searchByPatient_distinctQueries_eachEncodedOnce() {
+		FakeBackendStore backend = new FakeBackendStore(true);
+		CountingEmbeddingProvider provider = new CountingEmbeddingProvider("model-A");
+		service.setBackend(backend);
+		service.setEmbeddingProvider(provider);
+		service.setBootstrapServiceOverride(new RecordingBootstrapService());
+
+		service.searchByPatient("patient-uuid", "diabetes", 10);
+		service.searchByPatient("patient-uuid", "hypertension", 10);
+
+		assertEquals("distinct queries each require a fresh encode", 2, provider.embedQueryCount.get());
+	}
+
+	@Test
+	public void searchByPatient_modelChangeInvalidatesCache() {
+		// Cache key includes the provider's model name so a switch of the active embedding model
+		// (querystore.embedding.providerBean GP flip) cannot serve a vector from the previous
+		// model's space, which would silently drift kNN similarity comparisons against record
+		// embeddings that the new model never saw.
+		FakeBackendStore backend = new FakeBackendStore(true);
+		CountingEmbeddingProvider provider = new CountingEmbeddingProvider("model-A");
+		service.setBackend(backend);
+		service.setEmbeddingProvider(provider);
+		service.setBootstrapServiceOverride(new RecordingBootstrapService());
+
+		service.searchByPatient("patient-uuid", "diabetes", 10);
+		provider.modelName = "model-B";
+		service.searchByPatient("patient-uuid", "diabetes", 10);
+
+		assertEquals("model swap must force a fresh encode", 2, provider.embedQueryCount.get());
+	}
+
 	// ---------- fakes ----------
 
 	private static final class FakeBackendStore implements BackendStore {
@@ -399,6 +452,29 @@ public class QueryStoreServiceImplTest {
 			return new BackendCapabilities(true, false, false, 1_000_000, EnumSet.allOf(Filter.Kind.class));
 		}
 		@Override public HealthStatus health() { return null; }
+	}
+
+	private static final class CountingEmbeddingProvider implements EmbeddingProvider {
+		final AtomicInteger embedQueryCount = new AtomicInteger();
+
+		String modelName;
+
+		CountingEmbeddingProvider(String modelName) {
+			this.modelName = modelName;
+		}
+
+		@Override public int getDimensions() { return 4; }
+
+		@Override public float[] embed(String text) {
+			return new float[] { 1f, 0f, 0f, 0f };
+		}
+
+		@Override public float[] embedQuery(String text) {
+			embedQueryCount.incrementAndGet();
+			return new float[] { 1f, 0f, 0f, 0f };
+		}
+
+		@Override public String getModelName() { return modelName; }
 	}
 
 	private static final class RecordingBootstrapService implements BootstrapService {

@@ -22,6 +22,7 @@ import org.openmrs.module.querystore.backend.BackendStore;
 import org.openmrs.module.querystore.backend.BackendStoreSelector;
 import org.openmrs.module.querystore.bootstrap.BootstrapService;
 import org.openmrs.module.querystore.bridge.AfterCommitDispatcher;
+import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 
 public class QueryStoreActivator extends BaseModuleActivator implements DaemonTokenAware {
 
@@ -55,9 +56,37 @@ public class QueryStoreActivator extends BaseModuleActivator implements DaemonTo
 		// token before any AOP advice can fire. Activator owns the token (via DaemonTokenAware);
 		// the dispatcher is constructed by Spring without it, so propagation lives here.
 		wireBridgeDaemonToken();
+		warmupQueryEmbedder();
 		if (isAutostartEnabled(Context.getAdministrationService())) {
 			triggerBootstrap();
 		}
+	}
+
+	/**
+	 * Forces ONNX query-encoder construction (model bytes loaded from disk, session built, first
+	 * inference compiled) off the first user search. The first {@code embedQuery} pays a one-time
+	 * 3-4 s cost on the all-MiniLM-L6-v2 model (measured on the local standalone); without this
+	 * warmup the first search a user issues after a restart blocks for that full duration.
+	 * Runs in a daemon thread so module startup is not held by the model load; if the embedder
+	 * is unavailable (no provider bean wired, no daemon token), the warmup silently no-ops and
+	 * the first real search pays the cold cost — same behavior as before this hook existed.
+	 */
+	private void warmupQueryEmbedder() {
+		if (daemonToken == null) {
+			return;
+		}
+		Daemon.runInDaemonThread(() -> {
+			try {
+				EmbeddingProvider provider = Context.getRegisteredComponent(
+				    "querystore.embedding.dispatcher", EmbeddingProvider.class);
+				long t0 = System.currentTimeMillis();
+				provider.embedQuery("warmup");
+				log.info("Query embedder warmup completed in " + (System.currentTimeMillis() - t0) + " ms");
+			}
+			catch (RuntimeException e) {
+				log.warn("Query embedder warmup failed; first real query will pay cold cost", e);
+			}
+		}, daemonToken);
 	}
 
 	void wireBridgeDaemonToken() {
