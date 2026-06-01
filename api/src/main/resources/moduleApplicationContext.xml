@@ -215,11 +215,35 @@
         </property>
     </bean>
 
+    <!--
+        Register the externally-resolved service behind an authorization proxy so the
+        @Authorized(GET_PATIENTS) annotations on searchByPatient/search/getPatientChart are actually
+        enforced. ServiceContext.setService wraps a *bare* bean in an advice-free proxy (it only
+        carries advice forward when replacing an existing service), so handing it the raw impl leaves
+        @Authorized decorative — any caller can read patient-scoped data regardless of privilege.
+        Core enforces @Authorized by registering each service as an already-advised proxy carrying
+        serviceInterceptors; we do the minimal equivalent here with just the authorizationInterceptor
+        (the core AuthorizationAdvice bean, resolved from the parent context). No transaction/
+        RequiredData advice is added, preserving the service's current behavior. Internal beans
+        (BridgeIndexer, BootstrapServiceImpl) keep injecting the bare queryStoreService, so indexing
+        is deliberately not subject to GET_PATIENTS.
+    -->
+    <bean id="queryStoreService.authorized"
+          class="org.springframework.aop.framework.ProxyFactoryBean">
+        <property name="target" ref="queryStoreService"/>
+        <property name="proxyInterfaces" value="org.openmrs.module.querystore.api.QueryStoreService"/>
+        <property name="interceptorNames">
+            <list>
+                <value>authorizationInterceptor</value>
+            </list>
+        </property>
+    </bean>
+
     <bean parent="serviceContext">
         <property name="moduleService">
             <list>
                 <value>org.openmrs.module.querystore.api.QueryStoreService</value>
-                <ref bean="queryStoreService"/>
+                <ref bean="queryStoreService.authorized"/>
             </list>
         </property>
     </bean>
