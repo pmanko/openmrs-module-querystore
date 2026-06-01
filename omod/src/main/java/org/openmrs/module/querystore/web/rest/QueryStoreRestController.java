@@ -12,15 +12,22 @@ package org.openmrs.module.querystore.web.rest;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.openmrs.api.APIAuthenticationException;
+import org.openmrs.api.APIException;
 import org.openmrs.api.context.Context;
+import org.openmrs.api.context.ContextAuthenticationException;
 import org.openmrs.module.querystore.api.QueryStoreService;
 import org.openmrs.module.querystore.bootstrap.BootstrapService;
 import org.openmrs.module.querystore.bootstrap.BootstrapStatusReport;
 import org.openmrs.module.webservices.rest.web.RestConstants;
 import org.openmrs.util.PrivilegeConstants;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
@@ -47,6 +54,8 @@ import org.springframework.web.bind.annotation.ResponseBody;
 @Controller
 @RequestMapping("/rest/" + RestConstants.VERSION_1 + "/querystore")
 public class QueryStoreRestController {
+
+	private static final Logger log = LoggerFactory.getLogger(QueryStoreRestController.class);
 
 	/**
 	 * Per-resource-type bootstrap status plus a derived {@code complete} flag. Gated by
@@ -89,9 +98,7 @@ public class QueryStoreRestController {
 
 		String patientUuid = body == null ? null : body.get("patient");
 		if (patientUuid == null || patientUuid.trim().isEmpty()) {
-			Map<String, Object> error = new HashMap<String, Object>();
-			error.put("error", "patient is required");
-			return new ResponseEntity<Object>(error, HttpStatus.BAD_REQUEST);
+			return errorResponse(HttpStatus.BAD_REQUEST, "patient is required");
 		}
 
 		Context.getService(BootstrapService.class).reindexPatient(patientUuid);
@@ -101,5 +108,56 @@ public class QueryStoreRestController {
 		result.put("patient", patientUuid);
 		result.put("documentsIndexed", documentsIndexed);
 		return new ResponseEntity<Object>(result, HttpStatus.OK);
+	}
+
+	/**
+	 * Maps an authorization failure to a proper status with a clean body. Without this, the framework
+	 * serializes the thrown exception as an HTTP 200 carrying a full stack trace — both a misleading
+	 * status and an information leak. 401 when the caller is unauthenticated; 403 when authenticated
+	 * but lacking the privilege.
+	 *
+	 * <p>Catches both auth-failure types because they are siblings under {@code APIException}, not
+	 * one hierarchy: {@link Context#requirePrivilege} (the up-front gate this controller uses) throws
+	 * {@link ContextAuthenticationException}, while the {@code @Authorized} AOP throws
+	 * {@link APIAuthenticationException}. The up-front gate is the only auth check that fires on the
+	 * current code path, so {@link ContextAuthenticationException} is what you observe today; the
+	 * {@link APIAuthenticationException} arm is defense-in-depth so an authorization failure raised by
+	 * any future or downstream {@code @Authorized} call still surfaces as 401/403 rather than falling
+	 * to the catch-all as a 500.
+	 */
+	@ExceptionHandler({ ContextAuthenticationException.class, APIAuthenticationException.class })
+	@ResponseBody
+	public ResponseEntity<Object> handleAuthFailure(APIException e) {
+		HttpStatus status = Context.isAuthenticated() ? HttpStatus.FORBIDDEN : HttpStatus.UNAUTHORIZED;
+		return errorResponse(status,
+		        status == HttpStatus.FORBIDDEN ? "Insufficient privileges" : "Authentication required");
+	}
+
+	/**
+	 * A malformed JSON request body is a client error — return 400, not the catch-all's 500. (The
+	 * framework throws this during {@code @RequestBody} binding, before the handler method runs.)
+	 */
+	@ExceptionHandler(HttpMessageNotReadableException.class)
+	@ResponseBody
+	public ResponseEntity<Object> handleMalformedBody(HttpMessageNotReadableException e) {
+		return errorResponse(HttpStatus.BAD_REQUEST, "Malformed request body");
+	}
+
+	/**
+	 * Catch-all so any other unexpected error returns a clean 500 rather than the framework's default
+	 * for a thrown exception on this controller (an HTTP 200 carrying a serialized stack trace). The
+	 * detail is logged server-side, never returned to the caller.
+	 */
+	@ExceptionHandler(Exception.class)
+	@ResponseBody
+	public ResponseEntity<Object> handleUnexpected(Exception e) {
+		log.error("Unexpected error handling a querystore REST request", e);
+		return errorResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Internal error");
+	}
+
+	private static ResponseEntity<Object> errorResponse(HttpStatus status, String message) {
+		Map<String, Object> body = new HashMap<String, Object>();
+		body.put("error", message);
+		return new ResponseEntity<Object>(body, status);
 	}
 }
