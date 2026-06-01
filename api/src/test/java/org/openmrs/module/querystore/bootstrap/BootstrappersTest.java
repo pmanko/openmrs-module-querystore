@@ -64,20 +64,40 @@ public class BootstrappersTest {
 	public void hibernateBootstrapper_firstPageHql_includesEntityNameAndCursorExpr() {
 		// The 12 leaf bootstrappers share a parameterized HQL; pin its shape for two representative
 		// entities so a refactor of the HQL builder doesn't silently break the rest.
-		String encHql = HibernateTypeBootstrapper.firstPageHql("Encounter", "COALESCE(e.dateChanged, e.dateCreated)");
+		String encHql = HibernateTypeBootstrapper.firstPageHql("Encounter",
+		        "COALESCE(e.dateChanged, e.dateCreated)", "e.patient.uuid");
 		assertTrue(encHql.contains("FROM Encounter e"));
 		assertTrue(encHql.contains("WHERE e.voided = false"));
 		assertTrue(encHql.contains("ORDER BY COALESCE(e.dateChanged, e.dateCreated) ASC, e.uuid ASC"));
 
 		// Obs/Order subtypes use only dateCreated since Hibernate doesn't map dateChanged for them.
-		String obsHql = HibernateTypeBootstrapper.firstPageHql("Obs", "e.dateCreated");
+		String obsHql = HibernateTypeBootstrapper.firstPageHql("Obs", "e.dateCreated", "e.person.uuid");
 		assertTrue(obsHql.contains("ORDER BY e.dateCreated ASC, e.uuid ASC"));
+	}
+
+	@Test
+	public void hibernateBootstrapper_globalScan_excludesDanglingPatientRows() {
+		// Orphan rows (a dangling patient/person FK, e.g. left by a SQL-dump load) must be filtered out
+		// of the global scan — otherwise Hibernate eager-materializes the missing association during
+		// q.list() and FetchNotFoundException fails the whole type. Navigating the patient association
+		// forces the inner join that drops them. Pinned so a refactor can't silently reintroduce the
+		// poison-page failure. Mirrors the per-patient scan, which is already orphan-safe.
+		assertTrue("first-page scan excludes dangling-patient rows",
+		        HibernateTypeBootstrapper.firstPageHql("Encounter", "e.dateCreated", "e.patient.uuid")
+		                .contains("AND e.patient.uuid IS NOT NULL"));
+		assertTrue("after-cursor scan excludes dangling-patient rows",
+		        HibernateTypeBootstrapper.afterCursorHql("Encounter", "e.dateCreated", "e.patient.uuid")
+		                .contains("AND e.patient.uuid IS NOT NULL"));
+		// Obs scopes by person, not patient — its orphan filter must follow the same path it scans by.
+		assertTrue("obs global scan excludes dangling-person rows",
+		        HibernateTypeBootstrapper.firstPageHql("Obs", "e.dateCreated", "e.person.uuid")
+		                .contains("AND e.person.uuid IS NOT NULL"));
 	}
 
 	@Test
 	public void hibernateBootstrapper_afterCursorHql_handlesTieBreaker() {
 		String hql = HibernateTypeBootstrapper.afterCursorHql("Encounter",
-		        "COALESCE(e.dateChanged, e.dateCreated)");
+		        "COALESCE(e.dateChanged, e.dateCreated)", "e.patient.uuid");
 		assertTrue("strictly-greater cursor branch present",
 		        hql.contains("COALESCE(e.dateChanged, e.dateCreated) > :cursor"));
 		assertTrue("equal-cursor uuid tie-breaker present",

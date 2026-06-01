@@ -67,12 +67,13 @@ public abstract class HibernateTypeBootstrapper<T> extends TypeBootstrapper<T> {
 		String dateExpr = cursorDateExpr();
 		// Use the modern parameterized Query API via the underlying SessionFactory; DbSession's
 		// createQuery returns the legacy raw type.
+		String patientExpr = patientAssociationExpr();
 		Session session = sessionFactory.getHibernateSessionFactory().getCurrentSession();
 		Query<T> q;
 		if (afterDateChanged == null) {
-			q = session.createQuery(firstPageHql(entityName, dateExpr), entityType);
+			q = session.createQuery(firstPageHql(entityName, dateExpr, patientExpr), entityType);
 		} else {
-			q = session.createQuery(afterCursorHql(entityName, dateExpr), entityType);
+			q = session.createQuery(afterCursorHql(entityName, dateExpr, patientExpr), entityType);
 			q.setParameter("cursor", Date.from(afterDateChanged));
 			q.setParameter("afterUuid", afterUuid != null ? afterUuid : "");
 		}
@@ -102,15 +103,27 @@ public abstract class HibernateTypeBootstrapper<T> extends TypeBootstrapper<T> {
 	}
 
 	// Package-private so a unit test can pin the HQL shape without invoking Hibernate.
-	static String firstPageHql(String entityName, String dateExpr) {
+	//
+	// The "AND <patientExpr> IS NOT NULL" clause excludes rows whose patient/person FK is dangling —
+	// an orphan a SQL-dump load can leave behind (a diagnosis/visit pointing at a patient_id with no
+	// patient row). Navigating the association forces an INNER JOIN that drops such rows at the SQL
+	// level. Without it, q.list() eager-materializes the missing association and throws
+	// FetchNotFoundException, failing the ENTIRE type (per-record skip in projectOne can't help — the
+	// failure is at page fetch, before projection). The per-patient scan is already orphan-safe for
+	// the same reason (it navigates the same expr via "= :patientUuid"); this brings the global scan
+	// to parity. Orphan rows are unindexable anyway (no patient to scope them to), so excluding them
+	// is the correct "skip the bad record" behavior.
+	static String firstPageHql(String entityName, String dateExpr, String patientExpr) {
 		return "FROM " + entityName + " e WHERE e.voided = false "
+		        + "AND " + patientExpr + " IS NOT NULL "
 		        + "ORDER BY " + dateExpr + " ASC, e.uuid ASC";
 	}
 
-	static String afterCursorHql(String entityName, String dateExpr) {
+	static String afterCursorHql(String entityName, String dateExpr, String patientExpr) {
 		// COALESCE in WHERE so a record whose dateChanged is null still progresses past the cursor on
 		// dateCreated alone; the uuid tie-breaker handles records sharing the same effective timestamp.
-		return "FROM " + entityName + " e WHERE e.voided = false AND ("
+		return "FROM " + entityName + " e WHERE e.voided = false "
+		        + "AND " + patientExpr + " IS NOT NULL AND ("
 		        + dateExpr + " > :cursor "
 		        + "OR (" + dateExpr + " = :cursor AND e.uuid > :afterUuid)) "
 		        + "ORDER BY " + dateExpr + " ASC, e.uuid ASC";
