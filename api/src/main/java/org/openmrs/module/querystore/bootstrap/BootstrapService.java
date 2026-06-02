@@ -68,4 +68,15 @@ public interface BootstrapService extends OpenmrsService {
 	List<BootstrapProgress> getStatus();
 
 	BootstrapProgress getStatus(String resourceType);
+
+	/**
+	 * Read-only drift snapshot for every resource type (ADR: Sync reliability and reconciliation):
+	 * the core "expected" count ({@link TypeBootstrapper#countIndexable()}) versus the live index count
+	 * ({@link org.openmrs.module.querystore.backend.BackendStore#countByType(String)}). Detection only
+	 * — surfacing a gap is the operator's cue to re-run an existing reindex path; this method changes
+	 * nothing. Either count may be {@code -1} ("unknown"), in which case the entry's drift is {@code null}.
+	 * Runs a COUNT per type, so it is heavier than {@link #getStatus()} (which reads persisted rows) —
+	 * intended for on-demand admin/ops use, not a hot path.
+	 */
+	DriftReport getDrift();
 }

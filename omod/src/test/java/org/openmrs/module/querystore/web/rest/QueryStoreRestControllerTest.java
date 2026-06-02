@@ -30,6 +30,7 @@ import org.openmrs.api.context.UserContext;
 import org.openmrs.module.querystore.api.QueryStoreService;
 import org.openmrs.module.querystore.bootstrap.BootstrapLauncher;
 import org.openmrs.module.querystore.bootstrap.BootstrapService;
+import org.openmrs.module.querystore.bootstrap.DriftReport;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -226,6 +227,40 @@ public class QueryStoreRestControllerTest {
 		    body.get("documentsIndexed"));
 		verify(bootstrap).reindexPatient("patient-uuid");
 		assertEquals("a per-patient reindex must not also launch a global bootstrap", 0, launcher.launches);
+	}
+
+	@Test
+	public void getDrift_returnsTheReportAsAMapWith200() {
+		authenticate();
+		// Adapter contract: the controller is a thin pass-through over the service's DriftReport.toMap()
+		// — it adds no shaping of its own. The drift derivation itself is covered by DriftReportTest and
+		// BootstrapServiceImplTest; here we pin routing + the 200 + the body being exactly toMap().
+		BootstrapService bootstrap = mock(BootstrapService.class);
+		DriftReport report = new DriftReport(Collections.singletonList(
+		        new DriftReport.TypeDrift("obs", 100, 90)));
+		when(bootstrap.getDrift()).thenReturn(report);
+		controller.setBootstrapService(bootstrap);
+
+		ResponseEntity<Object> response = controller.getDrift();
+
+		assertEquals(HttpStatus.OK, response.getStatusCode());
+		assertEquals("the body is exactly the report's serialization view", report.toMap(), response.getBody());
+		verify(bootstrap).getDrift();
+	}
+
+	@Test(expected = ContextAuthenticationException.class)
+	public void getDrift_requiresManageGlobalPropertiesPrivilege() {
+		// Drift detection runs a COUNT per type across core + backend; it is gated behind the same admin
+		// privilege the reindex endpoints use. Pins that the requirePrivilege gate fires up front —
+		// without this, deleting the gate would expose the scan to any caller.
+		Context.setUserContext(new UserContext(null) {
+
+			@Override
+			public boolean hasPrivilege(String privilege) {
+				return false;
+			}
+		});
+		controller.getDrift();
 	}
 
 	/** Authenticates the thread with a user that holds every privilege, so the controller's

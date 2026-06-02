@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -28,6 +29,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Before;
 import org.junit.Test;
 import org.openmrs.module.querystore.api.QueryStoreService;
+import org.openmrs.module.querystore.backend.BackendStore;
+import org.openmrs.module.querystore.backend.BackendStoreSelector;
 import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
@@ -236,6 +239,126 @@ public class BootstrapServiceImplTest {
 
 		List<BootstrapProgress> all = service.getStatus();
 		assertEquals(2, all.size());
+	}
+
+	@Test
+	public void getDrift_composesCoreCountFromBootstrapperAndIndexedCountFromBackend() {
+		// The whole point of getDrift is the per-type pairing: coreCount comes from the bootstrapper
+		// (countIndexable), indexedCount from the live backend (countByType), keyed by the SAME resource
+		// type. This pins that wiring against a swap/crossed-key regression and the -1 "unknown" path.
+		EmptyPageBootstrapper obs = new EmptyPageBootstrapper("obs");
+		obs.indexableCount = 100;
+		EmptyPageBootstrapper enc = new EmptyPageBootstrapper("encounter");
+		enc.indexableCount = -1; // a non-Hibernate bootstrapper that cannot count its core rows
+		service.setBootstrappers(Arrays.asList(obs, enc));
+
+		Map<String, Long> indexed = new HashMap<>();
+		indexed.put("obs", 90L);
+		indexed.put("encounter", 42L);
+		final BackendStore backend = new CountingBackendStore(indexed);
+		service.setBackendSelector(new BackendStoreSelector(Collections.<String, BackendStore> emptyMap()) {
+			@Override
+			public BackendStore getStore() {
+				return backend;
+			}
+		});
+
+		Map<String, DriftReport.TypeDrift> byType = new HashMap<>();
+		for (DriftReport.TypeDrift t : service.getDrift().getTypes()) {
+			byType.put(t.getResourceType(), t);
+		}
+		assertEquals("a row per registered type", 2, byType.size());
+
+		DriftReport.TypeDrift obsDrift = byType.get("obs");
+		assertEquals("core count from the obs bootstrapper", 100, obsDrift.getCoreCount());
+		assertEquals("indexed count from the backend, keyed by obs", 90, obsDrift.getIndexedCount());
+		assertEquals(Long.valueOf(10), obsDrift.getDrift());
+
+		DriftReport.TypeDrift encDrift = byType.get("encounter");
+		assertEquals("unknown core count propagates as -1", -1, encDrift.getCoreCount());
+		assertEquals(42, encDrift.getIndexedCount());
+		assertNull("drift is uncomputable when the core count is unknown", encDrift.getDrift());
+	}
+
+	@Test
+	public void getDrift_isolatesAFailingCount_andStillReportsTheHealthyTypes() {
+		// A detection endpoint is most useful exactly when something is unhealthy, so one type's count
+		// blowing up (an unexpected backend RuntimeException, or a core COUNT query throwing) must
+		// degrade THAT type to unknown (-1 / drift null) — not abort the whole report and 500 the caller.
+		EmptyPageBootstrapper good = new EmptyPageBootstrapper("obs");
+		good.indexableCount = 100;
+		EmptyPageBootstrapper boom = new EmptyPageBootstrapper("encounter");
+		boom.countIndexableFailure = new IllegalStateException("core COUNT query blew up");
+		service.setBootstrappers(Arrays.asList(good, boom));
+
+		Map<String, Long> indexed = new HashMap<>();
+		indexed.put("obs", 90L);
+		final BackendStore backend = new CountingBackendStore(indexed, Collections.singleton("encounter"));
+		service.setBackendSelector(new BackendStoreSelector(Collections.<String, BackendStore> emptyMap()) {
+			@Override
+			public BackendStore getStore() {
+				return backend;
+			}
+		});
+
+		Map<String, DriftReport.TypeDrift> byType = new HashMap<>();
+		for (DriftReport.TypeDrift t : service.getDrift().getTypes()) {
+			byType.put(t.getResourceType(), t);
+		}
+		assertEquals("the report is returned in full despite a sibling type failing", 2, byType.size());
+
+		assertEquals("the healthy type is reported normally", 100, byType.get("obs").getCoreCount());
+		assertEquals(90, byType.get("obs").getIndexedCount());
+		assertEquals(Long.valueOf(10), byType.get("obs").getDrift());
+
+		// Both counts threw for the bad type -> both unknown -> drift null. The report still came back.
+		assertEquals("a thrown core count degrades to unknown", -1, byType.get("encounter").getCoreCount());
+		assertEquals("a thrown backend count degrades to unknown", -1, byType.get("encounter").getIndexedCount());
+		assertNull(byType.get("encounter").getDrift());
+	}
+
+	@Test
+	public void getDrift_resolvesCoreCountFromAProviderSuppliedBootstrapper() {
+		// getDrift must count provider-supplied types too, not just core ones — the provider-resolution
+		// arm (bootstrappers map miss -> provider.getBootstrapper) is a distinct branch. Pins that a
+		// provider type's coreCount comes from ITS bootstrapper, keyed by the provider's resource type.
+		EmptyPageBootstrapper providerBs = new EmptyPageBootstrapper("appointments_appointment");
+		providerBs.indexableCount = 12;
+		service.setBootstrappers(Collections.<TypeBootstrapper<?>> emptyList());
+		service.setProvidersOverride(Collections.<ResourceTypeProvider> singletonList(
+		        new TestProvider("appointments_appointment", providerBs)));
+
+		final BackendStore backend = new CountingBackendStore(
+		        Collections.singletonMap("appointments_appointment", 9L));
+		service.setBackendSelector(new BackendStoreSelector(Collections.<String, BackendStore> emptyMap()) {
+			@Override
+			public BackendStore getStore() {
+				return backend;
+			}
+		});
+
+		List<DriftReport.TypeDrift> types = service.getDrift().getTypes();
+		assertEquals(1, types.size());
+		DriftReport.TypeDrift t = types.get(0);
+		assertEquals("appointments_appointment", t.getResourceType());
+		assertEquals("core count comes from the provider's bootstrapper", 12, t.getCoreCount());
+		assertEquals(9, t.getIndexedCount());
+		assertEquals(Long.valueOf(3), t.getDrift());
+	}
+
+	@Test
+	public void getDrift_reportsIndexedCountUnknownWhenNoBackendWired() {
+		// No backend selector installed (the default in this suite): every indexedCount must degrade to
+		// -1 ("unknown") and drift to null, rather than NPE on a null store.
+		EmptyPageBootstrapper obs = new EmptyPageBootstrapper("obs");
+		obs.indexableCount = 100;
+		service.setBootstrappers(Collections.singletonList(obs));
+
+		List<DriftReport.TypeDrift> types = service.getDrift().getTypes();
+		assertEquals(1, types.size());
+		assertEquals(100, types.get(0).getCoreCount());
+		assertEquals("no backend -> indexed count unknown", -1, types.get(0).getIndexedCount());
+		assertNull(types.get(0).getDrift());
 	}
 
 	@Test
@@ -692,6 +815,96 @@ public class BootstrapServiceImplTest {
 	 * can pin the resume-from-progress semantics, and a failure can be injected to exercise the
 	 * service's continue-on-error behavior.
 	 */
+	/** Minimal backend that only knows how to count by type; every other operation is out of scope. */
+	private static final class CountingBackendStore implements BackendStore {
+
+		private final Map<String, Long> counts;
+
+		private final Set<String> failing;
+
+		CountingBackendStore(Map<String, Long> counts) {
+			this(counts, Collections.<String> emptySet());
+		}
+
+		CountingBackendStore(Map<String, Long> counts, Set<String> failing) {
+			this.counts = counts;
+			this.failing = failing;
+		}
+
+		@Override
+		public long countByType(String resourceType) {
+			if (failing.contains(resourceType)) {
+				throw new IllegalStateException("backend count failed for " + resourceType);
+			}
+			return counts.containsKey(resourceType) ? counts.get(resourceType) : -1L;
+		}
+
+		@Override
+		public void ensureSchema(String resourceType, org.openmrs.module.querystore.backend.SchemaSpec spec) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public void deleteSchema(String resourceType) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.WriteResult upsert(QueryDocument doc) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.WriteResult delete(String resourceType, String uuid) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.BulkWriteResult bulkUpsert(List<QueryDocument> docs) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.BulkWriteResult bulkDelete(String resourceType, List<String> uuids) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.BulkWriteResult bulkDeleteByPatient(String patientUuid) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public boolean existsByPatient(String patientUuid) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public List<QueryDocument> findAllByPatient(String patientUuid) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.SearchResult bm25(org.openmrs.module.querystore.backend.SearchRequest request) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.SearchResult knn(org.openmrs.module.querystore.backend.SearchRequest request) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.BackendCapabilities capabilities() {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public org.openmrs.module.querystore.backend.HealthStatus health() {
+			throw new UnsupportedOperationException();
+		}
+	}
+
 	private static class EmptyPageBootstrapper extends TypeBootstrapper<Object> {
 		private final String type;
 		int fetchCount;
@@ -702,6 +915,8 @@ public class BootstrapServiceImplTest {
 		RuntimeException failure;
 		RuntimeException perPatientFailure;
 		java.util.function.Consumer<String> onFetch;
+		long indexableCount = -1;
+		RuntimeException countIndexableFailure;
 
 		EmptyPageBootstrapper(String type) { this.type = type; }
 
@@ -709,6 +924,12 @@ public class BootstrapServiceImplTest {
 		@Override protected ClinicalRecordSerializer<Object> getSerializer() { return null; }
 		@Override protected Instant getDateChanged(Object e) { return null; }
 		@Override protected String getUuid(Object e) { return null; }
+		@Override public long countIndexable() {
+			if (countIndexableFailure != null) {
+				throw countIndexableFailure;
+			}
+			return indexableCount;
+		}
 
 		@Override
 		protected List<Object> fetchPage(Instant afterDateChanged, String afterUuid, int pageSize) {

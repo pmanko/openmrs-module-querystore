@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 import org.apache.commons.logging.Log;
@@ -25,6 +26,7 @@ import org.apache.commons.logging.LogFactory;
 import org.openmrs.api.context.Context;
 import org.openmrs.api.impl.BaseOpenmrsService;
 import org.openmrs.module.querystore.api.QueryStoreService;
+import org.openmrs.module.querystore.backend.BackendStore;
 import org.openmrs.module.querystore.backend.BackendStoreSelector;
 import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
@@ -219,6 +221,47 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 		return progressDao.find(resourceType);
 	}
 
+	@Override
+	public DriftReport getDrift() {
+		Map<String, ResourceTypeProvider> providers = discoverProviders();
+		BackendStore store = backendSelector != null ? backendSelector.getStore() : null;
+		List<DriftReport.TypeDrift> drifts = new ArrayList<>();
+		for (String resourceType : allResourceTypes(providers)) {
+			// coreCount: what the scan would visit (countIndexable); -1 when the bootstrapper has no
+			// count story. indexedCount: live docs in the backend (-1 when the backend can't count or
+			// isn't wired). DriftReport.TypeDrift renders drift=null when either is unknown. Each count
+			// is isolated (safeCount) so one type's failure degrades that type to unknown rather than
+			// aborting the whole report.
+			final TypeBootstrapper<?> bootstrapper = resolveBootstrapper(resourceType, providers);
+			long coreCount = bootstrapper != null
+			        ? safeCount("countIndexable", resourceType, bootstrapper::countIndexable)
+			        : -1L;
+			long indexedCount = store != null
+			        ? safeCount("countByType", resourceType, () -> store.countByType(resourceType))
+			        : -1L;
+			drifts.add(new DriftReport.TypeDrift(resourceType, coreCount, indexedCount));
+		}
+		return new DriftReport(drifts);
+	}
+
+	/**
+	 * Runs one count for the drift report, converting any failure into the {@code -1} "unknown"
+	 * sentinel rather than letting it abort the whole report. A detection endpoint is most useful
+	 * exactly when a backend or a core query is unhealthy; one type's failure must not blind the
+	 * operator to every other type. The {@code -1} lands in {@link DriftReport.TypeDrift} as
+	 * {@code drift=null} — identical to a backend that structurally cannot count.
+	 */
+	private long safeCount(String operation, String resourceType, LongSupplier counter) {
+		try {
+			return counter.getAsLong();
+		}
+		catch (RuntimeException e) {
+			log.warn(operation + " failed for resource type '" + resourceType
+			        + "'; reporting its drift as unknown", e);
+			return -1L;
+		}
+	}
+
 	private void runOne(String resourceType, Map<String, ResourceTypeProvider> providers) {
 		TypeBootstrapper<?> bootstrapper = bootstrappers.get(resourceType);
 		if (bootstrapper == null) {
@@ -306,13 +349,25 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 	private void runOneForPatient(String resourceType, String patientUuid,
 	                              Map<String, ResourceTypeProvider> providers) {
 		// Callers iterate allResourceTypes, which already filters providers with a null bootstrapper
-		// — so for every resourceType reaching here, the core map or the provider's bootstrapper
-		// resolves non-null. No null guards needed.
+		// — so for every resourceType reaching here, resolveBootstrapper returns non-null. No guard needed.
+		resolveBootstrapper(resourceType, providers).runForPatient(patientUuid, queryStoreService, embeddingProvider);
+	}
+
+	/**
+	 * Resolves the bootstrapper for a resource type: the core map first, then the provider's; null when
+	 * neither supplies one. The core-before-provider order is a routing invariant shared by the
+	 * <em>tolerant</em> callers ({@link #getDrift()} degrades a null to "unknown"; {@link #runOneForPatient}
+	 * trusts {@code allResourceTypes} to have filtered nulls). {@link #runOne} deliberately keeps its own
+	 * inline resolution because it must distinguish "no such type" from "provider declared no bootstrapper"
+	 * with separate exception messages.
+	 */
+	private TypeBootstrapper<?> resolveBootstrapper(String resourceType, Map<String, ResourceTypeProvider> providers) {
 		TypeBootstrapper<?> bootstrapper = bootstrappers.get(resourceType);
 		if (bootstrapper == null) {
-			bootstrapper = providers.get(resourceType).getBootstrapper();
+			ResourceTypeProvider provider = providers.get(resourceType);
+			bootstrapper = provider == null ? null : provider.getBootstrapper();
 		}
-		bootstrapper.runForPatient(patientUuid, queryStoreService, embeddingProvider);
+		return bootstrapper;
 	}
 
 	/** Core types first (insertion order), then providers with a non-null bootstrapper. The map is

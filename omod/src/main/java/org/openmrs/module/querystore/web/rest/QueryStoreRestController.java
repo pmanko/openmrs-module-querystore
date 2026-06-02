@@ -82,6 +82,21 @@ public class QueryStoreRestController {
 	}
 
 	/**
+	 * Per-type drift snapshot — core "expected" count vs live index count (ADR: Sync reliability and
+	 * reconciliation). Detection only; the operator reuses {@code POST /reindex} to remediate a gap.
+	 * Gated by {@code Manage Global Properties} (not the read endpoint's {@code Get Patients}): it runs
+	 * a COUNT per resource type across core and the index, so it is an admin/ops reconciliation tool,
+	 * the same audience as {@code reindex}. The JSON shape is produced and unit-tested in
+	 * {@link org.openmrs.module.querystore.bootstrap.DriftReport#toMap()}; the controller is a thin adapter.
+	 */
+	@RequestMapping(value = "/drift", method = RequestMethod.GET)
+	@ResponseBody
+	public ResponseEntity<Object> getDrift() {
+		Context.requirePrivilege(PrivilegeConstants.MANAGE_GLOBAL_PROPERTIES);
+		return new ResponseEntity<Object>(bootstrapService().getDrift().toMap(), HttpStatus.OK);
+	}
+
+	/**
 	 * Reindexes the read store, in one of two scopes selected by the request body:
 	 *
 	 * <ul>

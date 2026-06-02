@@ -598,6 +598,7 @@ public class QueryStoreServiceImplTest {
 		@Override public void reindexPatient(String patientUuid) { }
 		@Override public List<BootstrapProgress> getStatus() { return Collections.emptyList(); }
 		@Override public BootstrapProgress getStatus(String resourceType) { return null; }
+		@Override public org.openmrs.module.querystore.bootstrap.DriftReport getDrift() { return null; }
 		@Override public void onStartup() { }
 		@Override public void onShutdown() { }
 	}
