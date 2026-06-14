@@ -2,7 +2,7 @@
 name: pr-review
 description: Review a GitHub pull request with empirical verification and clearly-labeled review comments, optionally posting them inline on GitHub. Use when asked to review a PR or post review findings as PR comments. Trigger phrases include "review PR", "review this pull request", "post review comments".
 argument-hint: <pr-number-or-url> [--post]
-version: 0.6.0
+version: 0.7.0
 ---
 
 # PR review — verified findings, unambiguous comments
@@ -15,6 +15,7 @@ Arguments: `$ARGUMENTS` — a PR number or URL (if omitted, run `gh pr list` and
 - `gh pr diff <n>` for the diff; fetch the branch locally: `git fetch origin <base> 'pull/<n>/head:pr-<n>'`
 - Check whether the PR is behind its base: `git diff origin/<base>...pr-<n> --stat` vs `git diff origin/<base> pr-<n> --stat` (if they differ, note the drift).
 - **Read the existing review conversation before reviewing** — `gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate` (inline threads, with `in_reply_to_id` and author replies) and `gh pr view <n> --json reviews,comments`. A PR is often mid-conversation: a prior round may have raised your finding already, and the author may have replied/fixed it on a newer commit. For each candidate finding, check it against those threads — if it's already open, **reply in that thread** (build on it, or note the sub-point still unaddressed) instead of posting a fresh top-level comment. Duplicating a live thread is exactly the noise that makes review a bottleneck.
+- **Verify claimed fixes against the head — "fixed" is a claim, not evidence.** When a prior thread is marked resolved or the author replied "done/fixed", read the current code at that spot rather than trusting the reply. Authors routinely fix the headline of a comment while leaving a sub-point untouched (e.g. "memoized the value" addresses re-querying but not the broad `catch` the same comment flagged). If the fix is real, leave it closed; if a flagged sub-point survives, reopen it in-thread, naming exactly what remains. For a re-review of an updated PR, diff against the commit you last reviewed (`git diff <last-reviewed-sha>..pr-<n>`) to focus on what changed, but still confirm each prior finding is genuinely resolved in the head.
 
 ## Step 2 — Verify, don't just read
 
@@ -111,3 +112,4 @@ Mechanics that are easy to get wrong:
 - **Don't critique an inflated version of the PR.** When disagreeing with an approach, respond to the author's actual scope; larger redesigns are follow-up `suggestion`s, not blockers on this PR.
 - **Don't let severity labels substitute for analysis.** A finding is blocking because of its written failure mode, not because it pattern-matches "correctness". Small-looking code patterns (an unclosed resource, a swapped identifier) are routinely under-labeled.
 - **Don't restore confidence the author already has.** A PR author shipped because they believe the change is right; a recap of what they got right is cost without benefit. The review's value is the delta — what must change, plus the rare verified-clean item a later reviewer would re-raise. Passing CI is not a reason to soften the action items: both the expensive bugs and the bottleneck live in what the tests already wave through.
+- **Don't fake confidence on a PR too large to review.** When a PR is too big or sprawling to review with real confidence as one unit, say so plainly and suggest splitting it (by concern, or behavior-change vs. mechanical churn) rather than producing a sweep that reads as thorough but can't be. A reviewer's honest "this exceeds what I can verify in one pass — here's how I'd split it" is worth more than five findings that miss the sixth. Name what you *did* verify and what you couldn't reach.
