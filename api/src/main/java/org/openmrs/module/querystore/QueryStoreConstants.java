@@ -237,6 +237,23 @@ public final class QueryStoreConstants {
 	public static final String DEFAULT_BACKEND = BACKEND_MYSQL;
 
 	/**
+	 * Selects the active sync path (ADR Decision 12, "Runtime sync-mode selection"). {@code aop}
+	 * runs the migration-bridge advice; {@code events} consumes core's #6084 {@code *ServiceEvent}s
+	 * and gates the bridge off; {@code both} runs both for the parity-verification overlap only
+	 * (double embedding cost — not a steady state). Defaults to {@code aop}. Read once at startup and
+	 * cached; changing it takes effect on the next module/server restart.
+	 */
+	public static final String GP_SYNC_MODE = "querystore.syncMode";
+
+	public static final String SYNC_MODE_AOP = "aop";
+
+	public static final String SYNC_MODE_EVENTS = "events";
+
+	public static final String SYNC_MODE_BOTH = "both";
+
+	public static final String DEFAULT_SYNC_MODE = SYNC_MODE_AOP;
+
+	/**
 	 * Runtime-property key carrying the Elasticsearch endpoint URI (e.g.
 	 * {@code http://es.internal:9200}). Lives in {@code openmrs-runtime.properties} rather than a
 	 * GP because the URI may eventually carry credentials, and GPs are visible in the admin UI.

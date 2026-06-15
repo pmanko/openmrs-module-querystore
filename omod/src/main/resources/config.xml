@@ -79,6 +79,15 @@
     <updateURL>https://modules.openmrs.org/modules/download/${project.parent.artifactId}/update.rdf</updateURL>
 
     <globalProperty>
+        <property>querystore.syncMode</property>
+        <defaultValue>aop</defaultValue>
+        <description>Active sync path (ADR Decision 12). "aop" runs the migration-bridge advice;
+            "events" consumes core's #6084 *ServiceEvents and gates the bridge off; "both" runs both
+            for parity verification only (double embedding cost — not a steady state). Read once at
+            startup and cached; a change takes effect on the next module/server restart.</description>
+    </globalProperty>
+
+    <globalProperty>
         <property>querystore.embedding.providerBean</property>
         <defaultValue>querystore.embedding.onnx</defaultValue>
         <description>Spring bean name of the active EmbeddingProvider. Modules may register

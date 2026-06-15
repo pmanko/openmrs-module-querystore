@@ -64,6 +64,12 @@ import org.springframework.aop.AfterReturningAdvice;
  * {@link AfterCommitDispatcher}'s executor. Failures inside the dispatched task are caught
  * per-entity so a single poison record can't skip its siblings.
  *
+ * <p><b>Sync-mode gate.</b> {@link #afterReturning} short-circuits when the bridge is gated off by
+ * the {@code querystore.syncMode} global property (ADR Decision 12, "Runtime sync-mode selection")
+ * — checked via {@link #aopEnabled()} after the cheap trigger-method test, so non-trigger calls pay
+ * nothing. The default is AOP-on, including when the mode can't be resolved (e.g. no running
+ * context).
+ *
  * <p><b>Removal marker.</b> Each subclass is time-bound and carries its own removal marker per
  * ADR Decision 12. This abstract base is deleted when the last subclass is removed.
  */
@@ -75,6 +81,13 @@ public abstract class AbstractIndexingAdvice<T extends BaseOpenmrsData> implemen
 	public final void afterReturning(Object returnValue, Method method, Object[] args, Object target) {
 		String name = method.getName();
 		if (!triggerMethods().contains(name)) {
+			return;
+		}
+		// Trigger method confirmed; only now consult the sync-mode gate (a registered-component
+		// lookup) so non-trigger calls on the advised service — reads, mostly — pay nothing. When
+		// querystore.syncMode gates the bridge off (events / events-only), skip. ADR Decision 12,
+		// "Runtime sync-mode selection." The core-events consumer is gated symmetrically.
+		if (!aopEnabled()) {
 			return;
 		}
 
@@ -214,6 +227,24 @@ public abstract class AbstractIndexingAdvice<T extends BaseOpenmrsData> implemen
 	 */
 	protected String bulkDeletePatientUuidFor(T root) {
 		return null;
+	}
+
+	/**
+	 * Whether the AOP bridge path is active under the configured {@code querystore.syncMode} (ADR
+	 * Decision 12). Read from the cached {@link SyncModeResolver}. If the resolver can't be reached —
+	 * notably in plain unit tests with no running OpenMRS context — the gate defaults to {@code true}
+	 * (AOP enabled), the safe default that preserves pre-gate behavior and keeps the projection from
+	 * silently stalling. Package-visible so gate tests can drive the gated-off path without a context.
+	 */
+	boolean aopEnabled() {
+		try {
+			return Context.getRegisteredComponent("querystore.syncModeResolver", SyncModeResolver.class)
+			        .current().aopEnabled();
+		}
+		catch (RuntimeException e) {
+			log.debug("SyncModeResolver unavailable; defaulting AOP bridge to enabled", e);
+			return true;
+		}
 	}
 
 	BridgeIndexer indexer() {

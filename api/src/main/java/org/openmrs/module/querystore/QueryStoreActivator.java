@@ -22,6 +22,7 @@ import org.openmrs.module.querystore.backend.BackendStore;
 import org.openmrs.module.querystore.backend.BackendStoreSelector;
 import org.openmrs.module.querystore.bootstrap.BootstrapLauncher;
 import org.openmrs.module.querystore.bridge.AfterCommitDispatcher;
+import org.openmrs.module.querystore.bridge.SyncModeResolver;
 import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 
 public class QueryStoreActivator extends BaseModuleActivator implements DaemonTokenAware {
@@ -66,6 +67,10 @@ public class QueryStoreActivator extends BaseModuleActivator implements DaemonTo
 		// the dispatcher is constructed by Spring without it, so propagation lives here.
 		wireBridgeDaemonToken();
 		wireBootstrapLauncherToken();
+		// Seed the cached sync mode (ADR Decision 12) before any AOP advice can fire, so the gate is
+		// a volatile read on the clinical hot path rather than a per-save global-property lookup.
+		Context.getRegisteredComponent("querystore.syncModeResolver", SyncModeResolver.class)
+		        .refresh(Context.getAdministrationService());
 		warmupQueryEmbedder();
 		if (isAutostartEnabled(Context.getAdministrationService())) {
 			triggerBootstrap();

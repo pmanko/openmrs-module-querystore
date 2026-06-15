@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Loaded into context-sensitive tests via BaseModuleContextSensitiveTest's
+    classpath*:TestingApplicationContext.xml location. Registers test-only probe beans into the same
+    Spring context the module beans load into, so a test can verify behaviour that depends on
+    context wiring (currently: that a context bean's @EventListener receives core's #6084
+    SaveServiceEvent). Bean ids are querystore.test.* to avoid collision with core's own
+    TestingApplicationContext.xml, which is also on the classpath under the same wildcard.
+-->
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="
+           http://www.springframework.org/schema/beans
+           http://www.springframework.org/schema/beans/spring-beans-4.3.xsd">
+
+    <bean id="querystore.test.saveServiceEventProbe"
+          class="org.openmrs.module.querystore.events.SaveServiceEventProbe"/>
+
+</beans>

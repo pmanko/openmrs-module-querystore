@@ -20,7 +20,7 @@ The ADR is dense; here is the minimal load-bearing set with anchors.
 - **Locale + multilingual embeddings** ([Decision 8](docs/adr.md#decision-8-locale-specific-serialization-with-multilingual-embeddings)).
 - **Coded fields = UUID + name** ([Decision 9](docs/adr.md#decision-9-coded-fields--store-both-uuid-and-name)). Default is both. Exception only for small, stable, locale-invariant value sets.
 - **Voided → delete, retired → preserve** ([Decisions 10](docs/adr.md#decision-10-voided-records--deleted-from-the-read-store-not-marked) and [11](docs/adr.md#decision-11-retired-metadata--data-references-preserved-names-snapshotted)).
-- **Sync = events first** ([Decision 12](docs/adr.md#decision-12-sync-mechanism--events-first-aop-as-last-resort-gap-filler)). Core's in-process event infrastructure (PR #6084, merged on 2.9.x) is the target; the module's AOP bridge is the pre-2.9 gap filler, selected via `querystore.syncMode`. CDC (#6151 + the pre-alpha debezium module) is the reserved heavier-coverage path.
+- **Sync = events first** ([Decision 12](docs/adr.md#decision-12-sync-mechanism--events-first-aop-as-last-resort-gap-filler)). Core's in-process event infrastructure (PR #6084, merged on 2.9.x) is the target; the module targets 2.9 and the AOP bridge is the incumbent default, selected via `querystore.syncMode` and retired once the events consumer is parity-verified. CDC (#6151 + the pre-alpha debezium module) is the reserved heavier-coverage path.
 - **Module contributions via SPI** ([Decision 13](docs/adr.md#decision-13-module-extension-spi-service-provider-interface-for-custom-resource-types)). Modules contribute resource types via the contribution interface; querystore knows nothing about specific modules.
 
 ## Implementation priorities
@@ -42,7 +42,7 @@ Other open questions (migration-time re-projection hook, event-handler idempoten
 - `docs/migration-chartsearchai.md` — chartsearchai migration gap analysis.
 - `docs/chartsearchai-port-map.md` — implementation-phase pointer to which chartsearchai files are worth porting and which are not.
 - `docs/spi-providers.md` — step-by-step walkthrough for modules contributing custom resource types (verified by `ProviderEndToEndTest`).
-- `pom.xml` — Maven build. Depends on OpenMRS Platform 2.8.0+.
+- `pom.xml` — Maven build. Depends on OpenMRS Platform 2.9.0+ (bumped from 2.8 for #6084's event classes; see Decision 12).
 
 ## Workflow notes
 

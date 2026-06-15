@@ -185,6 +185,11 @@
         <constructor-arg ref="querystore.embedding.dispatcher"/>
     </bean>
 
+    <!-- Caches the querystore.syncMode global property so the per-save gate in the bridge advice
+         (ADR Decision 12) is a volatile read, not a GP lookup. Seeded by QueryStoreActivator. -->
+    <bean id="querystore.syncModeResolver"
+          class="org.openmrs.module.querystore.bridge.SyncModeResolver"/>
+
     <bean id="querystore.bootstrap.launcher"
           class="org.openmrs.module.querystore.bootstrap.BootstrapLauncher"/>
 

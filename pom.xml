@@ -43,7 +43,7 @@
         <maven.compiler.source>${java.version}</maven.compiler.source>
         <maven.compiler.target>${java.version}</maven.compiler.target>
 
-        <openMRSVersion>2.8.0</openMRSVersion>
+        <openMRSVersion>2.9.0-SNAPSHOT</openMRSVersion>
         <elasticsearchVersion>8.13.4</elasticsearchVersion>
         <!--
             Pinned to match the Lucene line OpenMRS core ships transitively via Hibernate Search
