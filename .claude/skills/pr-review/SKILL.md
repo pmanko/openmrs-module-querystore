@@ -61,7 +61,7 @@ Structure of the summary body:
 
 Evidence lives *inside the finding it supports*, not in a standalone "what I verified" section — a real finding is self-justifying once the reader checks it against the code, so a separate verification recap is redundant overhead. **Checked it and it's fine → say nothing.** Do not note cleared concerns "so they aren't re-raised": if the thing is trivially checkable, a later reviewer checks it as fast as you did and your note saves no round; if it isn't, a one-line reply when/if someone actually raises it costs less than pre-empting it on every review.
 
-The one exception that earns a terse line in the body: **cross-cutting verification that is itself the deliverable** — a result with no home in any single finding that materially changes the verdict (e.g. on a pom.xml PR, "built both branches — installed artifacts byte-identical"; the whole question was "did the output change"). That is the substantive output of the review, not a recap of diligence. A trivially-checkable detail (an FK name, a constant value) is not that.
+There is no exception — and on this the body is absolute: verified-clean material never appears in it, not as a section, a bullet, a terse line, or folded into prose. Even when cross-cutting verification was the whole point of the review (e.g. a pom.xml PR's "are the artifacts byte-identical?"), the result is reflected only in the verdict's disposition and the confidence behind it — never written out as a verified-clean note. If such a result genuinely must be on the record, it goes in a single inline `note (no action needed):` anchored to the relevant line, never in the body.
 
 Rules for every inline comment, no exceptions (this is the part PR authors complained about when missing):
 
@@ -78,7 +78,7 @@ Rules for every inline comment, no exceptions (this is the part PR authors compl
 - Silent-failure upgrade: when the failure mode produces wrong behavior without throwing (a swapped repo id, a dropped field, a silently replaced MockMaker), treat it one level more seriously than a crash — CI cannot catch what doesn't throw, so the cost of discovery lands on users.
 - When presenting alternatives, always state the recommended default. Never end on "either option is defensible" without picking one.
 - Do not narrate what the diff does — the author wrote it.
-- Keep each inline comment to its finding and the fix. Cross-cutting verification or context that doesn't attach to one line goes in the summary body (terse — see Step 3), never repeated inline.
+- Keep each inline comment to its finding and the fix — don't repeat the same cross-cutting point across comments. Verified-clean cross-cutting verification does NOT get relocated to the body (see Step 3 — the body carries none); at most it is a single inline `note (no action needed):`.
 - Use GitHub ```suggestion blocks when the fix is a concrete replacement of added lines (RIGHT side only — suggestions cannot attach to deleted lines).
 - Scale to the requested effort: by default, fewer high-confidence findings. At high effort, widen the sweep and surface uncertain findings too — explicitly as `question:`, never as unverified `issue`s.
 - Fewer, sharper comments beat exhaustive ones.
@@ -87,11 +87,13 @@ Rules for every inline comment, no exceptions (this is the part PR authors compl
 
 Posting publishes under the user's own GitHub account. Post only when the user passed `--post` or explicitly asked; otherwise present the full review in the conversation and offer to post.
 
-**Pre-posting gate** — before presenting or posting, write these three as three explicit, standalone lines in your report to the user — verbatim, not paraphrased, not woven into prose narration. If any cannot be said truthfully, go back and fix the review first:
+**Pre-posting gate** — before presenting or posting, write these four as four explicit, standalone lines in your report to the user — verbatim, not paraphrased, not woven into prose narration. If any cannot be said truthfully, go back and fix the review first:
 
 > "Every finding was verified by [building / running / tracing / upstream check], not just read off the diff."
 
 > "Every inline comment leads with a label and either requests an action or asks a question; every `issue (blocking)` contains its failure-mode sentence."
+
+> "The summary body is verdict + findings + 'needs action' and nothing else — zero verified-clean or cleared-concern content anywhere in it: no 'what I checked' line, bullet, section, or aside, and none folded into prose. The verification I did shows up only as the confidence behind the verdict, never written out; if a result must be on the record it is a single inline `note`, not body text."
 
 > "Needs action before merge: [list, or 'none']."
 
