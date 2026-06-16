@@ -162,6 +162,52 @@ public class BootstrapServiceImplTest {
 	}
 
 	@Test
+	public void resyncType_forcesFullReWalkOfCompletedType() {
+		// A drifted type is typically COMPLETED with its cursor at the end, so bootstrap("obs") would
+		// resume from that cursor — a near no-op (see bootstrap_resumesFromPersistedProgress). resyncType
+		// must instead reset the cursor and re-walk from the start, revisiting records the original scan
+		// skipped/lost before the cursor. Same backend here, so forceRestart is the only reset trigger.
+		BootstrapProgress prior = new BootstrapProgress("obs");
+		prior.setStatus(BootstrapStatus.COMPLETED);
+		prior.setCursorUuid("z");
+		prior.setCursorDateChanged(Instant.parse("2025-03-15T09:00:00Z"));
+		prior.setDocumentsIndexed(42);
+		prior.setBackend("lucene");
+		dao.store.put("obs", prior);
+		service.setBackendNameSupplierOverride(() -> "lucene");
+		EmptyPageBootstrapper obs = new EmptyPageBootstrapper("obs");
+		service.setBootstrappers(Collections.singletonList(obs));
+
+		service.resyncType("obs");
+
+		assertNull("resyncType clears the cursor uuid so the type re-walks from the start", obs.lastAfterUuid);
+		assertNull("resyncType clears the cursor timestamp so the type re-walks from the start",
+		        obs.lastAfterDateChanged);
+		assertEquals("documents_indexed reset for the re-walk", 0, dao.find("obs").getDocumentsIndexed());
+		assertEquals(BootstrapStatus.COMPLETED, dao.find("obs").getStatus());
+	}
+
+	@Test
+	public void resyncType_unknownType_throws() {
+		service.setBootstrappers(Collections.singletonList(new EmptyPageBootstrapper("obs")));
+		try {
+			service.resyncType("nosuch");
+			fail("expected IllegalArgumentException for an unknown resource type");
+		}
+		catch (IllegalArgumentException expected) {
+			assertTrue(expected.getMessage().contains("nosuch"));
+		}
+	}
+
+	@Test
+	public void getResourceTypeNames_listsRegisteredTypes() {
+		service.setBootstrappers(Arrays.asList(new EmptyPageBootstrapper("obs"),
+		        new EmptyPageBootstrapper("encounter")));
+		assertTrue("registered core bootstrapper types are listed",
+		        service.getResourceTypeNames().containsAll(Arrays.asList("obs", "encounter")));
+	}
+
+	@Test
 	public void bootstrap_resetsCursorWhenStoredBackendIsNull() {
 		// Rows written before the backend column existed carry null. Treat them as mismatched so
 		// one re-bootstrap follows the schema migration; otherwise we'd inherit a cursor that the

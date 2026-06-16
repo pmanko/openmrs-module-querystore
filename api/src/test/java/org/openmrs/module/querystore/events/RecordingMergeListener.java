@@ -105,6 +105,15 @@ public class RecordingMergeListener extends CoreServiceEventListener {
 		}
 
 		@Override
+		public void resyncType(String resourceType) {
+		}
+
+		@Override
+		public List<String> getResourceTypeNames() {
+			return Collections.emptyList();
+		}
+
+		@Override
 		public void ensureIndexed(String patientUuid) {
 		}
 

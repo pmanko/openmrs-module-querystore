@@ -177,6 +177,23 @@ public class QueryStoreRestControllerTest {
 	}
 
 	@Test
+	public void reindex_returns400_whenScopeAllWithResourceType() {
+		authenticate();
+		// scope:"all" + resourceType is ambiguous (global rebuild vs per-type re-sync) and must be
+		// rejected, not silently resolved to the expensive global scan with resourceType ignored.
+		RecordingLauncher launcher = new RecordingLauncher(true);
+		controller.setBootstrapLauncher(launcher);
+		Map<String, String> body = new HashMap<String, String>();
+		body.put("scope", "all");
+		body.put("resourceType", "obs");
+
+		ResponseEntity<Object> response = controller.reindex(body);
+
+		assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+		assertEquals("an ambiguous all+resourceType request must not launch a global reindex", 0, launcher.launches);
+	}
+
+	@Test
 	public void reindex_acceptsMixedCaseScopeAll() {
 		authenticate();
 		// A hand-typed "ALL" expresses the same intent; it must not be rejected as an unknown scope.
@@ -227,6 +244,98 @@ public class QueryStoreRestControllerTest {
 		    body.get("documentsIndexed"));
 		verify(bootstrap).reindexPatient("patient-uuid");
 		assertEquals("a per-patient reindex must not also launch a global bootstrap", 0, launcher.launches);
+	}
+
+	@Test
+	public void reindex_launchesTypeResyncAndReturns202_whenScopeType() {
+		authenticate();
+		// scope:"type" + a known resourceType launches exactly one per-type re-sync (async, 202) and
+		// never touches the global launch path. Echoes the resourceType in the body.
+		BootstrapService bootstrap = mock(BootstrapService.class);
+		when(bootstrap.getResourceTypeNames()).thenReturn(Arrays.asList("obs", "condition"));
+		controller.setBootstrapService(bootstrap);
+		RecordingLauncher launcher = new RecordingLauncher(true);
+		controller.setBootstrapLauncher(launcher);
+		Map<String, String> body = new HashMap<String, String>();
+		body.put("scope", "type");
+		body.put("resourceType", "obs");
+
+		ResponseEntity<Object> response = controller.reindex(body);
+
+		assertEquals(HttpStatus.ACCEPTED, response.getStatusCode());
+		assertEquals("scope:type must launch exactly one per-type re-sync", 1, launcher.resyncLaunches);
+		assertEquals("obs", launcher.resyncedType);
+		assertEquals("obs", ((Map<?, ?>) response.getBody()).get("resourceType"));
+		assertEquals("a per-type re-sync must not launch a global bootstrap", 0, launcher.launches);
+	}
+
+	@Test
+	public void reindex_returns400_whenScopeTypeMissingResourceType() {
+		authenticate();
+		RecordingLauncher launcher = new RecordingLauncher(true);
+		controller.setBootstrapLauncher(launcher);
+
+		ResponseEntity<Object> response = controller.reindex(Collections.singletonMap("scope", "type"));
+
+		assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+		assertEquals("scope:type with no resourceType must not launch anything", 0, launcher.resyncLaunches);
+	}
+
+	@Test
+	public void reindex_returns400_whenScopeTypeUnknownResourceType() {
+		authenticate();
+		// A typo'd type is rejected synchronously here (validated against getResourceTypeNames) rather
+		// than 202-then-fail on the daemon thread.
+		BootstrapService bootstrap = mock(BootstrapService.class);
+		when(bootstrap.getResourceTypeNames()).thenReturn(Arrays.asList("obs", "condition"));
+		controller.setBootstrapService(bootstrap);
+		RecordingLauncher launcher = new RecordingLauncher(true);
+		controller.setBootstrapLauncher(launcher);
+		Map<String, String> body = new HashMap<String, String>();
+		body.put("scope", "type");
+		body.put("resourceType", "nonsuch");
+
+		ResponseEntity<Object> response = controller.reindex(body);
+
+		assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+		assertEquals("an unknown resourceType must not launch a re-sync", 0, launcher.resyncLaunches);
+	}
+
+	@Test
+	public void reindex_returns503_whenScopeTypeButDaemonTokenUnavailable() {
+		authenticate();
+		// Validation passes, but launchResyncAsync returns false (no daemon token) — 503, not a
+		// misleading 202.
+		BootstrapService bootstrap = mock(BootstrapService.class);
+		when(bootstrap.getResourceTypeNames()).thenReturn(Arrays.asList("obs"));
+		controller.setBootstrapService(bootstrap);
+		RecordingLauncher launcher = new RecordingLauncher(false);
+		controller.setBootstrapLauncher(launcher);
+		Map<String, String> body = new HashMap<String, String>();
+		body.put("scope", "type");
+		body.put("resourceType", "obs");
+
+		ResponseEntity<Object> response = controller.reindex(body);
+
+		assertEquals(HttpStatus.SERVICE_UNAVAILABLE, response.getStatusCode());
+		assertEquals("validation passed, so a launch was attempted", 1, launcher.resyncLaunches);
+	}
+
+	@Test
+	public void reindex_returns400_whenBothPatientAndScopeType() {
+		authenticate();
+		// Ambiguous intent (per-patient vs per-type) must be rejected, never silently resolved.
+		RecordingLauncher launcher = new RecordingLauncher(true);
+		controller.setBootstrapLauncher(launcher);
+		Map<String, String> body = new HashMap<String, String>();
+		body.put("scope", "type");
+		body.put("resourceType", "obs");
+		body.put("patient", "patient-uuid");
+
+		ResponseEntity<Object> response = controller.reindex(body);
+
+		assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+		assertEquals("an ambiguous patient+type request must not launch a re-sync", 0, launcher.resyncLaunches);
 	}
 
 	@Test
@@ -293,6 +402,10 @@ public class QueryStoreRestControllerTest {
 
 		private int launches = 0;
 
+		private int resyncLaunches = 0;
+
+		private String resyncedType;
+
 		private RecordingLauncher(boolean result) {
 			this.result = result;
 		}
@@ -300,6 +413,13 @@ public class QueryStoreRestControllerTest {
 		@Override
 		public boolean launchAsync() {
 			launches++;
+			return result;
+		}
+
+		@Override
+		public boolean launchResyncAsync(String resourceType) {
+			resyncLaunches++;
+			resyncedType = resourceType;
 			return result;
 		}
 	}

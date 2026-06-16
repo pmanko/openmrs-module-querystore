@@ -589,6 +589,8 @@ public class QueryStoreServiceImplTest {
 
 		@Override public void bootstrap() { }
 		@Override public void bootstrap(String resourceType) { }
+		@Override public void resyncType(String resourceType) { }
+		@Override public List<String> getResourceTypeNames() { return Collections.emptyList(); }
 		@Override public void ensureIndexed(String patientUuid) {
 			ensureIndexedCalls.add(patientUuid);
 			if (onEnsureIndexed != null) {

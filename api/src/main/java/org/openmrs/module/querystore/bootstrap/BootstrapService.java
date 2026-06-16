@@ -31,6 +31,32 @@ public interface BootstrapService extends OpenmrsService {
 	void bootstrap(String resourceType);
 
 	/**
+	 * Reconciliation remediation (ADR: Sync reliability and reconciliation): force a full re-walk of
+	 * one resource type, used to correct drift surfaced by {@link #getDrift()}. Unlike
+	 * {@link #bootstrap(String)} — which resumes from the persisted cursor and so is a near no-op for
+	 * an already-{@code COMPLETED} type — this resets the type's progress (cursor cleared,
+	 * {@code NOT_STARTED}) and re-scans the whole type from the beginning, picking up records the
+	 * original scan skipped (poison rows) or never saw (lost events, post-bootstrap arrivals before
+	 * the cursor). Idempotent via the Decision 3 conditional-upsert-by-version invariant, so
+	 * re-walking already-indexed records writes no duplicates.
+	 *
+	 * <p><b>Re-walk only:</b> this corrects <em>positive</em> drift (under-indexing — the common
+	 * case). It does not delete <em>stale extras</em> (negative drift: docs whose core record was
+	 * voided/deleted but never evented out), since the scan only visits live core records. Runs under
+	 * the same per-type lock as {@link #bootstrap(String)}; expensive (a full type scan), so callers
+	 * should run it off the request thread. Throws {@code IllegalArgumentException} for an unknown
+	 * resource type.
+	 */
+	void resyncType(String resourceType);
+
+	/**
+	 * The registered indexed resource-type names (core bootstrappers plus SPI-contributed providers
+	 * that declare a bootstrapper). A cheap registry read — no counts or scans — suitable for
+	 * validating a requested {@code resourceType} before launching a {@link #resyncType(String)}.
+	 */
+	java.util.List<String> getResourceTypeNames();
+
+	/**
 	 * Synchronously projects every clinical record belonging to {@code patientUuid} into the read
 	 * store across every registered resource type, using the same serializers, embedder, and write
 	 * path the per-type bootstrap uses. Scoped to a single patient — distinct from {@link #bootstrap}'s

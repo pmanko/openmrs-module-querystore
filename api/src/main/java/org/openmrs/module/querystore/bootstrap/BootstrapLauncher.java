@@ -109,6 +109,42 @@ public class BootstrapLauncher {
 	}
 
 	/**
+	 * Launches a targeted re-sync of a single resource type on a daemon thread (reconciliation
+	 * remediation; see {@link BootstrapService#resyncType(String)}). Like {@link #launchAsync()} it
+	 * needs the {@link DaemonToken} for the daemon-user {@code UserContext} the scan's GP reads
+	 * require, and resolves the service on the daemon thread.
+	 *
+	 * <p>No global running-flag guard (unlike {@link #launchAsync()}): a re-sync is scoped to one
+	 * type, the service serializes same-type work on its per-type lock, and the scan is idempotent —
+	 * so a duplicate request is at worst redundant, not corrupting. The caller is expected to have
+	 * validated {@code resourceType} (e.g. against {@link BootstrapService#getResourceTypeNames()}).
+	 *
+	 * @return {@code true} once the re-sync is handed to a daemon thread; {@code false} only when no
+	 *         {@link DaemonToken} is wired yet, in which case nothing runs.
+	 */
+	public boolean launchResyncAsync(String resourceType) {
+		DaemonToken token = this.daemonToken;
+		if (token == null) {
+			log.warn("Daemon token unavailable; cannot launch type re-sync for " + resourceType
+			        + " (BootstrapService.resyncType(String) can still be called programmatically)");
+			return false;
+		}
+		daemonExecutor.execute(() -> {
+			try {
+				log.info("Type re-sync starting for " + resourceType);
+				Context.getService(BootstrapService.class).resyncType(resourceType);
+				log.info("Type re-sync completed for " + resourceType);
+			}
+			catch (RuntimeException e) {
+				// Fire-and-forget on a daemon thread — no caller upstack to surface to, so log here
+				// (mirrors the after-commit sync path's log-and-swallow per ADR Decision 12).
+				log.error("Type re-sync failed for " + resourceType, e);
+			}
+		}, token);
+		return true;
+	}
+
+	/**
 	 * Test seam over {@link Daemon#runInDaemonThread}: the static call cannot be stubbed, so the
 	 * launch handoff (task + token) is verified through this indirection. Mirrors
 	 * {@link org.openmrs.module.querystore.sync.AfterCommitDispatcher}'s executor seam.

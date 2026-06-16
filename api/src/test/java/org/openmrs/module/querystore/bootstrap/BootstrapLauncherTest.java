@@ -133,4 +133,52 @@ public class BootstrapLauncherTest {
 		assertEquals("a stuck flag would short-circuit the retry as a duplicate; both attempts must"
 		        + " reach the executor", 2, attempts[0]);
 	}
+
+	@Test
+	public void launchResyncAsync_returnsFalseAndHandsOffNothing_whenNoDaemonToken() {
+		BootstrapLauncher launcher = new BootstrapLauncher();
+		final int[] launches = { 0 };
+		launcher.setDaemonExecutor((task, token) -> launches[0]++);
+
+		// Same token contract as launchAsync: the re-walk reads GPs for its embedder/backend and so
+		// needs the daemon-user UserContext the token provides; refuse rather than spawn a context-less
+		// thread.
+		assertFalse(launcher.launchResyncAsync("obs"));
+		assertEquals("must not hand any task to the daemon executor without a token", 0, launches[0]);
+	}
+
+	@Test
+	public void launchResyncAsync_handsTaskAndWiredTokenToDaemonExecutor_whenTokenPresent() {
+		BootstrapLauncher launcher = new BootstrapLauncher();
+		final Runnable[] capturedTask = { null };
+		final DaemonToken[] capturedToken = { null };
+		final int[] launches = { 0 };
+		launcher.setDaemonExecutor((task, token) -> {
+			capturedTask[0] = task;
+			capturedToken[0] = token;
+			launches[0]++;
+		});
+		DaemonToken token = new DaemonToken("token-resync");
+		launcher.setDaemonToken(token);
+
+		assertTrue(launcher.launchResyncAsync("obs"));
+		assertEquals(1, launches[0]);
+		assertSame("the wired token must be the one handed to the daemon thread", token, capturedToken[0]);
+		assertNotNull("a re-sync task must be handed off to the daemon executor", capturedTask[0]);
+	}
+
+	@Test
+	public void launchResyncAsync_doesNotCollapse_eachCallHandsOffSeparately() {
+		// Deliberate contrast with launchAsync: a per-type re-sync has no in-flight guard, so repeated
+		// requests each hand off (the service serializes same-type work on its per-type lock and the
+		// scan is idempotent, so a duplicate is at worst redundant, never corrupting).
+		BootstrapLauncher launcher = new BootstrapLauncher();
+		final int[] launches = { 0 };
+		launcher.setDaemonExecutor((task, token) -> launches[0]++);
+		launcher.setDaemonToken(new DaemonToken("token-resync-twice"));
+
+		assertTrue(launcher.launchResyncAsync("obs"));
+		assertTrue(launcher.launchResyncAsync("obs"));
+		assertEquals("re-sync does not collapse overlapping requests (unlike launchAsync)", 2, launches[0]);
+	}
 }

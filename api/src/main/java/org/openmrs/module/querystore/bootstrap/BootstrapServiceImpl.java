@@ -128,7 +128,7 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 		Map<String, ResourceTypeProvider> providers = discoverProviders();
 		for (String resourceType : allResourceTypes(providers)) {
 			try {
-				runOne(resourceType, providers);
+				runOne(resourceType, providers, false);
 			}
 			catch (RuntimeException e) {
 				log.warn("Bootstrap of " + resourceType + " failed; continuing with remaining types", e);
@@ -138,7 +138,20 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 
 	@Override
 	public void bootstrap(String resourceType) {
-		runOne(resourceType, discoverProviders());
+		runOne(resourceType, discoverProviders(), false);
+	}
+
+	@Override
+	public void resyncType(String resourceType) {
+		// forceRestart=true: reset the cursor and re-walk the whole type, even if it is COMPLETED, so
+		// drift from skipped/lost records before the cursor is corrected (a plain bootstrap(type) would
+		// resume from the end-cursor and miss them).
+		runOne(resourceType, discoverProviders(), true);
+	}
+
+	@Override
+	public List<String> getResourceTypeNames() {
+		return allResourceTypes(discoverProviders());
 	}
 
 	@Override
@@ -262,7 +275,7 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 		}
 	}
 
-	private void runOne(String resourceType, Map<String, ResourceTypeProvider> providers) {
+	private void runOne(String resourceType, Map<String, ResourceTypeProvider> providers, boolean forceRestart) {
 		TypeBootstrapper<?> bootstrapper = bootstrappers.get(resourceType);
 		if (bootstrapper == null) {
 			ResourceTypeProvider provider = providers.get(resourceType);
@@ -286,8 +299,10 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 			if (progress == null) {
 				progress = new BootstrapProgress(resourceType);
 				progress.setBackend(currentBackend);
-			} else if (!Objects.equals(progress.getBackend(), currentBackend)) {
-				// A querystore.backend GP flip leaves the new backend's storage empty (or holding
+			} else if (forceRestart || !Objects.equals(progress.getBackend(), currentBackend)) {
+				// Reset the progress row so the loop re-walks the corpus from the start. Two triggers:
+				// (1) forceRestart — an operator-driven targeted re-sync (resyncType) to correct drift;
+				// (2) a querystore.backend GP flip leaves the new backend's storage empty (or holding
 				// whatever a prior session wrote there), while the persisted cursor points past
 				// records that were written into the old backend. Inheriting that cursor would
 				// declare the new backend "completed" without it ever having seen any data — the
@@ -303,8 +318,11 @@ public class BootstrapServiceImpl extends BaseOpenmrsService implements Bootstra
 				// path makes the static corpus correct on the next start but cannot recover those
 				// in-flight writes. If runtime backend swaps become a supported workflow, a
 				// GlobalPropertyListener that re-wires QueryStoreServiceImpl is the next fix.
-				log.info("Resetting bootstrap progress for " + resourceType
-				        + " (backend changed: " + progress.getBackend() + " -> " + currentBackend + ")");
+				log.info("Resetting bootstrap progress for " + resourceType + " ("
+				        + (Objects.equals(progress.getBackend(), currentBackend)
+				                ? "forced re-sync"
+				                : "backend changed: " + progress.getBackend() + " -> " + currentBackend)
+				        + ")");
 				resetProgressForBackend(progress, currentBackend);
 				progressDao.save(progress);
 			}

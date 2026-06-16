@@ -97,7 +97,7 @@ public class QueryStoreRestController {
 	}
 
 	/**
-	 * Reindexes the read store, in one of two scopes selected by the request body:
+	 * Reindexes the read store, in one of three scopes selected by the request body:
 	 *
 	 * <ul>
 	 * <li>{@code {"patient":"<uuid>"}} — force a full re-projection of one patient (delete + re-index
@@ -108,12 +108,20 @@ public class QueryStoreRestController {
 	 * <strong>Asynchronous</strong>: a full-corpus scan cannot run in a request thread, so it is handed
 	 * to a daemon thread via {@link BootstrapLauncher} and the call returns {@code 202 Accepted}
 	 * immediately. Progress is observed via {@code GET /querystore/indexingstatus}.</li>
+	 * <li>{@code {"scope":"type","resourceType":"<type>"}} — reconciliation remediation: force a full
+	 * re-walk of one resource type to correct drift surfaced by {@code GET /querystore/drift} (ADR:
+	 * Sync reliability and reconciliation). <strong>Asynchronous</strong> (a full single-type scan
+	 * can't run in a request thread); returns {@code 202 Accepted}, poll {@code indexingstatus}.
+	 * Re-walk only — corrects under-indexing, not stale extras (see {@link BootstrapService#resyncType}).
+	 * The {@code resourceType} is validated against {@link BootstrapService#getResourceTypeNames()}
+	 * (a {@code 400} for an unknown type) so a typo fails fast rather than silently on the daemon
+	 * thread.</li>
 	 * </ul>
 	 *
-	 * <p>The global scope is opt-in via an explicit {@code scope:"all"} rather than "absent patient
+	 * <p>The global/type scopes are opt-in via an explicit {@code scope} rather than "absent patient
 	 * means everything": absence overlaps with a malformed/truncated request, and resolving that
 	 * ambiguity by launching the single most expensive operation in the module is a footgun. A request
-	 * with neither {@code patient} nor {@code scope:"all"} is therefore a {@code 400}, and an
+	 * with neither {@code patient} nor a {@code scope} is therefore a {@code 400}, and an
 	 * unrecognised {@code scope} is rejected rather than silently falling through.
 	 *
 	 * <p>Gated by {@code Manage Global Properties} rather than the read endpoint's {@code Get Patients}:
@@ -133,30 +141,58 @@ public class QueryStoreRestController {
 
 		String scope = StringUtils.trimToNull(body == null ? null : body.get("scope"));
 		String patientUuid = StringUtils.trimToNull(body == null ? null : body.get("patient"));
+		String resourceType = StringUtils.trimToNull(body == null ? null : body.get("resourceType"));
 
 		if (scope != null) {
-			if (!"all".equalsIgnoreCase(scope)) {
-				return errorResponse(HttpStatus.BAD_REQUEST, "Unknown scope '" + scope + "'; the only supported scope is \"all\"");
+			if ("all".equalsIgnoreCase(scope)) {
+				if (patientUuid != null || resourceType != null) {
+					// Ambiguous intent: a global reindex is the most expensive op in the module, so do
+					// not silently let scope win and ignore a patient/resourceType the caller also sent.
+					return errorResponse(HttpStatus.BAD_REQUEST,
+					    "Specify only one of patient, scope:\"all\", or scope:\"type\" + resourceType");
+				}
+				boolean launched = bootstrapLauncher().launchAsync();
+				if (!launched) {
+					// No daemon token wired yet, so the async backfill cannot start. 503 rather than a
+					// misleading 202 that would imply work is underway.
+					return errorResponse(HttpStatus.SERVICE_UNAVAILABLE,
+					    "Cannot start reindex: the bootstrap daemon is not yet available");
+				}
+				Map<String, Object> result = new HashMap<String, Object>();
+				result.put("accepted", true);
+				return new ResponseEntity<Object>(result, HttpStatus.ACCEPTED);
 			}
-			if (patientUuid != null) {
-				// Ambiguous intent: a global reindex is expensive, so do not silently let scope win
-				// and ignore the patient — the caller might have meant a one-patient reindex.
-				return errorResponse(HttpStatus.BAD_REQUEST, "Specify either patient or scope:\"all\", not both");
+			if ("type".equalsIgnoreCase(scope)) {
+				// Reconciliation remediation: re-walk one drifted type (ADR: Sync reliability and
+				// reconciliation). Async like scope:"all" — a full single-type scan can't run in a
+				// request thread.
+				if (patientUuid != null) {
+					return errorResponse(HttpStatus.BAD_REQUEST, "Specify either patient or scope:\"type\", not both");
+				}
+				if (resourceType == null) {
+					return errorResponse(HttpStatus.BAD_REQUEST, "scope:\"type\" requires a resourceType");
+				}
+				// Validate synchronously (a cheap registry read) so a typo is a 400 here rather than a
+				// 202 that fails silently on the daemon thread.
+				if (!bootstrapService().getResourceTypeNames().contains(resourceType)) {
+					return errorResponse(HttpStatus.BAD_REQUEST, "Unknown resourceType '" + resourceType + "'");
+				}
+				boolean launched = bootstrapLauncher().launchResyncAsync(resourceType);
+				if (!launched) {
+					return errorResponse(HttpStatus.SERVICE_UNAVAILABLE,
+					    "Cannot start re-sync: the bootstrap daemon is not yet available");
+				}
+				Map<String, Object> result = new HashMap<String, Object>();
+				result.put("accepted", true);
+				result.put("resourceType", resourceType);
+				return new ResponseEntity<Object>(result, HttpStatus.ACCEPTED);
 			}
-			boolean launched = bootstrapLauncher().launchAsync();
-			if (!launched) {
-				// No daemon token wired yet, so the async backfill cannot start. 503 rather than a
-				// misleading 202 that would imply work is underway.
-				return errorResponse(HttpStatus.SERVICE_UNAVAILABLE,
-				    "Cannot start reindex: the bootstrap daemon is not yet available");
-			}
-			Map<String, Object> result = new HashMap<String, Object>();
-			result.put("accepted", true);
-			return new ResponseEntity<Object>(result, HttpStatus.ACCEPTED);
+			return errorResponse(HttpStatus.BAD_REQUEST,
+			    "Unknown scope '" + scope + "'; supported scopes are \"all\" and \"type\"");
 		}
 
 		if (patientUuid == null) {
-			return errorResponse(HttpStatus.BAD_REQUEST, "patient or scope:\"all\" is required");
+			return errorResponse(HttpStatus.BAD_REQUEST, "patient or scope (\"all\" or \"type\") is required");
 		}
 
 		bootstrapService().reindexPatient(patientUuid);

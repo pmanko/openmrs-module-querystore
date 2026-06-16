@@ -77,7 +77,7 @@ curl -s -u admin:Admin123 \
 
 ## POST `/ws/rest/v1/querystore/reindex`
 
-Re-indexes the read store in one of two scopes, selected by the request body. Both are destructive,
+Re-indexes the read store in one of three scopes, selected by the request body. All are destructive,
 expensive maintenance operations gated by **`Manage Global Properties`** (stricter than the read
 endpoint's `Get Patients`).
 
@@ -132,14 +132,47 @@ curl -s -X POST -u admin:Admin123 -H 'Content-Type: application/json' \
   https://your-server/openmrs/ws/rest/v1/querystore/reindex
 ```
 
+### Per-type — `{"scope": "type", "resourceType": "<type>"}`
+
+Reconciliation remediation: forces a full re-walk of **one resource type** from core to correct
+drift surfaced by [`GET /drift`](#get-wsrestv1querystoredrift), without the cost of a global
+rebuild. Resets that type's bootstrap cursor and re-scans it from the start, so records the original
+scan skipped (poison rows) or never saw (lost events, post-bootstrap arrivals before the cursor) are
+picked up. Poll [`GET /indexingstatus`](#get-wsrestv1querystoreindexingstatus) for that type's
+status; re-check `GET /drift` afterward.
+
+- **Asynchronous:** a full single-type scan can't run in a request thread, so the call returns `202
+  Accepted` and the work proceeds on a daemon thread.
+- **Re-walk only:** corrects **under-indexing** (positive drift — the common case). It does **not**
+  delete *stale extras* (negative drift: documents whose core record was voided/deleted but never
+  evented out), since the scan only visits live core records.
+- **Validated:** `resourceType` is checked against the registered indexed types; an unknown value is
+  rejected with `400` synchronously, rather than a `202` that fails silently on the daemon thread.
+
+**Response `202`:**
+
+```json
+{ "accepted": true, "resourceType": "obs" }
+```
+
+```bash
+curl -s -X POST -u admin:Admin123 -H 'Content-Type: application/json' \
+  -d '{"scope":"type","resourceType":"obs"}' \
+  https://your-server/openmrs/ws/rest/v1/querystore/reindex
+```
+
 ### Errors
 
 | Status | Body | When |
 |---|---|---|
-| `400` | `{"error": "patient or scope:\"all\" is required"}` | neither `patient` nor `scope` supplied |
-| `400` | `{"error": "Unknown scope '<x>'; the only supported scope is \"all\""}` | `scope` set to anything other than `all` |
-| `400` | `{"error": "Specify either patient or scope:\"all\", not both"}` | both `patient` and `scope:"all"` supplied (ambiguous) |
+| `400` | `{"error": "patient or scope (\"all\" or \"type\") is required"}` | neither `patient` nor `scope` supplied |
+| `400` | `{"error": "Unknown scope '<x>'; supported scopes are \"all\" and \"type\""}` | `scope` set to anything other than `all` or `type` |
+| `400` | `{"error": "Specify only one of patient, scope:\"all\", or scope:\"type\" + resourceType"}` | `scope:"all"` supplied together with `patient` or `resourceType` (ambiguous) |
+| `400` | `{"error": "Specify either patient or scope:\"type\", not both"}` | both `patient` and `scope:"type"` supplied (ambiguous) |
+| `400` | `{"error": "scope:\"type\" requires a resourceType"}` | `scope:"type"` without a `resourceType` |
+| `400` | `{"error": "Unknown resourceType '<x>'"}` | `scope:"type"` with a `resourceType` that is not a registered indexed type |
 | `503` | `{"error": "Cannot start reindex: the bootstrap daemon is not yet available"}` | `scope:"all"` requested while the module's daemon token is unavailable — normally a misconfiguration, since the token is wired during module startup, before the server serves requests |
+| `503` | `{"error": "Cannot start re-sync: the bootstrap daemon is not yet available"}` | `scope:"type"` requested while the daemon token is unavailable (same cause as above) |
 
 **Semantics & caveats:**
 
