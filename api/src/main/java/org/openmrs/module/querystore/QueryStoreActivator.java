@@ -22,7 +22,6 @@ import org.openmrs.module.querystore.backend.BackendStore;
 import org.openmrs.module.querystore.backend.BackendStoreSelector;
 import org.openmrs.module.querystore.bootstrap.BootstrapLauncher;
 import org.openmrs.module.querystore.bridge.AfterCommitDispatcher;
-import org.openmrs.module.querystore.bridge.SyncModeResolver;
 import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 
 public class QueryStoreActivator extends BaseModuleActivator implements DaemonTokenAware {
@@ -61,16 +60,12 @@ public class QueryStoreActivator extends BaseModuleActivator implements DaemonTo
 		wireBackend(
 		    Context.getRegisteredComponent("querystore.backend.selector", BackendStoreSelector.class),
 		    Context.getRegisteredComponent("queryStoreService", QueryStoreServiceImpl.class));
-		// The bridge dispatcher's pool threads have no UserContext; embedder reads of querystore
-		// global properties (provider bean, model/vocab paths) need one, so hand it the daemon
-		// token before any AOP advice can fire. Activator owns the token (via DaemonTokenAware);
-		// the dispatcher is constructed by Spring without it, so propagation lives here.
+		// The after-commit dispatcher's pool threads have no UserContext; embedder reads of querystore
+		// global properties (provider bean, model/vocab paths) need one, so hand it the daemon token
+		// before the events consumer can dispatch an index. Activator owns the token (via
+		// DaemonTokenAware); the dispatcher is constructed by Spring without it, so propagation lives here.
 		wireBridgeDaemonToken();
 		wireBootstrapLauncherToken();
-		// Seed the cached sync mode (ADR Decision 12) before any AOP advice can fire, so the gate is
-		// a volatile read on the clinical hot path rather than a per-save global-property lookup.
-		Context.getRegisteredComponent("querystore.syncModeResolver", SyncModeResolver.class)
-		        .refresh(Context.getAdministrationService());
 		warmupQueryEmbedder();
 		if (isAutostartEnabled(Context.getAdministrationService())) {
 			triggerBootstrap();
@@ -106,8 +101,8 @@ public class QueryStoreActivator extends BaseModuleActivator implements DaemonTo
 
 	void wireBridgeDaemonToken() {
 		if (daemonToken == null) {
-			log.warn("Daemon token unavailable; bridge AOP projection will run without a"
-			        + " UserContext until the token is wired. Documents created in this window"
+			log.warn("Daemon token unavailable; the events consumer's after-commit projection will run"
+			        + " without a UserContext until the token is wired. Documents created in this window"
 			        + " are silently dropped by the dispatcher's swallow guard — re-run the"
 			        + " bootstrap (or restart the module) once the token arrives to reconcile.");
 			return;

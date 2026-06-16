@@ -20,9 +20,9 @@ import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 
 /**
- * Shared {@code embed → index} terminal stage for bridge advice and (later) event handlers. The
- * upstream caller serializes the record while the Hibernate session is still open and passes the
- * resulting {@link QueryDocument} here; this class adds the embedding off the request thread and
+ * The {@code embed → index} terminal stage of the events-first sync pipeline. The events consumer
+ * serializes the record while the Hibernate session is still open and passes the resulting
+ * {@link QueryDocument} here; this class adds the embedding off the request thread and
  * writes via {@link QueryStoreService#index(QueryDocument)}, which honors the
  * conditional-upsert-by-version invariant (ADR Decision 3).
  *
@@ -44,7 +44,7 @@ public class BridgeIndexer {
 	}
 
 	/**
-	 * Embed and write the document. The AOP path is fire-and-forget by design (invoked from
+	 * Embed and write the document. This runs fire-and-forget by design (invoked from
 	 * {@code AfterCommitDispatcher} after the source-record transaction has committed), so per-doc
 	 * failures are logged here rather than thrown — there's no caller upstack who could meaningfully
 	 * react. Bootstrap goes through {@code TypeBootstrapper.projectBatch} instead and consumes the
@@ -71,8 +71,9 @@ public class BridgeIndexer {
 	}
 
 	/**
-	 * Cross-type sweep of every per-type-store document keyed by {@code patientUuid}. Used by the
-	 * {@link PatientIndexingAdvice} purge path so a core {@code purgePatient} call removes the
+	 * Cross-type sweep of every per-type-store document keyed by {@code patientUuid}. Driven by
+	 * {@link org.openmrs.module.querystore.serialization.PatientRecordSerializer#bulkDeletePatientUuidFor}
+	 * on a {@code PurgeServiceEvent} for a patient, so a core {@code purgePatient} removes the
 	 * patient's full read-store footprint, not just the {@code querystore_patient} row.
 	 */
 	public void bulkDeleteByPatient(String patientUuid) {

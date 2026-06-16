@@ -19,24 +19,22 @@ import org.openmrs.module.querystore.model.QueryDocument;
 import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
 
 /**
- * The single {@code serialize → partition → dispatch} projection used by <b>both</b> sync paths —
- * the AOP migration bridge ({@link AbstractIndexingAdvice}) and the events consumer — so a save
- * produces an identical read-store document regardless of which path drove it. This is the shared
- * core that makes the parity ADR Decision 12 calls for true by construction rather than by keeping
- * two implementations in step.
+ * The {@code serialize → partition → dispatch} projection the events consumer
+ * ({@code CoreServiceEventListener}) runs to write a saved/voided/purged record into the read store.
+ * (It was originally shared with the AOP migration bridge to guarantee parity; the bridge has since
+ * been removed and events is the sole sync path — ADR Decision 12.)
  *
  * <p>Per-type behaviour (which records the save touches; whether a purge sweeps a patient's whole
- * chart) lives on the {@link ClinicalRecordSerializer} — the per-type bean both paths already
- * resolve — via {@link ClinicalRecordSerializer#collectTree} and
+ * chart) lives on the {@link ClinicalRecordSerializer} — the per-type bean the consumer resolves —
+ * via {@link ClinicalRecordSerializer#collectTree} and
  * {@link ClinicalRecordSerializer#bulkDeletePatientUuidFor}, so module-contributed types (ADR
  * Decision 13) get the same treatment without touching this class.
  *
  * <p><b>Disposition is per-node, not per-call.</b> Each node in {@code collectTree(root)} is routed
  * by its own {@code voided} flag (voided → delete, per ADR Decision 10; otherwise serialize +
  * index). {@code purge} is the only call-level override — every node is deleted unconditionally
- * because the core row is gone. Both callers pass {@code purge=true} only for a hard delete (the AOP
- * purge methods; the events {@code PurgeServiceEvent}); every other trigger passes {@code false} and
- * lets the entity's own state decide.
+ * because the core row is gone. The consumer passes {@code purge=true} only for {@code
+ * PurgeServiceEvent}; every other event passes {@code false} and lets the entity's own state decide.
  *
  * <p><b>Synchronous serialize, asynchronous write.</b> Serialization runs on the caller's thread
  * (inside the originating transaction, so lazy navigations resolve against an open session); the

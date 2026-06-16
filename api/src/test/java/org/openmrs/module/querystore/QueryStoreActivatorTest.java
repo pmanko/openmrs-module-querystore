@@ -66,9 +66,9 @@ public class QueryStoreActivatorTest {
 	@Test
 	public void setDaemonToken_eagerlyPropagatesToDispatcher_whenLookupSucceeds() {
 		// OpenMRS' setDaemonToken typically arrives before started(); the activator must eagerly
-		// hand it to the bridge dispatcher so AOP advice firing between setDaemonToken and
-		// started() runs with a UserContext. Without this propagation path, documents in that
-		// window are silently dropped by the bridge swallow guard.
+		// hand it to the after-commit dispatcher so an events-consumer projection firing between
+		// setDaemonToken and started() runs with a UserContext. Without this propagation path,
+		// documents in that window are silently dropped by the dispatcher's swallow guard.
 		AfterCommitDispatcher dispatcher = mock(AfterCommitDispatcher.class);
 		QueryStoreActivator capturingActivator = new QueryStoreActivator() {
 			@Override

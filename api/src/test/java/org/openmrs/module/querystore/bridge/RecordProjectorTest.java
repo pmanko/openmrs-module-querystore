@@ -26,10 +26,9 @@ import org.openmrs.module.querystore.serialization.EncounterRecordSerializer;
 import org.openmrs.module.querystore.serialization.PatientRecordSerializer;
 
 /**
- * Direct tests of the shared projection contract both sync paths (AOP bridge, events consumer)
- * depend on for parity — ADR Decision 12. The per-type advice tests exercise {@link RecordProjector}
- * transitively; this locks its behaviour (per-node voided routing, purge override, the
- * serializer-carried patient sweep) independently of the AOP trigger plumbing.
+ * Direct tests of the projection the events consumer drives (ADR Decision 12). Locks its behaviour
+ * — per-node voided routing, purge override, the serializer-carried patient sweep — independently of
+ * the event-trigger plumbing (which {@code CoreServiceEventListenerTest} covers).
  */
 public class RecordProjectorTest {
 

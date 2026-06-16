@@ -22,14 +22,17 @@ import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
  * needs to register its bean in its own {@code moduleApplicationContext.xml}; querystore does not
  * need to know about specific modules.
  *
- * <p><b>Indexing trigger lives in the providing module.</b> Subclass
- * {@link org.openmrs.module.querystore.bridge.AbstractIndexingAdvice} and wire it as AOP advice on
- * the module's own service, mirroring how core-type advice is wired in querystore. The
- * {@code querystore.bridge.indexer} and {@code querystore.bridge.dispatcher} beans are reachable
- * via {@code Context.getRegisteredComponent(...)} so providers reuse the embed-then-upsert
- * after-commit pipeline without re-implementing it. AOP is a time-bound migration bridge per ADR
- * Decision 12; when events-first sync lands, this SPI will grow an event-subscription hook and the
- * AOP path retires alongside the core-type advice.
+ * <p><b>Indexing trigger is events-first.</b> querystore's sole sync path is
+ * {@code CoreServiceEventListener}, which consumes core's #6084 {@code *ServiceEvent}s and projects
+ * any entity for which a {@link org.openmrs.module.querystore.serialization.ClinicalRecordSerializer}
+ * is registered. So a provider whose write service emits those events gets steady-state indexing for
+ * free by registering a serializer — no querystore AOP advice (the migration bridge was removed; see
+ * ADR Decision 12). Whether a module's service emits #6084 events is conditional and must be
+ * verified at runtime (ADR Decision 13 §3: it must be an {@code OpenmrsService} with {@code save*}/
+ * {@code void*}/… methods taking an {@code OpenmrsObject}, called externally); a service that doesn't
+ * qualify contributes its own event listener or AOP shim. The {@code querystore.bridge.indexer} and
+ * {@code querystore.bridge.dispatcher} beans remain reachable via {@code Context.getRegisteredComponent(...)}
+ * for a provider that needs to drive the embed-then-upsert after-commit pipeline directly.
  *
  * <p><b>Name rule.</b> {@link #getResourceType()} must be {@code <moduleid>_<type>} per ADR
  * Decision 13 — e.g., {@code appointments_appointment}, {@code billing_bill}. Unprefixed names are

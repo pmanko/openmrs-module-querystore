@@ -19,9 +19,9 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
 /**
- * Shared executor for the AOP migration bridge (ADR Decision 12 "Migration bridge"). Per-type
- * advice classes hand projection tasks here so indexing runs off the clinical request thread, after
- * the originating transaction has committed. Pool size is two threads — enough headroom to overlap
+ * Shared executor for the events-first sync pipeline (ADR Decision 12). The events consumer's
+ * after-commit dispatcher hands projection tasks here so indexing runs off the clinical request
+ * thread, after the originating transaction has committed. Pool size is two threads — enough headroom to overlap
  * one embedding with the next document's submission, but no wider because the default ONNX
  * embedder's {@code embed} is {@code synchronized} (a larger pool would just queue against the
  * embedder's monitor).

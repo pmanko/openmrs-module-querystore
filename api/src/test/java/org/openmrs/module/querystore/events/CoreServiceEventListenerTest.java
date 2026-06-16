@@ -32,10 +32,10 @@ import org.openmrs.module.querystore.bridge.BridgeAdviceTestSupport.ZeroEmbedder
 import org.openmrs.module.querystore.serialization.EncounterRecordSerializer;
 
 /**
- * Unit tests for the events consumer's routing — gate, event-type → purge flag, serializer
- * resolution — exercised through the real {@code on*} handlers and {@code RecordProjector}, with a
+ * Unit tests for the events consumer's routing — event-type → purge flag, serializer resolution,
+ * skip cases — exercised through the real {@code on*} handlers and {@code RecordProjector}, with a
  * recording {@code QueryStoreService}. No OpenMRS context: the consumer's context seams
- * ({@code eventsEnabled}, {@code registry}, {@code indexer}, {@code dispatcher}) are overridden.
+ * ({@code registry}, {@code indexer}, {@code dispatcher}) are overridden.
  */
 public class CoreServiceEventListenerTest {
 
@@ -49,7 +49,6 @@ public class CoreServiceEventListenerTest {
 		BridgeIndexer indexer = new BridgeIndexer(service, new ZeroEmbedder());
 		listener = new TestableListener(indexer, new ImmediateDispatcher(),
 		    EventsTestSupport.registryOf(new EncounterRecordSerializer()));
-		listener.eventsEnabled = true;
 	}
 
 	@Test
@@ -59,17 +58,9 @@ public class CoreServiceEventListenerTest {
 	}
 
 	@Test
-	public void gatedOff_doesNothing() {
-		listener.eventsEnabled = false;
-		listener.onSave(new SaveServiceEvent<>(encounter("e1", false)));
-		assertTrue(service.indexed.isEmpty());
-		assertTrue(service.deleted.isEmpty());
-	}
-
-	@Test
 	public void onVoid_deletes() {
 		// The voided flag is set before the event publishes; purge=false routing lets the flag drive
-		// the per-node delete, parity with the bridge.
+		// the per-node delete.
 		listener.onVoid(new VoidServiceEvent<>(encounter("e2", true)));
 		assertTrue(service.indexed.isEmpty());
 		assertEquals(1, service.deleted.size());
@@ -137,17 +128,10 @@ public class CoreServiceEventListenerTest {
 
 		private final SerializerRegistry registry;
 
-		private boolean eventsEnabled;
-
 		TestableListener(BridgeIndexer indexer, AfterCommitDispatcher dispatcher, SerializerRegistry registry) {
 			this.indexer = indexer;
 			this.dispatcher = dispatcher;
 			this.registry = registry;
-		}
-
-		@Override
-		boolean eventsEnabled() {
-			return eventsEnabled;
 		}
 
 		@Override

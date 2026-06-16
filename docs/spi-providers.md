@@ -6,12 +6,13 @@ The recipe is verified by [`ProviderEndToEndTest`](../api/src/test/java/org/open
 
 ## What you build
 
-Four small classes in your own module:
+Three small classes in your own module:
 
 1. A **serializer** (`ClinicalRecordSerializer<YourEntity>`) that maps your domain entity to a `QueryDocument` with the cross-cutting fields contract.
 2. A **bootstrapper** (`TypeBootstrapper<YourEntity>`) that backfills historical records on first install.
-3. An **AOP indexing advice** (`AbstractIndexingAdvice<YourEntity>`) that catches steady-state saves, voids, and purges on your own service.
-4. A **provider bean** (`ResourceTypeProvider`) that bundles 1 + 2 and lets querystore discover the contribution.
+3. A **provider bean** (`ResourceTypeProvider`) that bundles 1 + 2 and lets querystore discover the contribution.
+
+Steady-state indexing is no longer something you build: querystore's events consumer indexes any type with a registered serializer whenever core's #6084 `*ServiceEvent`s fire for it — so if your write service qualifies (Step 3), saves/voids/purges are picked up for free.
 
 What you _do not_ build: schema migrations, table/index creation, embedding, search routing, patient-cascade deletion, authorization checks. All of that is automatic.
 
@@ -30,7 +31,7 @@ Before following the steps below, confirm your resource type meets [Decision 13'
 
 ## Prerequisite — entity must extend `BaseOpenmrsData`
 
-Your domain entity must be a Hibernate-mapped subclass of `org.openmrs.BaseOpenmrsData`. The AOP advice base class (`AbstractIndexingAdvice<T extends BaseOpenmrsData>`) is bounded on this for two reasons: the per-node voided routing reads `getVoided()`, and the bootstrap cursor reads `getDateChanged() ?? getDateCreated()`. Domain entities that don't extend `BaseOpenmrsData` cannot use the SPI as-is — that's a deliberate scope limit, not an accident.
+Your domain entity must be a Hibernate-mapped subclass of `org.openmrs.BaseOpenmrsData`. The projection pipeline (`RecordProjector.project(...)`) is bounded on this for two reasons: the per-node voided routing reads `getVoided()`, and the bootstrap cursor reads `getDateChanged() ?? getDateCreated()`. Domain entities that don't extend `BaseOpenmrsData` cannot use the SPI as-is — that's a deliberate scope limit, not an accident.
 
 ## Naming rule
 
@@ -117,33 +118,13 @@ If your entity's Hibernate mapping omits `dateChanged` (as `Obs` and `Order` do 
 
 The bootstrapper is optional — see Step 7 for when to return null from `getBootstrapper()`.
 
-## Step 3 — indexing advice
+## Step 3 — steady-state indexing (events)
 
-Subclass `AbstractIndexingAdvice<YourEntity>` to catch live saves, voids, and purges through Spring AOP. The pattern mirrors all 14 core advice classes — copy the closest sibling (e.g., `ConditionIndexingAdvice` for patient-scoped types, `EncounterIndexingAdvice` for types with their own service):
+You no longer write an indexing advice — the AOP migration bridge was removed (ADR Decision 12). querystore's `CoreServiceEventListener` consumes core's #6084 `*ServiceEvent`s and projects any entity for which a serializer (Step 1) is registered, through the same `RecordProjector` that does per-node voided routing (voided → delete, non-voided → serialize + index), after-commit dispatch, and per-entity failure isolation. So once your serializer is registered, steady-state saves/voids/purges of your type are indexed **for free** — *if* your write service emits those events.
 
-```java
-public class BillIndexingAdvice extends AbstractIndexingAdvice<Bill> {
+It does, automatically, when your service meets core's #6084 pointcut ([Decision 13](./adr.md#decision-13-module-extension-spi-service-provider-interface-for-custom-resource-types) §3): it implements `org.openmrs.api.OpenmrsService`, the mutator is named `save* / create* / void* / unvoid* / retire* / unretire* / purge*`, `args[0]` is an `OpenmrsObject`, and the call is external (self-invocation bypasses the proxy). This is **opt-in by verification, not assumption** — confirm an event actually fires for your service at runtime (the default assumption is *no* coverage).
 
-    static final Set<String> TRIGGER_METHODS = new HashSet<>(Arrays.asList(
-            "saveBill", "voidBill", "unvoidBill", "purgeBill"));
-
-    static final Set<String> PURGE_METHODS = Collections.singleton("purgeBill");
-
-    @Override protected Class<Bill> getSupportedType() { return Bill.class; }
-
-    @Override
-    protected BillSerializer serializer() {
-        return Context.getRegisteredComponent("billing.serializer.bill", BillSerializer.class);
-    }
-
-    @Override protected Set<String> triggerMethods() { return TRIGGER_METHODS; }
-    @Override protected Set<String> purgeMethods() { return PURGE_METHODS; }
-}
-```
-
-The base class handles per-node voided routing (voided → delete, non-voided → serialize + index), after-commit dispatch (so the upsert never runs against uncommitted state), and per-entity failure isolation (a poison record cannot starve its siblings).
-
-**Known limitation.** AOP misses self-invocations (when your service calls its own methods via `invokevirtual` rather than through `Context.getService()`). The next bootstrap pass _will_ catch records modified after the persisted cursor and re-project them, but a steady-state self-invocation miss is not corrected until then. Decision 12 acknowledges this as a time-bound migration bridge. Core's events-first emission layer has since merged (PR #6084 on 2.9.x): on 2.9+ a provider whose write service satisfies its pointcut may receive core `*ServiceEvent`s without an AOP shim at all — but per [Decision 13](./adr.md#decision-13-module-extension-spi-service-provider-interface-for-custom-resource-types) §3 that coverage is opt-in and must be confirmed at runtime (the default assumption is *no* coverage, and self-invocation misses the advice the same way noted here). Until you have verified an event actually fires, keep the shim.
+If your service does not qualify (non-`OpenmrsService`, non-standard method names, or self-invocation), contribute your own listener: a Spring `@EventListener` for the relevant `*ServiceEvent`, or — for a service that doesn't emit at all — a small AOP `@Around` shim on your service that calls `RecordProjector.project(serializer, entity, isPurge, indexer, dispatcher)` (the `querystore.bridge.indexer` and `querystore.bridge.dispatcher` beans are reachable via `Context.getRegisteredComponent(...)`). Until then, the bootstrap (Step 2) is the only thing keeping your type current.
 
 ## Step 4 — provider bean
 
@@ -187,16 +168,7 @@ In your module's `omod/src/main/resources/moduleApplicationContext.xml`, registe
 </bean>
 ```
 
-Wire the AOP advice in your module's `omod/src/main/resources/config.xml` using the OpenMRS module DTD's `<advice>` element — the same form the 14 core advices use:
-
-```xml
-<advice>
-    <point>org.openmrs.module.billing.api.BillService</point>
-    <class>org.openmrs.module.billing.querystore.BillIndexingAdvice</class>
-</advice>
-```
-
-The OpenMRS module loader registers the advice on the named service interface. The advice class is instantiated via no-arg constructor at module load — that's why `serializer()` in Step 3 resolves the bean lazily through `Context.getRegisteredComponent(...)` rather than taking it through a constructor.
+(Steady-state indexing needs no wiring here — it rides core's #6084 events per Step 3. If your service doesn't emit them and you added your own `@EventListener` or AOP shim, register/wire that bean too.)
 
 Querystore discovers `billing.provider.bill` at the next `bootstrap()` invocation via `Context.getRegisteredComponents(ResourceTypeProvider.class)` — no further wiring on the querystore side is needed.
 
@@ -257,8 +229,8 @@ After your module loads and bootstraps:
 
 ## Limitations and gotchas
 
-- **Self-invocation bypass.** Your AOP advice fires only when your service's methods are called through Spring's proxy. Internal calls (`this.foo()` from inside an `@Service`-managed bean) bypass it. The bootstrap pass is the safety net.
-- **Hibernate cascade saves bypass AOP.** If a save on parent entity X cascades to child entity Y through a Hibernate mapping, the Y save does not trigger your Y advice. Same shape as `transferEncounter` on the core side — accepted bridge-window limitation per Decision 12.
+- **Self-invocation bypass.** Core's #6084 events (and any AOP shim you add) fire only when your service's methods are called through Spring's proxy. An internal `this.foo()` call from inside the bean bypasses them. The bootstrap pass is the safety net.
+- **Hibernate cascade saves.** If a save on parent entity X cascades to child entity Y through a Hibernate mapping, no `*ServiceEvent` fires for Y (there's no service call), so the events consumer doesn't see it. Same shape as `transferEncounter` on the core side — an accepted events-path limitation per Decision 12; reconciliation/bootstrap catches it.
 - **`dateChanged ?? dateCreated` cursor.** If your entity's Hibernate mapping omits `dateChanged`, override `cursorDateExpr()` in your bootstrapper to return `"e.dateCreated"` or HQL throws at first fetch.
 - **Embedding model identifier.** Every consumer issuing kNN queries against your documents must embed its query with the same model querystore used at index time. Decision 8 and Decision 13 fix this as part of the public contract; query-time consumers read the model identifier from querystore configuration.
 - **One provider per resource type.** If two providers claim the same name, the first one wins at discovery and the second is logged and dropped. Two modules cannot independently index the same `<moduleid>_<type>`.
@@ -270,10 +242,10 @@ The 14 core-type contributions in this module follow the same shape (minus the S
 
 | If your type looks like… | Look at… |
 |---|---|
-| A patient-scoped clinical observation | `ConditionRecordSerializer`, `ConditionBootstrapper`, `ConditionIndexingAdvice` |
-| An order against a patient (drug, lab, referral) | `DrugOrderRecordSerializer` + its bootstrapper + advice |
-| An encounter-attached event | `EncounterRecordSerializer` + its bootstrapper + advice |
-| A patient entity with denormalized identifiers | `PatientRecordSerializer` + its bootstrapper + advice |
+| A patient-scoped clinical observation | `ConditionRecordSerializer` + `ConditionBootstrapper` |
+| An order against a patient (drug, lab, referral) | `DrugOrderRecordSerializer` + its bootstrapper |
+| An encounter-attached event | `EncounterRecordSerializer` + its bootstrapper |
+| A patient entity with denormalized identifiers | `PatientRecordSerializer` + its bootstrapper |
 | A program enrollment / lifecycle | `PatientProgramRecordSerializer` + its bootstrapper + advice |
 
 The canonical worked example is [`ProviderEndToEndTest`](../api/src/test/java/org/openmrs/module/querystore/bootstrap/ProviderEndToEndTest.java), already referenced at the top of this document.

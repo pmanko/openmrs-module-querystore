@@ -56,8 +56,9 @@ import org.openmrs.module.querystore.spi.ResourceTypeProvider;
  *   <li>Patient-scoped retrieval correctly filters provider documents by {@code patient_uuid}.</li>
  * </ul>
  *
- * <p>The AOP-trigger path is not re-tested here — it is identical to the 14 core advice classes in
- * the {@code bridge} package and is exercised by their existing tests.
+ * <p>The steady-state trigger is not re-tested here — it is core's #6084 events consumed by
+ * {@code CoreServiceEventListener}, exercised by {@code CoreServiceEventTest} (the AOP bridge that
+ * used to drive it was removed).
  */
 public class ProviderEndToEndTest {
 
@@ -195,9 +196,9 @@ public class ProviderEndToEndTest {
 	// ---------- The recipe a real provider module would ship (see docs/spi-providers.md) ----------
 
 	/** Domain entity. A real module would point this at its Hibernate-mapped {@code BaseOpenmrsData}
-	 *  subclass; the test uses a plain POJO so no schema is needed. The AOP advice step from the
-	 *  walkthrough is intentionally absent here — it's identical to the 14 core advice classes and
-	 *  is exercised by their existing tests. */
+	 *  subclass; the test uses a plain POJO so no schema is needed. The steady-state event-trigger
+	 *  (Step 3 of the walkthrough) is intentionally not exercised here — it's core's #6084 events,
+	 *  covered by {@code CoreServiceEventTest}. */
 	private static final class Bill {
 		final String uuid;
 		final String patientUuid;

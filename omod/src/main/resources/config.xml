@@ -22,71 +22,12 @@
     </require_modules>
 
     <!--
-        Migration-bridge advice per ADR Decision 12. Each entry projects writes through the same
-        serialize → embed → index pipeline an events-first handler will drive once core publishes
-        the corresponding events. Bridge entries are time-bound: delete the entry (and the advice
-        class) when the events subscriber for that type ships and has been verified at parity.
+        Sync is events-first (ADR Decision 12): CoreServiceEventListener consumes core's #6084
+        *ServiceEvents. The AOP migration bridge (per-type <advice> entries) was removed once the
+        events consumer was verified end-to-end; there is no longer a syncMode global property.
     -->
-    <advice>
-        <point>org.openmrs.api.ObsService</point>
-        <class>org.openmrs.module.querystore.bridge.ObsIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.EncounterService</point>
-        <class>org.openmrs.module.querystore.bridge.EncounterIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.ConditionService</point>
-        <class>org.openmrs.module.querystore.bridge.ConditionIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.DiagnosisService</point>
-        <class>org.openmrs.module.querystore.bridge.DiagnosisIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.VisitService</point>
-        <class>org.openmrs.module.querystore.bridge.VisitIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.PatientService</point>
-        <class>org.openmrs.module.querystore.bridge.AllergyIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.PatientService</point>
-        <class>org.openmrs.module.querystore.bridge.PatientIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.ProgramWorkflowService</point>
-        <class>org.openmrs.module.querystore.bridge.PatientProgramIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.MedicationDispenseService</point>
-        <class>org.openmrs.module.querystore.bridge.MedicationDispenseIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.OrderService</point>
-        <class>org.openmrs.module.querystore.bridge.DrugOrderIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.OrderService</point>
-        <class>org.openmrs.module.querystore.bridge.TestOrderIndexingAdvice</class>
-    </advice>
-    <advice>
-        <point>org.openmrs.api.OrderService</point>
-        <class>org.openmrs.module.querystore.bridge.ReferralOrderIndexingAdvice</class>
-    </advice>
 
     <updateURL>https://modules.openmrs.org/modules/download/${project.parent.artifactId}/update.rdf</updateURL>
-
-    <globalProperty>
-        <property>querystore.syncMode</property>
-        <defaultValue>events</defaultValue>
-        <description>Active sync path (ADR Decision 12). "events" (default) consumes core's #6084
-            *ServiceEvents and gates the bridge off; "aop" runs the migration-bridge advice instead;
-            "both" runs both for parity verification only (double embedding cost — not a steady
-            state). Read once at startup and cached; a change takes effect on the next module/server
-            restart.</description>
-    </globalProperty>
 
     <globalProperty>
         <property>querystore.embedding.providerBean</property>

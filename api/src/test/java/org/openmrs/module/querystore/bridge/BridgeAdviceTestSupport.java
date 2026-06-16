@@ -19,14 +19,13 @@ import org.openmrs.module.querystore.embedding.EmbeddingProvider;
 import org.openmrs.module.querystore.model.QueryDocument;
 
 /**
- * Shared fixtures for the bridge-advice unit tests. Every per-type advice test consumes the same
- * {@link RecordingService}, {@link ZeroEmbedder}, and {@link ImmediateDispatcher} shapes;
- * centralising them keeps each test class small and removes the clipboard-copy drift the prior
- * /harden cycle flagged.
+ * Shared recording fixtures for the sync-pipeline unit tests — the {@link RecordingService},
+ * {@link ZeroEmbedder}, and {@link ImmediateDispatcher} shapes consumed by {@code RecordProjectorTest}
+ * and the events-consumer tests ({@code org.openmrs.module.querystore.events}). Centralising them
+ * keeps each test class small and avoids clipboard-copy drift.
  *
- * <p>Public so the events-consumer tests ({@code org.openmrs.module.querystore.events}) reuse the
- * same recording pipeline as the bridge tests rather than cloning it. Not unified with the
- * bootstrap tests' own (subtly different) recording-service variants — out of this slice's scope.
+ * <p>Public for cross-package reuse by the events tests. Not unified with the bootstrap tests' own
+ * (subtly different) recording-service variants — out of scope.
  */
 public final class BridgeAdviceTestSupport {
 

@@ -185,14 +185,9 @@
         <constructor-arg ref="querystore.embedding.dispatcher"/>
     </bean>
 
-    <!-- Caches the querystore.syncMode global property so the per-save gate in the bridge advice
-         (ADR Decision 12) is a volatile read, not a GP lookup. Seeded by QueryStoreActivator. -->
-    <bean id="querystore.syncModeResolver"
-          class="org.openmrs.module.querystore.bridge.SyncModeResolver"/>
-
     <!-- Events-first sync (ADR Decision 12): the consumer subscribes to core's #6084 *ServiceEvents
-         and projects through the same RecordProjector as the bridge; the registry resolves the
-         per-type serializer by entity type. Active only when querystore.syncMode enables events. -->
+         and projects through RecordProjector; the registry resolves the per-type serializer by
+         entity type. This is the sole sync path (the AOP bridge was removed). -->
     <bean id="querystore.serializerRegistry"
           class="org.openmrs.module.querystore.events.SerializerRegistry"/>
 
