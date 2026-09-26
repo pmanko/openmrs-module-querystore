@@ -1054,6 +1054,39 @@ def test_record_attribution(tmp: Path) -> None:
         got = pool.record_written(before2, "266", set())
         check("with no siblings the unnumbered fallback still finds a record", got is not None)
 
+        # #542 on 2026-09-25: an owner-directed retro edited an old note mid-run, the run wrote no
+        # record, and the fallback handed the run the note.
+        note = lessons / "2026-01-01-a-defect-note.md"
+        note.write_text("somebody else's note\n")
+        before3 = pool.lesson_files()
+        note.write_text("somebody else's note, edited mid-run\n")
+        got = pool.record_written(before3, "542", set())
+        check("with no stream, a pre-existing file edited mid-run is not taken", got is None, str(got))
+        stream = tmp / "542.jsonl"
+        def calls(*inputs, output=""):
+            events = [{"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": i} for i in inputs]}}]
+            if output:
+                events.append({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "content": output}]}})
+            stream.write_text("".join(json.dumps(e) + "\n" for e in events))
+            return stream
+
+        got = pool.record_written(before3, "542", set(), calls({"command": "true"}))
+        check("nor when the run's stream never names it", got is None, str(got))
+        got = pool.record_written(before3, "542", set(),
+                                  calls({"command": "ls -t ~/.claude/skill-lessons"}, output=note.name))
+        check("nor when only a tool's OUTPUT names it (#444 listed the store)", got is None, str(got))
+        got = pool.record_written(before3, "542", set(),
+                                  calls({"command": f"cat >> ~/.claude/skill-lessons/{note.name}"}))
+        check("but it is taken when the run's own tool call names it", got == note, str(got))
+        (lessons / "2026-01-01-repo-PR543.md").write_text("a pr-named record, unnumbered for #542\n")
+        (lessons / "2026-01-01-a-later-note.md").write_text("newer, and no business of this run's\n")
+        got = pool.record_written(before3, "542", set(), calls(
+            {"file_path": "/x/.claude/skill-lessons/2026-01-01-repo-PR543.md", "content": "..."}))
+        check("a record named for the PR is found through the stream over a newer unnamed file",
+              got and got.name.endswith("-PR543.md"), str(got))
+
 
 def test_record_says_aborted(tmp: Path) -> None:
     print("\nreading a run's abort from a record file that may hold several runs")

@@ -4740,3 +4740,69 @@ it would be a second barrier rather than a fix.
 **Recorded for a later pass:** pr-harden:964 ("without it an unattended run cannot proceed at all") and
 `pr-harden-gate.sh`:33 contradict the unattended block after them, since `207a8e3`.
 **REOPEN ON:** a pass over the attended/unattended framing of `awaiting` as a whole.
+
+## 2026-09-26 (window: 4 records over 2 tickets — #402's resumed resolve-ticket run, `…09-26-…-402.md`, aborted-as-draft; #542/PR543's pr-harden run, converged in 2 rounds; and the two 2026-09-25 driver captures for #542 and #402, found appended to `2026-08-26-unattended-yield-kills-the-run.md` and relocated below) — 2 applied after revision, 0 killed, 2 parked; two refutation rounds, the second over the staged diff; linter 10 files, 0 findings; `pool-test.py` 587 passed / 0 failed
+
+Proposals and the gate's reply: `proposals/2026-09-26-window-402-542.md`.
+
+**APPLIED after revision · pr-harden 0.34.0: under `ticket-pool`, `[Request interrupted by user for
+tool use]` on an agent's result is not the operator.**
+- Evidence: #542's stream `20260925T152447Z-…-542.jsonl`. The round-1 reviewer's `task_updated` reads
+  `Agent stalled: no progress for 600s (stream watchdog did not recover)`, the parent's tool result
+  reads the interrupted text, and the orchestrator stopped on "you interrupted the round-1 reviewer",
+  took the override and wrote no record. Another session re-ran the loop on 2026-09-26 (2 rounds).
+- Bar, stated as the gate corrected it: one event; the whole loop was forfeited in-run, and the rerun
+  in another session cost 2 rounds. The stop's reason was neither of pr-harden's two early ends.
+- Measured over `~/.claude/pipeline/logs/*.jsonl`: that exact string occurs in one top-level tool
+  result, this one. The broader `[Request interrupted by user]` also appears where an orchestrator's own
+  `TaskStop` killed subagents (#346's stream), which is why the text claims no cause.
+- Gate's blocking objections, both fixed: (1) the first draft said "in an unattended run" and a
+  session had no way to test that. The shipped text names `CLAUDE_PIPELINE_SESSION=1`, which
+  `pool-run`'s `Session` stamps into the sessions it starts headless (since e09a039, 2026-09-14, so
+  #542 had it). `--work` sessions do not get it. (2) The draft named the harness wording as a
+  watchdog's text; the shipped text says the cause was not established.
+- An attempt to back the guard with "a real Esc ends the turn" found no calibration case in any
+  transcript, so that claim was not made.
+- Prunes nothing. Net +7 lines, because the existing contract was bypassed by a misclassification it
+  does not name.
+
+**APPLIED after revision · `pool-run` (no skill version; ticket-pool's prose is unchanged): the
+`record_written` fallback takes a file only if the run's own stream names it.**
+- Evidence: ledger `#542.record` was `2026-08-26-unattended-yield-kills-the-run.md`, and the ledger
+  backup before #402's resume shows #402 pointing there too. Both runs started 2026-09-25T15:24:47Z;
+  commit 47b8431 edited that note at 15:47Z. Neither stream names it. The gate reproduced the
+  misattribution by calling the real `record_written`.
+- Bar: data corruption in driver code, measured. The gate refused the first draft's "self-
+  contradiction" label because the docstring names siblings as the threat.
+- Gate's blocking objections, both fixed: (1) the draft's "created during the run" restriction would
+  drop a legitimate PRE-EXISTING record that does not end in the ticket's number (`…-PR543.md`, or a
+  same-day second attempt appending to one). Dropping it also blinds `record_says_aborted`, so an
+  aborted run gets retried. (2) The draft's "either numbered or someone else's edit" was false for
+  those names.
+- The shipped test is the gate's stronger shape: one of the run's own TOOL CALLS must name the file.
+  With no stream to read, only a created file counts. The second gate narrowed "the stream" to tool
+  calls, because #444's stream ran `ls -t ~/.claude/skill-lessons` and its output named an unnumbered
+  record another run wrote. Calibrated over the ledger: 30 of 30 run-written records are named in a
+  tool call of their own stream. The two misses are a driver-written `-driver.md`, which never reaches
+  the fallback, and this misattribution. Both 09-25 streams do not name the note, and #444's `ls` no
+  longer counts.
+- Five `pool-test.py` cases. A mutation removing the filter reddens four of them. A mutation that reads
+  the whole stream instead of tool calls reddens the `ls`-output case.
+- Store repair: the two captures moved verbatim into `2026-09-25-openmrs-module-chartsearchai-
+  {542,402}-driver.md`. Their mtimes are set to when the driver took each capture, 2026-09-25 21:25
+  and 2026-09-26 01:56 local. The first attempt's `touch -r` used a reference that `cp` had already
+  restamped; the second gate caught it. The 08-26 note is restored to its committed
+  content, and ledger `#542.record` is repointed (backup `ledger.json.bak-pre-542-record-repair-20260926`).
+
+**PARKED · #402: a ticket's direction ("end as draft when a gate criterion cannot be fixed by
+rendering") against resolve-ticket Step 9 / pr-harden FINISH and harden's required second Phase 2
+after escalation.** A labelled override was taken. Count: 1. **REOPEN ON:** a second record where a
+ticket's direction and a skill's terminus disagree.
+
+**PARKED · session-level network loss.** #402 session abb941f5 died after 10 API retries on ENOTFOUND
+(exit 1, 7h31m) and was resumed by the operator the next day. #542's session 138dde08 shows an 18-minute
+heartbeat gap and "unknown" `api_retry` lines in the same window, but that was not verified to be the
+same outage. Count: 1 verified. **REOPEN ON:** a second verified session death to network loss.
+
+**Not a lesson:** the rest of #402's record is chartsearchai domain evidence (A/B arms, referent
+wording), and so is PR543's r1/r2.

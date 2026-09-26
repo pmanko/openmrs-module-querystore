@@ -2,7 +2,7 @@
 name: pr-harden
 description: Harden an open pull request by cycling clean-context review rounds against it — a fresh agent reviews the pushed head, a second fresh agent implements every finding it agrees with and declines the rest on the record, the build is proved green, the change is verified on a real standalone where runtime behaviour is at stake, and the round is committed and pushed. The cycle repeats until the sha being handed over has been reviewed with zero blocking findings. Use when a PR should be hardened by reviewers who have never seen it being written. Trigger phrases include "harden this PR", "review and fix the PR until it's clean", "cycle review rounds on PR N".
 argument-hint: <pr-number-or-url> [--max-rounds N] [--no-verify]
-version: 0.33.3
+version: 0.34.0
 ---
 
 # PR harden — clean-context review rounds until nothing blocks
@@ -1112,6 +1112,14 @@ retry, stop with the labelled deviation naming the phase and the failure mode, e
 cap does. A retry is not free of consequence either: on the first run, retrying a reviewer twice is
 what exposed the stale-diff-base defect above, because the third brief had to state the base
 explicitly.
+
+**And under `ticket-pool`, `[Request interrupted by user for tool use]` on an agent's result is not the
+operator.** The driver stamps `CLAUDE_PIPELINE_SESSION=1` into the headless sessions it starts; where
+that is set, treat the result as the agent's death and apply this contract. On #542 the round-1
+reviewer hit `Agent stalled: no progress for 600s`, its result read as above, and the orchestrator
+stopped on "you interrupted the round-1 reviewer" — neither of the two early ends — forfeiting the
+loop, which another session then re-ran (#542/PR543, 2 rounds). Why the harness words it so was not
+established.
 
 Write it at every transition:
 

@@ -2828,7 +2828,7 @@ def lesson_files() -> dict[Path, float]:
 
 
 def record_written(before: dict[Path, float], ticket: str | None = None,
-                   others: set[str] | None = None) -> Path | None:
+                   others: set[str] | None = None, stream: Path | None = None) -> Path | None:
     """The record file this run created or appended to, if any.
 
     The `ticket` and `others` arguments are what make this safe with several runs in flight. A
@@ -2841,6 +2841,14 @@ def record_written(before: dict[Path, float], ticket: str | None = None,
     number is taken first. Failing that — a run may name a record for the lesson rather than the
     ticket — a fresh file is accepted only if it does not carry a CONCURRENT ticket's number, which
     is the case where attributing it here would be attributing it away from its owner.
+
+    An unnumbered fresh file may also be one nobody in the pool wrote: on 2026-09-25 an owner-directed
+    retro edited a 2026-08-26 defect note while #542 and #402 ran, neither run wrote a record, and both
+    driver captures were appended to that note. So the fallback takes a file only if this run's own
+    `stream` names it in a tool call — measured over the ledger, 30 of 30 run-written records are, and
+    the misattributed note is not. Tool calls, not the whole stream: #444 ran `ls -t` over the store,
+    and its OUTPUT named an unnumbered record another run wrote. With no stream to read, only a file
+    the run created.
     """
     after = lesson_files()
     fresh = [p for p, m in after.items() if before.get(p) != m]
@@ -2854,7 +2862,31 @@ def record_written(before: dict[Path, float], ticket: str | None = None,
     for num in sorted(others or ()):
         fresh = [p for p in fresh
                  if not re.search(rf"[-_]{re.escape(num)}(-driver)?$", p.stem)]
+    text = tool_call_text(stream)
+    fresh = [p for p in fresh if (p.name in text if text is not None else p not in before)]
     return sorted(fresh, key=lambda p: after[p])[-1] if fresh else None
+
+
+def tool_call_text(stream: Path | str | None) -> str | None:
+    """The inputs of every tool call the session made, as one string; None if there is no stream."""
+    if not stream:
+        return None
+    try:
+        lines = Path(stream).read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    calls = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") != "assistant":
+            continue
+        for block in (event.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                calls.append(json.dumps(block.get("input")))
+    return "\n".join(calls)
 
 
 # The ledger is one dict and one file, mutated by every worker. Read-modify-write it under this.
@@ -3306,7 +3338,7 @@ def work_ticket(job: dict, slot: Slot, cfg: dict, ledger: dict, say_all: Say,
     # Outcome from evidence, never from the session's own closing prose.
     gate = read_gate_state(wt)
     pr, asked = outcome_pr(job["slug"], ticket, gate, started_at, open_prs(job["slug"]))
-    own_record = record_written(before, ticket, siblings)
+    own_record = record_written(before, ticket, siblings, run.get("jsonl"))
 
     if run.get("killed_for"):
         status = "timeout"
