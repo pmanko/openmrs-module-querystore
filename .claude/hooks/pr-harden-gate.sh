@@ -3,9 +3,13 @@
 #
 # The contract: a /pr-harden run is complete only when the SHA IT IS HANDING OVER has been reviewed
 # with ZERO blocking findings, and — where a verifier ran at all — verified on that same sha. Edit
-# counts are irrelevant here: unlike /harden, every round is expected to make edits, so "the cycle
-# changed nothing" can never be the condition. Only a reviewer's blocking count can end the run, and
-# the reviewer that produced it must have been a fresh agent — see the skill.
+# counts are irrelevant here, and as of harden 0.34.0 they are irrelevant THERE too, so this is no
+# longer a contrast between the two skills. In a full round the fixer implements the non-blocking
+# findings as well, so a round that edits has not thereby found anything that blocks; what outlives
+# that, in a blocking-only round where the two nearly coincide, is whose number it is.
+# Only a reviewer's blocking count can end the run — an edit count would hand the exit to the fixer,
+# whose work is the thing being judged — and the reviewer that produced it must have been a fresh
+# agent. See the skill.
 #
 # THE CONDITION IS A PROPERTY OF THE ARTIFACT, NOT A PAST EVENT, and it used to be the latter. A
 # reviewer clears sha N; FINISH then applies that round's non-blocking findings, commits and pushes
@@ -34,9 +38,10 @@
 # `awaiting` allows the yield. That is not a concession — the harness re-invokes the orchestrator when
 # the agent completes, so yielding mid-await does not end the run, it is how the run proceeds.
 #
-# THAT PREMISE HOLDS ONLY FOR AN ATTENDED SESSION, and taking it as universal is what let two
-# unattended runs die here. Measured 2026-08-26: a `claude -p` process exits when its turn ends, so
-# nothing re-invokes it and the yield IS the death. Issue #297 wrote
+# THAT PREMISE HOLDS IN FULL ONLY FOR AN ATTENDED SESSION, and taking it as universal is what let two
+# unattended runs die here. When a `claude -p` turn ends, the process stops a background agent still
+# running 600 s later and exits without re-invoking anyone (the skill's State section carries the
+# measurement). Measured 2026-08-26: issue #297 wrote
 # `awaiting=[{agent: "refute plan #297 pass 1"}]`, narrated "dispatched the refutation gate. Here is
 # where things stand", and ended — 51 turns, no PR, its plan and reproduction discarded; the gate
 # allowed it, silently, because allowing is exit 0. Issue #310 died with the same signature in
@@ -53,7 +58,7 @@
 # awaiting non-empty, fresh -> a background agent this run delegated to is outstanding; ALLOW the
 #                              yield, whatever the phase says. Bounded by AWAIT_TTL.
 # phase "building"      -> a resolve-ticket run is in flight and has not opened its PR yet; block.
-# phase "init"/"fixing" -> a run is in flight and no clean review has been recorded yet; block.
+# phase "init"/"fixing" -> a run is in flight and the head it will hand over is not reviewed yet; block.
 # phase "reviewed", blocking > 0  -> another round is required; block.
 # phase "reviewed", blocking == 0 -> converged; allow.
 # override == true                -> the skill took the labelled override; allow (on the record).
@@ -211,7 +216,7 @@ case "$OWNER_PID" in
         1) allow ;;   # a LIVE session that is not this one owns this entry
       esac            # 0 = ours, 2 = cannot tell: fall through and hold us to the contract
     else
-      allow           # the owning session is gone; nobody here can advance its run
+      allow           # the owning session is gone
     fi
     ;;
 esac
@@ -222,9 +227,9 @@ esac
 # blocking > 0). Fail open on anything unparseable, like every other check here.
 AWAITING=$(jq -r '[(.awaiting // [])[] | (.since // 0)] | length' <<<"$ENTRY" 2>/dev/null) || allow
 case "$AWAITING" in ''|*[!0-9]*) AWAITING=0 ;; esac
-# An UNATTENDED run has no next turn. `claude -p` exits when the turn ends, so for it a yield
-# mid-await is not how the run proceeds — it is how the run dies, silently and with its work
-# unpublished. Absent or unparseable, this is false, so an attended session keeps exactly the
+# An UNATTENDED run's process stops a background agent still running 600 s after the turn ends,
+# then exits, so for it a yield mid-await is how the run dies whenever the agent outlasts that,
+# silently and with its work unpublished. Absent or unparseable, this is false, so an attended session keeps exactly the
 # behaviour documented above.
 UNATTENDED=$(jq -r 'if .unattended == true then "true" else "false" end' <<<"$ENTRY" 2>/dev/null) || allow
 case "$UNATTENDED" in true|false) ;; *) UNATTENDED=false ;; esac
@@ -270,15 +275,16 @@ if [ "$AWAITING" -gt 0 ]; then
     jq -n --arg a "$AGENTS" '{
       decision: "block",
       reason: ("This run is UNATTENDED and you ended your turn with a background agent outstanding: "
-        + $a + ". An unattended run has no next turn — the process exits when the turn ends, so "
-        + "yielding mid-await does not continue the run, it ends it, with the work unpublished. "
+        + $a + ". In an unattended run the process stops an agent still running 600 s after the "
+        + "turn ends and then exits, so yielding mid-await ends the run whenever the agent outlasts "
+        + "that, with the work unpublished, and nothing at the yield says which case this is. "
         + "Collect that agent IN THIS TURN, clear the awaiting entry in "
         + "~/.claude/pr-harden-state.json, and carry on with the phases the skill defines. Do NOT "
         + "hand back to the user, do NOT report progress as if finished, and do NOT ask whether to "
         + "continue; if you are aborting, take one of the labelled abort conditions and set "
         + "override:true with its reason so the deviation is on the record."),
       systemMessage: ("unattended run yielded with agents outstanding (" + $a
-        + ") — there is no next turn; collect them in-turn")
+        + ") — past 600 s the run exits with them; collect them in-turn")
     }'
     exit 0
   fi
@@ -322,7 +328,7 @@ case "$PHASE" in
     jq -n --arg p "$PR" --arg r "$ROUND" --arg ph "$PHASE" '{
       decision: "block",
       reason: ("pr-harden termination contract: a run on PR #" + $p + " is in flight (round " + $r
-        + ", phase " + $ph + ") and no review round has yet reported zero blocking findings. The run "
+        + ", phase " + $ph + ") and the head it will hand over has not been reviewed yet. The run "
         + "ends on a REVIEW, never on a fix: spawn a fresh reviewer agent (a new subagent — never "
         + "subagent_type \"fork\", which would inherit this context and defeat the whole point), "
         + "record its blocking count, and continue the loop. Do NOT hand back to the user and do "
@@ -330,7 +336,7 @@ case "$PHASE" in
         + "override in the skill'"'"'s Termination section and set override:true in "
         + "~/.claude/pr-harden-state.json so the deviation is on the record."),
       systemMessage: ("pr-harden: PR #" + $p + " round " + $r + " is mid-flight (" + $ph
-        + ") — no clean review recorded yet")
+        + ") — the head it will hand over is not reviewed yet")
     }'
     exit 0
     ;;
@@ -358,10 +364,10 @@ if [ "$BLOCKING" -eq 0 ]; then
         + "blocking findings, but it reported that about " + $s + ", and this worktree'"'"'s head is "
         + $h + ". The sha you hand over must be one a review round cleared -- the condition is a "
         + "property of the artifact, not a past event. Something edited the branch after the last "
-        + "review, and FINISH applying that round'"'"'s non-blocking findings is the usual cause. So "
+        + "review. So "
         + "either hand over the reviewed sha, or run one more round on this head: a FRESH reviewer "
-        + "agent (a new subagent, never subagent_type \"fork\"), BLOCKING-ONLY so it terminates -- "
-        + "any non-blocking finding it raises goes to a follow-up issue rather than into this branch "
+        + "agent (a new subagent, never subagent_type \"fork\"), BLOCKING-ONLY so it terminates, "
+        + "reporting blockers alone and filing nothing "
         + "-- then record it with `gate-state reviewed-sha " + $h + "`. Do NOT hand back to the user "
         + "and do NOT ask whether to continue; if you are deliberately stopping early, take the "
         + "labelled override in the skill'"'"'s Termination section and set override:true in "
@@ -407,8 +413,8 @@ fi
 jq -n --arg p "$PR" --arg r "$ROUND" --arg b "$BLOCKING" '{
   decision: "block",
   reason: ("pr-harden termination contract: round " + $r + " on PR #" + $p + " reported " + $b
-    + " blocking finding(s), so it was not the last round. Apply that round'"'"'s findings — all of "
-    + "them, blocking and non-blocking alike — commit and push to the PR branch, then run round "
+    + " blocking finding(s), so it was not the last round. Apply that round'"'"'s findings, commit and "
+    + "push to the PR branch, then run round "
     + (($r|tonumber?) + 1 | tostring) + ": a FRESH reviewer agent (a new subagent, never "
     + "subagent_type \"fork\") over the pushed head. Do NOT hand back to the user and do NOT ask "
     + "whether to continue; if you are deliberately stopping early, take the labelled override in "

@@ -18,6 +18,26 @@ What this driver decides, and what it deliberately does not:
     governance that no retro can see and no run record can cite. Anything this pipeline needs the
     runs to do belongs in the skill text, put there by a retro.
 
+A claude.ai usage limit is not a failure and is not handled as one. The CLI's own wait-for-the-reset
+is gated on an INTERACTIVE session, so it can never arm under the `claude -p` this driver runs: a
+headless session simply ends the moment the window closes. So the driver reads the `rate_limit_event`
+records the stream already carries, SUSPENDS the tickets in flight the way `--pause --now` does —
+their transcripts intact, no attempt spent, worktrees kept — sleeps until the reset the CLI reported,
+and re-enters them. See `wait_for_limit_reset` for the three cases where it hands back to a human
+instead.
+
+`--work` is carried past the same limit by a different mechanism, because neither of the other two
+reaches it: the CLI's own wait belongs to the SESSION and can be gated off for an account, and the
+driver's belongs to sessions it can suspend and re-enter, which a hand-launched one is not. So
+`watch_hand_launched` notices the window reopening and tells the session to continue, over the local
+peer socket the session itself publishes. What it waits for is the ACCOUNT SERVING a request again,
+not a clock: a reset time is an optimisation over that and never a precondition, because the
+rejected form of the record carrying one has never been observed here. It acts only on a run that
+is quiet and that the account refused, and the session must have been STARTED by this launcher —
+a session that bypasses prompts holds an inbound peer message from a sender it cannot identify, and
+`pool-run` is a python script, so the launcher passes `crossSessionInbound: accept` scoped to the
+session it starts. `ticket.limit_continue_work: false` turns all of that off.
+
 Evidence the runs cannot produce about themselves is captured here: a run that dies leaves no record
 of its own death, so this driver writes (or appends to) the record in `~/.claude/skill-lessons/`,
 labelled as driver capture. It is capture, never a proposed rule — same contract the skills have.
@@ -40,16 +60,19 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import calendar
 import concurrent.futures
 import contextlib
 import fcntl
 import hashlib
 import json
 import os
+import random
 import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -72,7 +95,8 @@ PAUSED = PIPELINE / "paused.json"      # what a paused driver left behind; see `
 SHARED_M2 = HOME / ".m2/repository"
 LESSONS = CLAUDE / "skill-lessons"
 LAST = LESSONS / "LAST"
-PROJECTS = CLAUDE / "projects"         # where `claude` writes a session's transcript; see `session_transcript`
+PROJECTS = CLAUDE / "projects"         # where `claude` writes a session's transcript; see `project_dir_name`
+SESSIONS = CLAUDE / "sessions"         # `claude`'s OWN registry of live sessions; see `live_session`
 PR_STATE = CLAUDE / "pr-harden-state.json"
 HARDEN_STATE = CLAUDE / "harden-state.json"
 SETTINGS = CLAUDE / "settings.json"
@@ -91,7 +115,17 @@ DEFAULTS = {
     "repos": {},
     "source_repo": None,
     "retro": {"enabled": True, "min_records": 2, "timeout_seconds": 7200},
-    "ticket": {"timeout_seconds": 28800, "max_attempts": 2, "quiet_seconds": 5400},
+    # `limit_wait_*` govern what happens when a claude.ai usage limit ends a session: how long
+    # the driver will sleep for that window to reset before handing the pause back to a human
+    # (0 never waits, which is what it did before), and the margin it adds past the reset it was
+    # told. Both are read in `wait_for_limit_reset`, which is where the reasoning lives.
+    # `outage_resumes` is how many times one attempt re-enters its own session after the API could
+    # not be reached, and `outage_wait_seconds` the first wait before doing so (doubled each time);
+    # see `api_outage`, which is where the reasoning lives. 0 resumes restores a fresh attempt.
+    "ticket": {"timeout_seconds": 28800, "max_attempts": 2, "quiet_seconds": 5400,
+               "limit_wait_max_seconds": 21600, "limit_wait_jitter_seconds": 90,
+               "limit_continue_work": True, "limit_probe_seconds": 120,
+               "outage_resumes": 3, "outage_wait_seconds": 300},
     # `remote_control` applies to `--work` only: it is a flag on an INTERACTIVE session, so it means
     # nothing to the headless driver. The name is per ticket rather than per host, because the point
     # of monitoring two sessions from a phone is being able to tell which is which.
@@ -140,13 +174,21 @@ NOT_OURS = {"has-open-pr"}
 # a plan objection no citation settles, an unrepairable standalone, the round cap, a declined blocking
 # finding. A second identical attempt is guaranteed to reach the same place, so an abort waits for a
 # human instead of consuming the attempt budget.
-NEEDS_HUMAN = {"aborted"}
+# `unknown` joins it for a different reason: the run may have delivered and the driver cannot tell,
+# so a second attempt would risk a SECOND PR for one issue. A human reads the stream instead.
+NEEDS_HUMAN = {"aborted", "unknown"}
 # A ticket the operator paused. Neither an outcome nor a failure: its session is suspended with its
 # transcript intact and `--resume` re-enters it with `claude --resume <session-id>`. A plain run must
 # not pick it up — starting it again opens a SECOND session on the same branch and abandons the first
 # one's context, which nothing would report, because a fresh session in a worktree that already holds
 # work looks exactly like a run that got a long way.
 SUSPENDED = {"paused"}
+# What a session suspended by a claude.ai usage limit is paused FOR, written to the ledger row.
+# One string and not a flag, because it is read by three different kinds of reader: the driver,
+# deciding whether this pause has a clock on it and can end without a human; `--status`, telling
+# an operator whether anything is owed of them; and the operator, who otherwise sees a pool that
+# stopped for no stated reason. An operator's pause carries their own words here.
+LIMIT_WHY = "the claude.ai usage limit was reached"
 
 
 # ─────────────────────────────────────────────────────────────── plumbing ──
@@ -162,6 +204,22 @@ def utc_date() -> str:
 
 def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def at_clock(epoch: int) -> str:
+    """An epoch as a local wall clock. `hms` says how long; deciding whether to wait needs when.
+
+    Total over any number, because the numbers reaching it come off the wire. A `resetsAt` the
+    platform cannot represent raises out of `datetime.fromtimestamp` — and the first caller is the
+    line `work_ticket` prints as it SUSPENDS a session, so a formatting error there would take the
+    pause with it: the attempt spent, the ticket recorded as a crash, and the session orphaned in a
+    worktree nothing names. Printing the raw number is the smaller failure by a wide margin.
+    """
+    try:
+        when = datetime.fromtimestamp(epoch)
+    except (OverflowError, OSError, ValueError):
+        return f"epoch {epoch}"
+    return when.strftime("%H:%M" if when.date() == datetime.now().date() else "%Y-%m-%d %H:%M")
 
 
 def hms(seconds: float) -> str:
@@ -417,6 +475,12 @@ def clear_pause_request() -> None:
         pass
 
 
+def portable_job(job: dict) -> dict:
+    """A job as JSON can carry it: a job holds a `Path`, and both the pause plan and the automatic
+    resume hand one to `resume_jobs`, which puts it back."""
+    return {k: (str(v) if isinstance(v, Path) else v) for k, v in job.items()}
+
+
 def write_pause_plan(cfg_path: str, workers: int, no_retro: bool, remaining: list[dict],
                      suspended: list[dict], say: Say, forced: bool = False) -> Path:
     """What a paused run leaves for `--resume`: the queue it had left, in the order it had it.
@@ -437,13 +501,10 @@ def write_pause_plan(cfg_path: str, workers: int, no_retro: bool, remaining: lis
     for a queue the operator named. Recording it is what makes the resumed run behave as the paused
     one would have, rather than as whichever kind the resume happens to look like.
     """
-    def portable(job: dict) -> dict:
-        return {k: (str(v) if isinstance(v, Path) else v) for k, v in job.items()}
-
     save_json(PAUSED, {"at": now(), "config": cfg_path, "workers": workers,
                        "no_retro": bool(no_retro), "forced": bool(forced),
-                       "suspended": [portable(j) for j in suspended],
-                       "queue": [portable(j) for j in remaining]})
+                       "suspended": [portable_job(j) for j in suspended],
+                       "queue": [portable_job(j) for j in remaining]})
     say(f"    wrote the resume plan to {PAUSED}")
     return PAUSED
 
@@ -526,6 +587,102 @@ def resume_jobs(plan: dict, ledger: dict, cfg: dict, say: Say) -> list[dict]:
     for job in plan.get("queue") or []:
         jobs.append({**job, "path": Path(job["path"]).expanduser()})
     return jobs
+
+
+def wait_for_limit_reset(suspended: list[dict], ledger: dict, cfg: dict, say: Say,
+                         interrupted) -> list[dict] | None:
+    """Sleep until the usage limit that suspended these tickets resets, then hand back the jobs that
+    re-enter them. `None` means do not wait — hand the pause back to the operator, as before.
+
+    This is the half whose absence made a closed window cost a person's evening. Everything else was
+    already here: `work_ticket` suspends the session, `resume_jobs` rebuilds it, `--resume` re-enters
+    it. But the driver's answer to a limit was to write a plan and exit, so the pool sat idle from
+    the moment the window closed until somebody came back to the terminal — and a reset is a KNOWN
+    instant, reported by the CLI itself. There is nothing in it for a human to decide.
+
+    `interrupted` is polled throughout rather than waited on: it is the only way Ctrl-C and
+    `--pause` reach a sleep that can be hours long.
+
+    Three things stop it waiting, and each is a way the wait would be WRONG rather than merely long:
+
+      * a suspended ticket with no `resume_at` — an operator's pause, or one whose reset was never
+        reported. Nothing here knows when that ends, and a wave holding one of each is exactly where
+        guessing would resume a session somebody suspended on purpose.
+      * a reset past `ticket.limit_wait_max_seconds`. A five-hour window is at most five hours out
+        and waiting costs an idle box; a seven-day one can be days out, and a driver holding
+        worktrees, slots and the machine lock across that is not unattended operation, it is a hang.
+      * a ticket suspended this way before that produced NO turns since. The reset it already waited
+        for bought nothing, so the next one will not either: that is a session spinning against a
+        limit it cannot get out from under, and it needs a person, not a longer sleep.
+    """
+    def refuse(summary: str, **fields) -> None:
+        """Say it AND push it. `paused` is a status that deliberately pages nobody, which is right
+        for a pause the driver will end itself and wrong for one only a person can end. The same
+        limit used to end these runs as `error`, which DID page — so a refused wait must not buy its
+        quiet at the cost of the one signal that mattered."""
+        say(f"  not waiting: {summary}")
+        notify(cfg, "limit-held", f"pool held by a usage limit: {summary}", say,
+               needs_human=True, tickets=[j.get("key") for j in suspended], **fields)
+
+    rows = [(job, ledger.get(job.get("key")) or {}) for job in suspended]
+    resets = [row.get("resume_at") for _, row in rows]
+    if not rows or any(not isinstance(r, int) for r in resets):
+        # Said, not pushed. The only way to get here is a pause with no reset on it, which means an
+        # operator's own — and they are at a terminal, having just typed for it. Said rather than
+        # silent all the same: a hand-back with no reason reads as the wait being broken.
+        say("  not waiting: " + ("nothing is suspended" if not rows else
+            "a suspended ticket was not paused by a usage limit, so nothing here knows when it ends"))
+        return None
+    for job, row in rows:
+        if row.get("limit_pauses", 0) > 1 and not row.get("turns"):
+            refuse(f"{job.get('key')} has been suspended by the usage limit "
+                   f"{row['limit_pauses']} times and did nothing with the last reset — it wants a "
+                   "person, not another sleep.", key=job.get("key"))
+            return None
+
+    resets_at = max(resets)
+    jitter = max(0, int(cfg["ticket"].get("limit_wait_jitter_seconds") or 0))
+    # Never exactly ON the reset: this machine's clock may be ahead of the server's, and several
+    # tickets — or several machines — waking on the same second would be rejected together.
+    target = resets_at + (random.randint(jitter // 2, jitter) if jitter else 0)
+    cap = int(cfg["ticket"].get("limit_wait_max_seconds") or 0)
+    ahead = target - now()
+    if cap <= 0 or ahead > cap:
+        refuse(f"the limit resets at {at_clock(resets_at)}, {hms(max(0, ahead))} from "
+               + ("now, and waiting for a reset is off (ticket.limit_wait_max_seconds is 0)."
+                  if cap <= 0 else
+                  f"now, past ticket.limit_wait_max_seconds ({hms(cap)}). A window that far out is "
+                  "a weekly limit, and a weekly limit wants a person."),
+               resets_at=resets_at)
+        return None
+
+    say(f"  waiting {hms(max(0, ahead))} for the usage limit to reset at {at_clock(resets_at)} — "
+        f"{len(rows)} ticket(s) stay suspended with their transcripts intact.")
+    told = now()
+    while now() < target:
+        # A poll and not a sleep. This is the longest thing the driver ever does with nothing
+        # running, and BOTH ways an operator stops a pool work by being noticed: the signal handler
+        # sets a flag the loop reads, `--pause` writes a file the watchdogs poll. Neither of them
+        # survives a `time.sleep` to the reset.
+        if interrupted():
+            # Not pushed, for the same reason the no-reset case is not: an interruption is Ctrl-C or
+            # `--pause`, both of which somebody has just typed.
+            say("  the wait was interrupted — the tickets stay suspended for `pool-run --resume`.")
+            return None
+        time.sleep(5)
+        if now() - told >= 600:
+            told = now()
+            say(f"    … {hms(max(0, target - now()))} until the limit resets")
+
+    # Through the real rebuilder, so a ticket the ledger has since moved on from is screened out
+    # exactly as `--resume` screens it. Over a ledger narrowed to THIS wave, because `resume_jobs`
+    # also sweeps in every other row the ledger calls paused — right for an operator who typed
+    # `--resume` and wrong here, where it would re-enter a session somebody suspended on purpose.
+    mine = {j.get("key") for j in suspended}
+    jobs = resume_jobs({"queue": [], "suspended": [portable_job(j) for j in suspended]},
+                       {k: v for k, v in ledger.items() if k in mine}, cfg, say)
+    say(f"  the usage limit has reset — re-entering {len(jobs)} suspended session(s).")
+    return jobs or None
 
 
 # ───────────────────────────────────────────────────────────────── locking ──
@@ -985,6 +1142,12 @@ def claim_slot(cfg: dict, slug: str, ticket: str, repo: Path, base: str,
             lease_path.unlink(missing_ok=True)
             say(f"  x {why}")
             return None
+        # The gate entry goes with the old worktree, as it does on the driver's path. A session
+        # reaped without `--release` leaves its entry at this same path, and the next session's
+        # Step 1 `building` write merges into it rather than replacing it. Measured on #477: that
+        # entry carried PR #483's `pr`, reviewed and verified shas and declined list into PR #509's
+        # run. No live claim holds this ticket (checked above), so what is here is a leftover.
+        clear_gate_state(wt, say)
         with os.fdopen(fd, "w") as fh:
             json.dump({"slot": slot.name, "ticket": ticket.lstrip("#"), "slug": slug,
                        "worktree": str(wt), "repo": str(repo),
@@ -1095,9 +1258,155 @@ def silence_since(worktree: Path, started_at: int) -> int | None:
     return None if newest is None else now() - newest
 
 
+def process_start(pid: int) -> float | None:
+    """When the process holding `pid` started, as epoch seconds, or None if nothing holds it."""
+    stamp = sh(["ps", "-o", "lstart=", "-p", str(pid)]).stdout.strip()
+    try:
+        return time.mktime(time.strptime(stamp, "%a %b %d %H:%M:%S %Y")) if stamp else None
+    except ValueError:
+        return None
+
+
+def same_process(pid: int, recorded: str | None) -> bool:
+    """Whether `recorded` describes the process that holds `pid` NOW.
+
+    Both sides are bare wall clocks, and they do not agree about which zone they are in: `claude`
+    records its own start in UTC and `ps -o lstart=` prints local. Comparing the two as STRINGS
+    therefore refuses every live session on any machine that is not on UTC — measured 2026-09-13,
+    where it refused every nudge this feature had ever attempted, on a +0300 box, with the two
+    stamps three hours apart and otherwise identical.
+
+    The suite did not catch it, and the reason is worth keeping: the fixture wrote its registry
+    entry by calling `process_start`, so the comparison it was meant to exercise was true by
+    construction. A guard tested against its own output is not tested.
+
+    So: epochs, and a match under EITHER reading, because which zone gets recorded is not this
+    driver's to fix and a future version may answer differently. That is not a weak guard — a
+    recycled pid would have to have started at the same wall clock to the second, or exactly one
+    UTC offset away from it, and the session id travelling in the envelope is what the RECEIVER
+    checks regardless. Unparseable or unrecorded is not evidence of anything, and passes.
+    """
+    if not recorded:
+        return True
+    live = process_start(pid)
+    if live is None:
+        return False
+    try:
+        parsed = time.strptime(recorded, "%a %b %d %H:%M:%S %Y")
+    except (ValueError, TypeError):
+        return True
+    return min(abs(live - time.mktime(parsed)), abs(live - calendar.timegm(parsed))) <= 2
+
+
+def live_session(pid: int) -> dict | None:
+    """`claude`'s OWN registry entry for a live session, or None if this pid is not one.
+
+    A session publishes `~/.claude/sessions/<pid>.json` for itself, and it carries the two things an
+    outside process needs in order to talk to it — the socket it is listening on and its session id
+    — plus the one that makes talking to it SAFE. `procStart` is checked against the live process
+    because pids are recycled, and the cost of getting that wrong is a resume prompt delivered into
+    somebody else's unrelated session. Registry entries also outlive the sessions that wrote them.
+    """
+    entry = load_json(SESSIONS / f"{pid}.json", {})
+    if not isinstance(entry, dict) or entry.get("pid") != pid:
+        return None
+    if not entry.get("messagingSocketPath") or not entry.get("sessionId"):
+        return None
+    if not same_process(pid, entry.get("procStart")):
+        return None
+    return entry
+
+
+def peer_send(entry: dict, payload: dict, timeout: float = 5.0) -> str | None:
+    """Hand one message to a live session over the socket IT published. Returns an error, or None.
+
+    Never raises. This is a convenience laid over a run in exactly the sense `notify` is: a session
+    that cannot be reached costs a line in the log and nothing else, because the alternative — a
+    launcher that dies trying to be helpful — is worse than the stall it was fixing.
+
+    The transport is `claude`'s own local peer-message socket, which is how one session messages
+    another on this machine, and it is not a published contract: the envelope carries a protocol
+    version and can change. That is survivable ONLY because of where this is called from — a failed
+    send leaves the session exactly as it was, stalled, which is what it did before any of this
+    existed. Never build anything on this that a failure would corrupt.
+    """
+    path = entry.get("messagingSocketPath")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(path)
+            sock.sendall((json.dumps(payload) + "\n").encode())
+            sock.shutdown(socket.SHUT_WR)
+    except (OSError, ValueError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def continue_session(pid: int, text: str) -> str | None:
+    """Put one user turn into a live session's queue, the way another session would.
+
+    `session_id` rides along deliberately: the receiver drops a message whose session id is not its
+    own, which is the second guard after `procStart` against a recycled pid being handed a resume
+    prompt meant for something else. Two guards because they fail differently — one is a stale
+    registry file, the other a pid reissued between reading it and writing to it.
+    """
+    entry = live_session(pid)
+    if not entry:
+        return f"no live session is registered under pid {pid}"
+    return peer_send(entry, {"type": "user", "from": "pool-run", "priority": "next",
+                             "session_id": entry["sessionId"],
+                             "message": {"content": text}})
+
+
+def session_is_busy(pid: int) -> bool:
+    """Whether the session says it is working. Absent or unreadable reads as NOT busy, deliberately:
+    this only ever gates whether to spend a probe, and the decision to act needs the probe's answer
+    as well as this one."""
+    entry = live_session(pid)
+    return bool(entry) and entry.get("status") == "busy"
+
+
+def account_limit(cfg: dict) -> tuple[str, dict | None]:
+    """Ask the ACCOUNT whether it will serve a request: "open", "limited" (with the window), or
+    "refused" (it would not, and did not say why).
+
+    An interactive transcript records nothing machine-readable about a limit — the only trace is an
+    assistant line in the operator's own locale ("resets 7:10am"), and reading a wall clock out of
+    a localised sentence is a bug waiting for somebody in another timezone. A rate limit is an
+    ACCOUNT fact, so this asks the account: the smallest possible headless session, read through the
+    same `Session` and the same `limit_rejection` the driver uses. One reader of rate limits here,
+    not two.
+
+    It is free in the case that matters. A probe made while the window is shut is REJECTED, so it
+    spends nothing; only a probe that finds the window OPEN costs a few tokens, and that is the
+    answer that stops anything waiting. `pausable=False` because there is nothing to resume: this
+    session is one question.
+
+    THREE answers rather than two, and the third is what the caller is really built on. A window's
+    `resetsAt` reaches this through a `rate_limit_event` whose rejected form nothing here has ever
+    observed — every one of the records this pipeline has captured says `allowed_warning`, because
+    a rejection ends the run that would have logged it, and the shape is taken from the CLI's own
+    predicate rather than from a measurement. So a probe that is refused WITHOUT saying why is
+    reported as refused rather than as fine: the caller polls until the account serves it, which is
+    what "the limit lifted" means operationally, and needs no `resetsAt` to be right.
+    """
+    # Deliberately NOT run in the worktree it is asked on behalf of. `claude` keys its transcript
+    # directory on the cwd, and `silence_since` reads that directory to decide a run has stopped
+    # writing — so a probe run there would refresh the very signal that summoned it, and the
+    # session would never look quiet again. Measured by the suite before this line existed.
+    stem = LOGS / safe_component(f"{utc_stamp()}-limit-probe")
+    run = Session("Reply with one word: ok", PIPELINE, cfg, stem, 300, 300,
+                  lambda *a, **k: None, pausable=False).run()
+    limit = run.get("rate_limit")
+    if limit:
+        return "limited", limit
+    return ("refused", None) if run.get("is_error") else ("open", None)
+
+
 def watch_hand_launched(cfg: dict, key: str, worktree: Path, started_at: int,
-                        stop: threading.Event, say) -> None:
-    """Tell somebody when a hand-launched run passes its bound or goes quiet. It NEVER kills.
+                        stop: threading.Event, say, pid: int | None = None) -> None:
+    """Tell somebody when a hand-launched run passes its bound or goes quiet, and carry it past a
+    usage limit. It NEVER kills.
 
     `Session` carries the driver's timeout and quiet window; `work_in_session` starts an ordinary
     interactive `claude` with `Popen`, so for as long as this path has existed neither bound applied
@@ -1115,6 +1424,65 @@ def watch_hand_launched(cfg: dict, key: str, worktree: Path, started_at: int,
     quiet = int(cfg["ticket"]["quiet_seconds"])
     tick = max(1, min(30, bound, quiet))
     told: set[str] = set()
+    # The usage limit this session is blocked by, once observed, and the earliest the account may be
+    # asked again. The CLI's own wait-for-the-reset is a feature of the SESSION and can be gated off
+    # for an account; the driver's is for sessions it can suspend and re-enter, which a `--work`
+    # session is not — it has no ledger row carrying it back. So what is left is to notice the
+    # window reopening and say so. Unlike every other branch in this watcher that is an ACTION, and
+    # it is guarded three times over: the session must be quiet, the account must have REFUSED a
+    # probe rather than merely be suspected, and the reset must have arrived. A wrong nudge is a
+    # turn injected into a session that was working.
+    carry = bool(cfg["ticket"].get("limit_continue_work", True))
+    cap = int(cfg["ticket"].get("limit_wait_max_seconds") or 0)
+    jitter = max(0, int(cfg["ticket"].get("limit_wait_jitter_seconds") or 0))
+    # `blocked` is the whole state: the account has refused a request while this session sat quiet.
+    # What ends it is the account SERVING one again — not a clock — because that is what "the limit
+    # lifted" means and it is true whether or not a reset time was ever reported. `fire_at` is only
+    # an optimisation over that: when a window was named, there is no point asking again before it.
+    blocked, fire_at, until, tries, next_probe, spell = False, 0, None, 0, 0, 0
+    # How stopped a run must look before the account is asked, and how often it may be asked after
+    # that. Ten minutes and five, except where the pool calls silence a problem sooner than that —
+    # one that treats five minutes of quiet as trouble should not wait ten to ask why.
+    # Pacing is per QUIET SPELL, not per watcher. A probe spent during an EARLIER silence used to
+    # push the next one ten minutes out, so the silence that actually mattered waited that long for
+    # its first look. Measured 2026-09-14 on #315: it stopped six minutes before its window
+    # reopened, its first look landed seven minutes later with the account already serving, and
+    # "open" says nothing without a refusal to pair it with — so it sat idle for an hour while
+    # three siblings that had caught the refusal all resumed. A new spell is looked at at once, and
+    # only repeats WITHIN one spell back off.
+    # The REPEAT interval is its own setting and is NOT derived from `quiet_seconds`. Deriving it
+    # left a pool with a small quiet window unable to exercise a long interval at all, so the case
+    # written for the #315 pacing bug passed against the broken code — worse than no case. A knob
+    # instead, which a case can set small on purpose and one that must not be small leaves alone.
+    probe_first = max(tick, int(cfg["ticket"].get("limit_probe_seconds") or 120))
+    probe_after, probe_cap = min(300, quiet), probe_first * 5
+    # The probe runs on its OWN thread and this loop only collects its answer. A probe is a whole
+    # `claude` startup, and this loop's first duty is the bounds above — a watcher that stops
+    # reporting while it investigates misses the thing it exists for. Measured by the suite: run
+    # inline, a session that went quiet during a probe was never reported quiet at all.
+    probe_lock = threading.Lock()
+    probe: dict = {"busy": False, "answer": None}
+
+    def ask_the_account() -> None:
+        try:
+            got = account_limit(cfg)
+        except Exception as exc:      # a watcher must never take the session it watches with it
+            say(f"! could not ask the account about usage limits: {type(exc).__name__}: {exc}")
+            got = ("error", None)
+        with probe_lock:
+            probe["answer"], probe["busy"] = got, False
+
+    def ask_if_idle() -> None:
+        with probe_lock:
+            if probe["busy"]:
+                return
+            probe["busy"], probe["answer"] = True, None
+        threading.Thread(target=ask_the_account, daemon=True).start()
+
+    def answer():
+        with probe_lock:
+            got, probe["answer"] = probe["answer"], None
+            return got
 
     def report(reason: str, summary: str, **fields) -> None:
         # Said in the LOG as well as pushed. `notify` reaches `say` only when the channel fails, and
@@ -1135,6 +1503,93 @@ def watch_hand_launched(cfg: dict, key: str, worktree: Path, started_at: int,
             if silent is not None and silent > quiet:
                 report("quiet", f"{key} has written nothing for {hms(silent)} — it may be waiting "
                                 "for you, or wedged", quiet_for_s=silent)
+
+        if not carry or pid is None or cap <= 0:
+            continue
+        if blocked:
+            # `fire_at` was drawn ONCE, when the window was named. Drawing the margin here instead
+            # would re-roll it every tick, so the moment being waited for would move each time it
+            # was asked about — either firing early or never settling.
+            # A named window governs on its own; `next_probe` paces the case where the account
+            # refused without naming one, which is the case that has to be polled.
+            got = answer()
+            if got is None:
+                if now() >= fire_at and now() >= next_probe:
+                    next_probe = now() + probe_first
+                    ask_if_idle()
+                continue
+            state, found = got
+            if state == "error":
+                continue
+            if state != "open":
+                # Still refused. A named window that has passed and is still refusing is the case a
+                # clock alone would have got wrong — it nudges a session that cannot yet run.
+                fire_at = (found["resets_at"] + (random.randint(jitter // 2, jitter) if jitter
+                                                  else 0)) if found else 0
+                until = found["resets_at"] if found else until
+                if found:
+                    next_probe = 0
+                continue
+            failed = continue_session(pid, WORK_CONTINUE_PROMPT)
+            if not failed:
+                say("the account is serving requests again"
+                    + (f" (the window reopened at {at_clock(until)})" if until else "")
+                    + f" — told {key}'s session to continue where it stopped")
+                # Cleared so a run that meets the limit twice is carried twice. The bounds above
+                # latch deliberately; this must not, because each window is its own event.
+                told.discard("limit-continue-failed")
+                blocked, fire_at, until, tries, next_probe, spell = False, 0, None, 0, 0, 0
+                continue
+            # Retried across ticks rather than abandoned on the first refusal. Giving up here would
+            # be permanent in practice: the next probe happens with the window OPEN, finds no limit,
+            # and so never schedules another attempt — one dropped packet and the session sits
+            # there. Bounded, because a send that fails three times is failing for a reason a
+            # fourth will not fix, and that reason belongs in front of a person.
+            tries += 1
+            if tries < 3:
+                continue
+            if "limit-continue-failed" not in told:
+                # Latched like the bounds above, and discarded on the next success: once per run of
+                # failures, not once per window and not once per tick.
+                report("limit-continue-failed",
+                       f"{key}: the account is serving requests again but this session could not "
+                       f"be told to continue after {tries} tries ({failed}) — send it any message "
+                       "to pick it up", resets_at=until)
+            blocked, fire_at, until, tries, next_probe, spell = False, 0, None, 0, 0, 0
+            continue
+        # Asking the account costs a session, so it is asked only of a run that looks stopped: quiet
+        # AND not busy by its own account. A long build is silent and says it is busy, which is what
+        # keeps this from spending a probe a tick through a compile.
+        got = answer()
+        if got is None:
+            silent = silence_since(worktree, started_at)
+            if silent is None or silent < probe_after:
+                # This spell is over, or has not begun. The NEXT one gets a prompt first look, which
+                # is the whole of the fix above: what this spell spent is not charged to the next.
+                next_probe, spell = 0, 0
+                continue
+            if now() < next_probe or session_is_busy(pid):
+                continue
+            spell += 1
+            next_probe = now() + min(probe_cap, probe_first * 2 ** (spell - 1))
+            ask_if_idle()
+            continue
+        state, found = got
+        if state in ("open", "error"):
+            continue
+        if found and found["resets_at"] - now() > cap:
+            # A window further out than the driver will wait for is one a person should see; the
+            # same bound, so "do not wait for usage limits" means one thing on both paths.
+            continue
+        blocked, until = True, found["resets_at"] if found else None
+        fire_at = (found["resets_at"] + (random.randint(jitter // 2, jitter) if jitter else 0)
+                   if found else 0)
+        if found:
+            next_probe = 0
+        say(f"{key} is stopped: the account is refusing requests"
+            + (f" — its {found['type'] or 'usage'} window reopens at {at_clock(found['resets_at'])}"
+               if found else " and did not say when it will stop")
+            + ". This session will be told to continue as soon as the account serves one again")
 
 
 def reap_stale_work(ledger: dict, say) -> list[str]:
@@ -1209,6 +1664,20 @@ def work_in_session(cfg: dict, slug: str, ticket: str, issue: dict, repo: Path, 
         # does not start with `-` binds to it, leaving the prompt as the positional it was.
         argv += ["--remote-control", f"{slug.split('/')[-1].replace('openmrs-module-', '')}"
                                      f"-{ticket.lstrip('#')}"]
+    if cfg["ticket"].get("limit_continue_work", True):
+        # Without this the carry cannot land. A session that bypasses prompts HOLDS an inbound peer
+        # message unless the sender is identifiable as another session of the same permission class,
+        # and `pool-run` is a python script — "an unidentified session" by construction, whatever it
+        # puts in the envelope. Measured 2026-09-13: the carry detected the limit, waited out the
+        # window, saw the account serve again, delivered its message — and the session recorded
+        # "Held peer message ... not delivered to Claude" and went on sitting there for seven hours.
+        #
+        # Set HERE rather than in `~/.claude/settings.json`, because it is a real loosening: it lets
+        # any local process put a turn into this session. A pool worktree already running
+        # `--dangerously-skip-permissions` is inside that trust boundary; the operator's other
+        # sessions are not, and must not be enrolled by a knob they did not set for them.
+        # `ticket.limit_continue_work: false` turns the carry off and takes this with it.
+        argv += ["--settings", json.dumps({"crossSessionInbound": "accept"})]
     argv += common_claude_args(cfg)
     argv.append(prompt)
     say(f"{slug}#{ticket.lstrip('#')} on {claim['slot'].name} "
@@ -1267,7 +1736,7 @@ def work_in_session(cfg: dict, slug: str, ticket: str, issue: dict, repo: Path, 
         stop = threading.Event()
         threading.Thread(target=watch_hand_launched, daemon=True,
                          args=(cfg, key, claim["worktree"], started_at, stop,
-                               getattr(say, "quietly", say))).start()
+                               getattr(say, "quietly", say), proc.pid)).start()
         try:
             code = proc.wait()
         finally:
@@ -1387,7 +1856,37 @@ def parity_problems(cfg: dict) -> list[str]:
                     problems.append(f"{skill}/{f.relative_to(live)} is not in the source repo")
                 elif m.read_bytes() != f.read_bytes():
                     problems.append(f"{skill}/{f.relative_to(live)} differs from the source repo")
+        # And the other direction. Walking only the live tree cannot see a file the repo added and
+        # nobody installed, and a role file a skill's brief points its subagents at is that shape.
+        for m in sorted(mirror.rglob("*")):
+            if m.is_file() and not (live / m.relative_to(mirror)).is_file():
+                problems.append(f"{skill}/{m.relative_to(mirror)} is in the source repo but not installed")
     return problems
+
+
+def lint_problems(src: Path, before: str) -> list[str]:
+    """What the source repo's own skill linter says after a retro, run against the head it started from.
+
+    The retro runs the linter itself (skill-retro Step 2), and a budget it raised is meant to carry a
+    recorded reason (Step 4). Both were instructions to the session being checked. This runs the linter
+    the retro left in the source repo, from the driver and with `--against` the pre-retro head, so a
+    SKILL.md off its budget or a budget raised with no `raises` entry is a problem the driver reports,
+    not a sentence the retro may or may not have written. Its limit: the code that runs is the retro's
+    own copy, so a retro that edits the linter is checked by what it edited. A linter that is missing
+    or will not run is said as such: silence here would read as a clean result."""
+    lint = src / ".claude/skills/skill-retro/skill-lint.py"
+    if not lint.is_file():
+        return [f"{lint} is missing, so no budget was checked"]
+    r = sh([sys.executable, str(lint), str(src / ".claude/skills"), "--against", before], timeout=120)
+    if r.returncode == 0:
+        return []
+    found, where = [], ""
+    for line in r.stdout.splitlines():
+        if line and not line.startswith(" ") and not line[0].isdigit() and "checked" not in line:
+            where = line.strip()
+        elif line.strip().startswith(("file", "line")):
+            found.append(f"skill-lint: {Path(where).parent.name}/{Path(where).name}: {line.strip()}")
+    return found or [f"skill-lint exited {r.returncode}: {(r.stdout + r.stderr).strip()[-300:]}"]
 
 
 def preflight(cfg: dict, say: Say, want_label: bool, driving: bool = True) -> list[str]:
@@ -1487,12 +1986,61 @@ def load_json_str(text: str, default):
 # ────────────────────────────────────────────────────────────────── queue ──
 
 
-def open_prs(slug: str) -> list[dict]:
+def open_prs(slug: str) -> list[dict] | None:
+    """The repository's open PRs, or **None when the ask itself failed.**
+
+    `gh` can exit 0 with empty stdout, and `[]` cannot say which happened: an empty list reads as
+    "this repository has no open PRs", which is how a delivered ticket gets recorded `no-pr` and
+    charged an attempt. Every caller has to decide what an unknown means for its own question;
+    nothing here may turn one into an absence.
+    """
     got = sh(
         ["gh", "pr", "list", "--repo", slug, "--state", "open", "--limit", "100", "--json",
          "number,title,isDraft,headRefName,closingIssuesReferences,url,body,createdAt"]
     )
-    return load_json_str(got.stdout, [])
+    if got.returncode != 0 or not got.stdout.strip():
+        return None
+    return load_json_str(got.stdout, None)
+
+
+def pr_by_number(slug: str, number) -> dict | None:
+    """One PR by number, in ANY state — the question `open_prs` cannot answer.
+
+    A PR merged before the outcome check is not an open PR. The gate entry carries the number the
+    run itself wrote there, so that number is the one piece of evidence that survives the merge.
+    """
+    got = sh(["gh", "pr", "view", str(number), "--repo", slug, "--json",
+              "number,title,isDraft,headRefName,closingIssuesReferences,url,body,createdAt,state"])
+    if got.returncode != 0 or not got.stdout.strip():
+        return None
+    return load_json_str(got.stdout, None)
+
+
+def outcome_pr(slug: str, ticket: str, gate: dict, since: int | None,
+               prs: list[dict] | None) -> tuple[dict | None, bool]:
+    """The PR this run opened, and whether GitHub could be asked at all.
+
+    Three sources, because the open list alone was measured wrong on eight tickets over two days
+    (2026-09-13/14: #413, #337, #421, #276, #412, #409, #425, #315 — every one of them had opened a
+    PR that was MERGED before this check ran, and every one was recorded `no-pr`):
+
+      1. the open list, matched by `pr_for_ticket`;
+      2. the number in the gate entry, fetched in any state — a merged PR is invisible to (1), and
+         on #315 the driver cleared a gate entry reading `pr=431 blocking=0` in the same breath as
+         it wrote `no-pr`;
+      3. nothing, and `asked` is False when the ask failed, so the caller can refuse to call an
+         unknown an outcome.
+    """
+    if prs is not None:
+        pr = pr_for_ticket(prs, ticket, since=since)
+        if pr:
+            return pr, True
+    known = (gate or {}).get("pr")
+    if known:
+        pr = pr_by_number(slug, known)
+        if pr:
+            return pr, True
+    return None, prs is not None
 
 
 def pr_for_ticket(prs: list[dict], ticket: str, since: int | None = None) -> dict | None:
@@ -1515,16 +2063,25 @@ def pr_for_ticket(prs: list[dict], ticket: str, since: int | None = None) -> dic
     num = ticket.lstrip("#")
     digit = num.isdigit()
     named = rf"(?<!\d)#?{num}(?!\d)" if digit else re.escape(num)
+    # Tier 3 reads PROSE, so it needs the ticket to be CLAIMED and not merely mentioned. PR 417
+    # said "`main` gained #416 (issue #294) after this branch was reviewed"; on the bare name that
+    # match handed #409's PR to #294 as a `ready` verdict. A keyword and the number next to it is
+    # what the skill writes when it means this PR is for this ticket, in either the bare or the
+    # linked form (`Refs #276`, `Refs [#276](url)`). Searched case-insensitively whatever the
+    # ticket is: the keyword is written `Refs` as often as `refs`, and the number carries no case.
+    claimed = (rf"(?:fixes|closes|resolves|refs)\s*:?\s*\[?#?{num}(?!\d)" if digit
+               else re.escape(num))
     flags = 0 if digit else re.IGNORECASE
     best = None
-    for pr in prs:
+    for pr in prs or []:
         tier = 0
         if num in [str(r.get("number")) for r in pr.get("closingIssuesReferences") or []]:
             tier = 3
         elif re.search(named, pr.get("title") or "", flags) or re.search(
                 named, pr.get("headRefName") or "", flags):
             tier = 2
-        elif since is not None and re.search(named, pr.get("body") or "", flags) and (
+        elif since is not None and re.search(
+                claimed, pr.get("body") or "", flags | re.IGNORECASE) and (
                 pr_created_at(pr) or 0) >= since:
             tier = 1
         if tier and (best is None or (tier, pr["number"]) > (best[0], best[1]["number"])):
@@ -1584,6 +2141,13 @@ def consider(slug: str, path: str, issue: dict, prs: list[dict], ledger: dict, s
         # prose: an attempt that ended as a draft may have written `Refs` on a branch carrying no
         # number, which tiers 1-2 cannot see — and a second run on such a ticket opens a SECOND PR
         # for one issue.
+        if prs is None:
+            # Working it blind is the one move that cannot be undone: if a PR is open for this
+            # ticket and the ask simply failed, a second run opens a SECOND PR for one issue.
+            say(f"  - {key}: GitHub could not be asked whether a PR is already open for it "
+                "(`gh pr list` failed or answered nothing). Skipping rather than risking a "
+                "second PR for one issue.")
+            return None
         known = entry.get("pr")
         existing = next((x for x in prs if x["number"] == known), None) if known else None
         existing = existing or pr_for_ticket(prs, ticket)
@@ -1640,9 +2204,9 @@ def build_queue(cfg: dict, ledger: dict, say: Say, named: list[str] | None) -> l
     invocation.
     """
     queue: list[dict] = []
-    pr_cache: dict[str, list[dict]] = {}
+    pr_cache: dict[str, list[dict] | None] = {}
 
-    def prs_for(slug: str) -> list[dict]:
+    def prs_for(slug: str) -> list[dict] | None:
         if slug not in pr_cache:
             pr_cache[slug] = open_prs(slug)
         return pr_cache[slug]
@@ -1947,11 +2511,31 @@ def clear_gate_state(path: Path, say) -> list[str]:
     """
     removed = gate_state_cmd("--cwd", str(path), "clear", "--json")
     names = {"pr": PR_STATE.name, "harden": HARDEN_STATE.name}
-    cleared = [
-        f"{names[w]}: phase={e.get('phase')} blocking={e.get('blocking')} "
-        f"edits={e.get('edits')} pr={e.get('pr')} round={e.get('round')}"
-        for w, e in sorted(removed.items()) if e
-    ]
+    # Name each gate's OWN predicate. This line reaches a run record (`2026-09-17-pool-pr-detection`
+    # quotes the pr half of it), and for a harden leftover it used to read
+    # `phase=None blocking=None edits=N pr=None round=None` -- the one number that gates nothing,
+    # and neither of the two that do.
+    def _fields(w: str, e: dict) -> str:
+        if w == "harden":
+            # An await-only entry carries no verdict AND no count, and calling that LEGACY asserts
+            # a zero-edit rule with no edit count for it to read. `pool-watch` prints no predicate
+            # line for the same shape (it does print the await); this says what it is. Emptiness,
+            # not `in`, so the three readers of this entry agree on `phase1: ""`.
+            if not e.get("phase1") and e.get("edits") is None:
+                return f"cycle={e.get('cycle')} no verdict and no count recorded"
+            # LEGACY is no run AND no verdict, matching the hook. A run-stamped entry with no
+            # verdict is a run that owes one, not one held to an edit count.
+            if e.get("phase1"):
+                phases = f"phase1={e['phase1']} phase2={e.get('phase2', 'pending')}"
+            elif e.get("run"):
+                phases = f"run={e['run']} no verdict recorded"
+            else:
+                phases = "LEGACY (no run id, no phase1: zero-edit rule)"
+            return f"cycle={e.get('cycle')} {phases} edits={e.get('edits')}"
+        return (f"phase={e.get('phase')} blocking={e.get('blocking')} "
+                f"pr={e.get('pr')} round={e.get('round')}")
+
+    cleared = [f"{names[w]}: {_fields(w, e)}" for w, e in sorted(removed.items()) if e]
     for line in cleared:
         say(f"    cleared leftover gate state — {line}")
     return cleared
@@ -1995,6 +2579,35 @@ def unattended_marker(path: Path):
 # ──────────────────────────────────────────────────────────────── session ──
 
 
+def limit_rejection(info: object) -> dict | None:
+    """The claude.ai usage limit stopping a session, read off one `rate_limit_event`, or None.
+
+    `claude -p` already streams these: `{"type": "rate_limit_event", "rate_limit_info": {...}}`,
+    carrying `status` (allowed / allowed_warning / rejected), the `resetsAt` epoch of the window that
+    is limiting, `rateLimitType` and whether paid overage is covering the overflow. The driver read
+    none of it, so a limit arrived as `is_error` and nothing else — indistinguishable from a crash.
+
+    The predicate is the CLI's OWN, mirrored rather than invented, and the two exclusions are the
+    whole of why it is not just `status == "rejected"`. A rejection with no `resetsAt` names no
+    instant to come back at. A rejection while overage is in use is covered by credit that resets on
+    nothing this driver can wait for, so sleeping to `resetsAt` would wait out the wrong thing.
+
+    It answers about ONE observation. `status` moves — a session rejected while a grace window or
+    overage is provisioned sees `rejected` and then `allowed`, and finishes — so the caller keeps the
+    latest rather than latching the first.
+    """
+    if not isinstance(info, dict) or info.get("status") != "rejected":
+        return None
+    if info.get("isUsingOverage") is True or info.get("overageInUse") is True:
+        return None
+    resets = info.get("resetsAt")
+    # `True` is an `int` in Python and would arrive here as the epoch 1, which is in the past and so
+    # would read as a limit that has already reset — a wrong answer rather than no answer.
+    if isinstance(resets, bool) or not isinstance(resets, (int, float)) or resets <= 0:
+        return None
+    return {"resets_at": int(resets), "type": info.get("rateLimitType")}
+
+
 def common_claude_args(cfg: dict) -> list[str]:
     """The options that apply to a session however it is started.
 
@@ -2026,6 +2639,11 @@ class Session:
         # travels here rather than in the prompt: the skills read it, and a pipeline instruction
         # bolted onto the prompt would be governance no retro can see.
         self.env = env or dict(os.environ)
+        # Every session this driver starts is unattended, whatever its cwd: the ticket runs in a
+        # worktree, `/skill-retro` in the skills checkout, the health probe in this directory. The
+        # PreToolUse rm-shape guard scopes on this stamp as well as on the worktree path, because a
+        # permission prompt raised in ANY of them is a hang, not a pause -- see ~/.claude/hooks.
+        self.env["CLAUDE_PIPELINE_SESSION"] = "1"
         self.jsonl = log_stem.with_suffix(".jsonl")
         self.err = log_stem.with_suffix(".err")
         self.timeout, self.quiet, self.say = timeout, quiet, say
@@ -2048,6 +2666,32 @@ class Session:
         self.turns = 0
         self.last_tool = ""
         self.result = {}
+        # The usage limit this session last reported, or None — see `limit_rejection`. Not a
+        # count and not a history: only the standing state can decide anything.
+        self.rate_limit = None
+
+    def limit_in_force(self) -> bool:
+        """Whether a claude.ai usage limit is what is stopping this session right now.
+
+        The reset instant is half the question and the guard is the other half. A rejection whose
+        window has since reset cannot be what is stopping anything — so a failure hours later, with
+        a stale rejection still on the object, must not read as one, or the driver would sleep until
+        a moment already behind it, wake immediately, and re-enter a session that fails again for
+        the reason nobody looked at.
+        """
+        return bool(self.rate_limit) and self.rate_limit["resets_at"] > now()
+
+    def suspend_for_limit(self) -> bool:
+        """Whether THIS session may be suspended for the limit rather than ended by it.
+
+        A session with nothing to resume it must not be. `run_retro` builds one with
+        `pausable=False` because it has no ledger row to carry a session id and a worktree back, so
+        suspending it would END it — losing the work, leaving the source repo mid-checkout for the
+        next retro to refuse as dirty, and reporting it through the problem list as "no commit
+        landed", which is true and is not the reason. A retro is bounded and runs between waves, so
+        the right answer there is the old one: end, and say what ended it.
+        """
+        return self.pausable and self.limit_in_force()
 
     def argv(self) -> list[str]:
         c = self.cfg["claude"]
@@ -2105,6 +2749,13 @@ class Session:
                     if now() - started > self.timeout:
                         return stop(f"exceeded the ticket timeout of {hms(self.timeout)}")
                     if now() - last_line[0] > self.quiet:
+                        # A session that cannot make a request produces nothing, so the quiet
+                        # watchdog is the SECOND way a usage limit reaches the driver — and as a
+                        # kill it costs everything a kill costs: the attempt, the worktree, and
+                        # `timeout` in the ledger over a run that had not failed. Both routes end
+                        # in the same place; this is the one no exit code marks.
+                        if self.suspend_for_limit():
+                            return stop(LIMIT_WHY, paused=True)
                         return stop(f"produced nothing for {hms(self.quiet)}")
 
             threading.Thread(target=watchdog, daemon=True).start()
@@ -2121,9 +2772,24 @@ class Session:
             code = proc.wait()
             live_drop(proc)
 
+        # The other route, and the ordinary one. The CLI's own wait-for-the-reset is gated on an
+        # INTERACTIVE session (`isInteractive() && !isBackground()`), so it can never arm under
+        # `-p`: a headless run ends the moment the window closes, with nothing but a non-zero exit
+        # to say so. Read after the wait, so the last record the session streamed is the one that
+        # decides, and only over a run that actually FAILED — a rejection a session got past must
+        # not re-label the clean end that followed it.
+        if not self.killed_for and not self.paused_for and self.suspend_for_limit() and (
+                code != 0 or self.result.get("is_error")):
+            self.paused_for = LIMIT_WHY
+
         return {"exit": code, "seconds": now() - started, "session_id": self.session_id,
                 "killed_for": self.killed_for, "paused_for": self.paused_for,
                 "turns": self.turns, "jsonl": str(self.jsonl),
+                # The limit standing over the session as it ENDED — a rejection it got past, or
+                # one whose window has since reset, is not one. Whether that is worth recording as a
+                # time to come back at is `work_ticket`'s to decide: an operator pause taken while a
+                # limit happened to be in force is still an operator pause, and ends when they say.
+                "rate_limit": self.rate_limit if self.limit_in_force() else None,
                 "cost_usd": self.result.get("total_cost_usd"),
                 "is_error": bool(self.result.get("is_error")) or code != 0,
                 # What ENDED the session, straight off the final result record. An outcome status is
@@ -2148,6 +2814,10 @@ class Session:
                     arg = block.get("input", {}) or {}
                     detail = arg.get("command") or arg.get("prompt") or arg.get("skill") or ""
                     self.last_tool = f"{name}({str(detail)[:60]})" if detail else name
+        elif kind == "rate_limit_event":
+            # Replaced rather than accumulated, and cleared by an `allowed` that follows a
+            # `rejected`: only the standing state means anything. See `limit_rejection`.
+            self.rate_limit = limit_rejection(event.get("rate_limit_info"))
         elif kind == "result":
             self.result = event
 
@@ -2170,6 +2840,48 @@ RESUME_PROMPT = (
     "confirm where that was."
 )
 
+# What a session is told when the driver re-enters it after the API could not be reached. The
+# session did not choose to stop, so it says what happened and rules out the wrong reading: that the
+# work was judged, or that anything on disk moved while it was away.
+OUTAGE_PROMPT = (
+    "Your previous request never reached the API (a network or API outage), so the pool driver has "
+    "resumed this session. Nothing was cancelled and nothing has changed underneath you: this is the "
+    "same session, the same working tree and the same branch. Continue the /resolve-ticket run for "
+    "{url} exactly where you stopped. Do not start the skill again and do not repeat work you have "
+    "already done — pick up from your last step, re-reading state from disk if you need to confirm "
+    "where that was."
+)
+
+# The CLI's own wording for a request that never got an answer, as it ends a `-p` run. Only these:
+# they are the two every kept stream shows (#402 at 32 min, #515 at 44 min, 2026-09-24/25), and each
+# cost a fresh attempt from zero. A safeguard refusal also reads "API Error:", and must NOT match —
+# re-entering it asks the same flagged question again — which is why this is not "API Error" alone.
+API_OUTAGE = re.compile(r"API Error: (?:Can't reach the API server|No response from API)")
+
+
+def api_outage(run: dict) -> bool:
+    """Whether the session ended because the API could not be reached, and nothing else ended it.
+
+    A kill or a pause already decided what this run is; an outage is only the reading of a run that
+    ENDED on its own with an error, and whose last words are the CLI's outage message.
+    """
+    return (not run.get("killed_for") and not run.get("paused_for") and bool(run.get("is_error"))
+            and bool(API_OUTAGE.search(run.get("summary") or "")))
+
+
+# What a `--work` session is told when the window it was stopped by reopens. Addressed to a
+# conversation that was never killed — it has been sitting at the limit notice with everything
+# intact — so it says what changed (the limit lifted) and rules out the one wrong reading: that a
+# message arriving out of nowhere means start again.
+WORK_CONTINUE_PROMPT = (
+    "The claude.ai usage limit that stopped you has reset — continue the /resolve-ticket run "
+    "exactly where you stopped. Nothing was cancelled and nothing has changed underneath you: the "
+    "same session, the same working tree, the same branch and the same slot. Do not start the skill "
+    "again and do not repeat work you have already done; pick up from your last step, re-reading "
+    "state from disk if you need to confirm where that was. (Sent by pool-run, automatically, when "
+    "the window reopened.)"
+)
+
 
 def lesson_files() -> dict[Path, float]:
     if not LESSONS.is_dir():
@@ -2178,7 +2890,7 @@ def lesson_files() -> dict[Path, float]:
 
 
 def record_written(before: dict[Path, float], ticket: str | None = None,
-                   others: set[str] | None = None) -> Path | None:
+                   others: set[str] | None = None, stream: Path | None = None) -> Path | None:
     """The record file this run created or appended to, if any.
 
     The `ticket` and `others` arguments are what make this safe with several runs in flight. A
@@ -2191,6 +2903,14 @@ def record_written(before: dict[Path, float], ticket: str | None = None,
     number is taken first. Failing that — a run may name a record for the lesson rather than the
     ticket — a fresh file is accepted only if it does not carry a CONCURRENT ticket's number, which
     is the case where attributing it here would be attributing it away from its owner.
+
+    An unnumbered fresh file may also be one nobody in the pool wrote: on 2026-09-25 an owner-directed
+    retro edited a 2026-08-26 defect note while #542 and #402 ran, neither run wrote a record, and both
+    driver captures were appended to that note. So the fallback takes a file only if this run's own
+    `stream` names it in a tool call — measured over the ledger, 30 of 30 run-written records are, and
+    the misattributed note is not. Tool calls, not the whole stream: #444 ran `ls -t` over the store,
+    and its OUTPUT named an unnumbered record another run wrote. With no stream to read, only a file
+    the run created.
     """
     after = lesson_files()
     fresh = [p for p, m in after.items() if before.get(p) != m]
@@ -2204,7 +2924,31 @@ def record_written(before: dict[Path, float], ticket: str | None = None,
     for num in sorted(others or ()):
         fresh = [p for p in fresh
                  if not re.search(rf"[-_]{re.escape(num)}(-driver)?$", p.stem)]
+    text = tool_call_text(stream)
+    fresh = [p for p in fresh if (p.name in text if text is not None else p not in before)]
     return sorted(fresh, key=lambda p: after[p])[-1] if fresh else None
+
+
+def tool_call_text(stream: Path | str | None) -> str | None:
+    """The inputs of every tool call the session made, as one string; None if there is no stream."""
+    if not stream:
+        return None
+    try:
+        lines = Path(stream).read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    calls = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") != "assistant":
+            continue
+        for block in (event.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                calls.append(json.dumps(block.get("input")))
+    return "\n".join(calls)
 
 
 # The ledger is one dict and one file, mutated by every worker. Read-modify-write it under this.
@@ -2408,6 +3152,7 @@ def write_ledger(ledger: dict, key: str, entry: dict) -> None:
 # in the list: the ledger's memory of a previous attempt's PR is what stops a second run opening a
 # second PR for one issue.
 RUN_FIELDS = ("duration_s", "turns", "cost_usd", "session_id", "stream", "killed_for",
+              "paused_for", "resume_at", "outage_resumes",
               "slot", "standalone", "worktree", "worktree_release", "record")
 
 
@@ -2454,17 +3199,27 @@ def record_says_aborted(record: Path | None) -> bool:
     deliberate hand-back from a crash, since both leave no PR. And it can only make the driver do
     LESS: the ticket waits for a human instead of being retried. A crashed run that mislabelled itself
     therefore costs an attempt nobody spends, never a wrong PR.
+
+    A file can hold several runs' records, since a later run on the same ticket and date appends to
+    it, so the outcome read is the LAST record's: the last `# ` header immediately followed by an
+    `outcome:` line. Reading the first would retry a second run that aborted after a first converged.
+    A header alone is not enough to anchor on, because a fenced shell comment is one too.
     """
     if not record:
         return False
-    for line in record.read_text().splitlines()[:12]:
+    lines = record.read_text().splitlines()
+    outcomes = [nxt for line, nxt in zip(lines, lines[1:])
+                if line.startswith("# ") and nxt.lower().startswith("outcome:")]
+    if outcomes:
+        return "abort" in outcomes[-1].lower()
+    for line in lines[:12]:
         if line.lower().startswith("outcome:") and "abort" in line.lower():
             return True
     return False
 
 
 def capture_record(slug: str, ticket: str, outcome: str, run: dict, gate: dict, cleared: list[str],
-                   own: Path | None, say) -> Path | None:
+                   own: Path | None, say, *, worktree: Path) -> Path | None:
     """Write, or append to, the run record — but only with what the driver itself observed.
 
     A run that dies cannot write its own record, and the death is exactly the kind of evidence a
@@ -2515,7 +3270,7 @@ def capture_record(slug: str, ticket: str, outcome: str, run: dict, gate: dict, 
         f"outcome: {outcome}\n"
         f"rounds: unknown   cycles: unknown   verifier: unknown\n"
         f"context: not surfaced\n"
-        f"transcript: ~/.claude/projects/<cwd-slug>/{run.get('session_id')}.jsonl\n\n"
+        f"transcript: ~/.claude/projects/{project_dir_name(worktree)}/{run.get('session_id')}.jsonl\n\n"
         "**This record was written by the pool driver, not by the run.** The run ended without "
         "writing one, so the four sections a retro reads for signal — refuted by measurement, raised "
         "by a fresh agent, where a skill blocked the run, declined — are ABSENT rather than empty: "
@@ -2607,6 +3362,36 @@ def work_ticket(job: dict, slot: Slot, cfg: dict, ledger: dict, say_all: Say,
         run = Session(prompt, wt, cfg, stem,
                       cfg["ticket"]["timeout_seconds"], cfg["ticket"]["quiet_seconds"], say,
                       env=slot.env(), resume=resume.get("session_id")).run()
+        # An outage is the middle of an attempt, like a pause, but one nobody has to come back for:
+        # the session is re-entered here, in the same tree, under the same id. Every resume shares
+        # the one ticket timeout, and the run below is the sum of them, so the ledger reads the
+        # attempt and not its last leg.
+        outages, total = 0, dict(run)
+        while (api_outage(run) and outages < cfg["ticket"].get("outage_resumes", 0)
+               and (left := cfg["ticket"]["timeout_seconds"] - total["seconds"]) > 60):
+            outages += 1
+            wait = cfg["ticket"].get("outage_wait_seconds", 0) * 2 ** (outages - 1)
+            say(f"! the API could not be reached ({run['summary'].strip()[:120]}). Re-entering "
+                f"session {run['session_id']} in {hms(wait)} — outage resume {outages} of "
+                f"{cfg['ticket']['outage_resumes']}, no attempt spent")
+            until = now() + wait
+            # A pause asked for during the wait takes the pause's route: the session is exactly as
+            # resumable as it would have been had the watchdog stopped it.
+            while now() < until and not pause_requested():
+                time.sleep(min(5, max(0, until - now())))
+            if pause_requested():
+                total["paused_for"] = "the operator asked for a pause"
+                break
+            stem = LOGS / safe_component(
+                f"{utc_stamp()}-{key.replace('/', '_').replace('#', '-')}")
+            run = Session(OUTAGE_PROMPT.format(url=job["url"]), wt, cfg, stem, left,
+                          cfg["ticket"]["quiet_seconds"], say, env=slot.env(),
+                          resume=run["session_id"]).run()
+            costs = [c for c in (total.get("cost_usd"), run.get("cost_usd")) if c is not None]
+            total = {**run, "seconds": total["seconds"] + run["seconds"],
+                     "turns": total["turns"] + run["turns"],
+                     "cost_usd": sum(costs) if costs else None, "outage_resumes": outages}
+        run = total
 
     # A pause is the middle of an attempt, so nothing that closes one out runs: no `gh pr list`, no
     # record (a record counts towards the retro threshold, and this run has not finished to be
@@ -2614,22 +3399,38 @@ def work_ticket(job: dict, slot: Slot, cfg: dict, ledger: dict, say_all: Say,
     # that tree. Asked before `is_error`, because SIGTERM leaves a non-zero exit and every branch
     # below would read it as a death.
     if run.get("paused_for"):
-        write_ledger(ledger, key, {**ledger.get(key, {}), "status": "paused",
+        # A pause the CLOCK can end, told apart from one only a person can. `resume_at` is the
+        # instant the window the CLI named resets, and it is the whole of what lets the driver come
+        # back by itself; an operator's pause carries none, deliberately, because nothing but them
+        # ends it — which is why this reads `paused_for` and not merely "was a limit in force".
+        # `limit_pauses` counts how many times THIS ticket has been suspended this way, and is what
+        # `wait_for_limit_reset` reads to tell a big ticket from a session spinning against a limit.
+        was = ledger.get(key, {})
+        limit = run.get("rate_limit") if run["paused_for"] == LIMIT_WHY else None
+        write_ledger(ledger, key, {**was, "status": "paused",
                                    "session_id": run["session_id"], "worktree": str(wt),
                                    "url": job.get("url"),
                                    "slot": slot.name, "stream": run["jsonl"],
                                    "turns": run["turns"], "duration_s": run["seconds"],
                                    "cost_usd": run.get("cost_usd"),
+                                   "paused_for": run["paused_for"],
+                                   "resume_at": limit["resets_at"] if limit else None,
+                                   "limit_pauses": was.get("limit_pauses", 0) + (1 if limit else 0),
                                    "paused_at": datetime.now(timezone.utc).isoformat(),
                                    "last_run": datetime.now(timezone.utc).isoformat()})
-        say(f"paused: the session is suspended with its transcript intact "
-            f"({hms(run['seconds'])}, {run['turns']} turns) — `pool-run --resume` continues it")
+        if limit:
+            say(f"paused: {LIMIT_WHY} ({hms(run['seconds'])}, {run['turns']} turns). Its "
+                f"{limit['type'] or 'usage'} window resets at {at_clock(limit['resets_at'])} and the "
+                "session is suspended with its transcript intact until then")
+        else:
+            say(f"paused: the session is suspended with its transcript intact "
+                f"({hms(run['seconds'])}, {run['turns']} turns) — `pool-run --resume` continues it")
         return "paused"
 
     # Outcome from evidence, never from the session's own closing prose.
     gate = read_gate_state(wt)
-    pr = pr_for_ticket(open_prs(job["slug"]), ticket, since=started_at)
-    own_record = record_written(before, ticket, siblings)
+    pr, asked = outcome_pr(job["slug"], ticket, gate, started_at, open_prs(job["slug"]))
+    own_record = record_written(before, ticket, siblings, run.get("jsonl"))
 
     if run.get("killed_for"):
         status = "timeout"
@@ -2639,12 +3440,17 @@ def work_ticket(job: dict, slot: Slot, cfg: dict, ledger: dict, say_all: Say,
         status = "draft"
     elif run["is_error"]:
         status = "error"
+    elif not asked:
+        # GitHub could not be asked. That is not an outcome, and calling it `no-pr` charges the
+        # ticket an attempt for the driver's own blind spot.
+        status = "unknown"
     else:
         status = "no-pr"
     if status in ("no-pr", "error") and record_says_aborted(own_record):
         status = "aborted"
     # Ended with an agent still outstanding. Distinct from no-pr because the cause is known and is
-    # not the run's judgement: it yielded, and an unattended run has no next turn to yield into.
+    # not the run's judgement: it yielded, and a `claude -p` process stops an agent still running
+    # 600 s after the turn ends, then exits.
     if status == "no-pr" and (gate.get("awaiting") or []):
         status = "died-yielding"
 
@@ -2655,7 +3461,8 @@ def work_ticket(job: dict, slot: Slot, cfg: dict, ledger: dict, say_all: Say,
     if status == "ready" and gate.get("override"):
         flags.append("the run took the labelled override — read its reason in the state entry")
 
-    record = capture_record(job["slug"], ticket, status, run, gate, cleared, own_record, say)
+    record = capture_record(job["slug"], ticket, status, run, gate, cleared, own_record, say,
+                            worktree=wt)
     for f in flags:
         say(f"! {f}")
 
@@ -2676,6 +3483,12 @@ def work_ticket(job: dict, slot: Slot, cfg: dict, ledger: dict, say_all: Say,
         **entry,
         "status": status,
         "attempts": entry.get("attempts", 0) + 1,
+        # The pause is over, however it ended. `write_ledger` keeps a field the caller SAW and did
+        # not drop, and this caller spreads its whole previous entry — so without these two a
+        # finished ticket keeps saying it is waiting for a window to reset. `limit_pauses` is not
+        # cleared: like `attempts`, it counts the ticket's history and not this run.
+        "paused_for": None,
+        "resume_at": None,
         "pr": pr["number"] if pr else None,
         "pr_url": pr.get("url") if pr else None,
         "last_run": datetime.now(timezone.utc).isoformat(),
@@ -2694,6 +3507,9 @@ def work_ticket(job: dict, slot: Slot, cfg: dict, ledger: dict, say_all: Say,
         "worktree_release": released,
         "flags": flags,
         "killed_for": run.get("killed_for"),
+        # How many API outages this attempt rode out in place; 0 when none. `stream` above is the
+        # last leg's, and each earlier leg's .jsonl sits beside it in the logs under the same key.
+        "outage_resumes": run.get("outage_resumes", 0),
     })
 
     verdict = {"ready": f"PR #{pr['number'] if pr else '?'} marked ready for review",
@@ -2702,8 +3518,12 @@ def work_ticket(job: dict, slot: Slot, cfg: dict, ledger: dict, say_all: Say,
                "timeout": f"killed — {run.get('killed_for')}",
                "error": "the session errored and opened no PR",
                "no-pr": "ended with no PR — read the run's own report in the stream",
-               "died-yielding": ("ended while still awaiting a background agent — it yielded, and an "
-                                 "unattended run has no next turn; see the gate entry's awaiting list"),
+               "unknown": ("outcome UNKNOWN — GitHub could not be asked whether a PR exists, so "
+                           "nothing here says whether the run delivered. Read the stream and set "
+                           "the ledger row by hand"),
+               "died-yielding": ("ended while still awaiting a background agent — it yielded, and a "
+                                 "headless run stops an agent still running 600 s after the turn "
+                                 "ends; see the gate entry's awaiting list"),
                "aborted": "the run aborted and handed back — it will not be retried"}[status]
     say(f"{status}: {verdict}  ({hms(run['seconds'])}, {run['turns']} turns"
         + (f", ${run['cost_usd']:.2f}" if run.get("cost_usd") else "") + ")")
@@ -2815,7 +3635,7 @@ def record_work_outcome(cfg: dict, ledger: dict, key: str, slug: str, ticket: st
     """
     gate = read_gate_state(claim["worktree"])
     try:
-        pr = pr_for_ticket(open_prs(slug), ticket, since=started_at)
+        pr, _asked = outcome_pr(slug, ticket, gate, started_at, open_prs(slug))
     except Exception:
         pr = None
     if pr and not pr.get("isDraft"):
@@ -2986,6 +3806,13 @@ def run_retro(cfg: dict, say: Say, force: bool) -> dict | None:
     problems = []
     if run.get("killed_for"):
         problems.append(f"killed — {run['killed_for']}")
+    if run.get("rate_limit") and run.get("is_error"):
+        # A retro is not suspendable (see `Session.suspend_for_limit`), so a limit ends it — and
+        # every other line below would then report it as "no commit landed", which is true and is
+        # not the reason. Nothing is lost: its records stay un-retroed and the next retro reads them.
+        problems.append(f"the claude.ai usage limit ended it — the "
+                        f"{run['rate_limit']['type'] or 'usage'} window resets at "
+                        f"{at_clock(run['rate_limit']['resets_at'])}. Its records stay un-retroed.")
     if after_head == before_head:
         problems.append("no commit landed in the source repo. The skill commits even when it "
                         "applies nothing, because the records and the parked counts are its output")
@@ -2996,6 +3823,7 @@ def run_retro(cfg: dict, say: Say, force: bool) -> dict | None:
     if ahead and "ahead" in ahead[0]:
         problems.append(f"the commit was not pushed ({ahead[0].strip()})")
     problems += parity_problems(cfg)
+    problems += lint_problems(src, before_head)
 
     say(f"    retro finished in {hms(run['seconds'])}, {run['turns']} turns"
         + (f", ${run['cost_usd']:.2f}" if run.get("cost_usd") else ""))
@@ -3004,7 +3832,8 @@ def run_retro(cfg: dict, say: Say, force: bool) -> dict | None:
     for p in problems:
         say(f"    ! {p}")
     if not problems:
-        say("    verified: committed, pushed, LAST advanced, live copies and the mirror identical.")
+        say("    verified: committed, pushed, LAST advanced, live copies and the mirror identical, "
+            "and every skill file on its budget with each raise recorded.")
     # Set by this retro and no earlier one — an invocation whose retros were already off returned
     # above. The rest of the pool is now being worked without learning, which is the failure this
     # whole pipeline is arranged to prevent, and it is not a line to find afterwards in a log.
@@ -3220,6 +4049,12 @@ def cmd_status(cfg: dict, say: Say) -> int:
             # session gone. Scoped to `--work` rows because a DRIVER takes no lease at all, and
             # annotating its live tickets with "no live session holds it" would be simply false.
             note = f"  ← no live session holds it{running_for}"
+        elif e.get("status") in SUSPENDED and isinstance(e.get("resume_at"), int):
+            # The one row `--resume` is not the answer to: the driver comes back to it on its own,
+            # unless it died in the wait — which is what the reset time in the past reads as.
+            note = (f"  ← {e.get('paused_for') or 'paused'}; resets at "
+                    f"{at_clock(e['resume_at'])}"
+                    + (" (already past — nothing picked it up)" if e["resume_at"] < now() else ""))
         else:
             note = ""
         say(f"{key:52s} {e.get('status','?'):13s} attempts={e.get('attempts',0)} "
@@ -3762,16 +4597,42 @@ def main() -> int:
             say(f"paused: {len(suspended)} ticket(s) suspended mid-run, {len(remaining)} not "
                 "started. `pool-run --resume` continues from here.")
 
+        def hand_back(left: list[list[dict]], suspended_now: list[dict] | None = None) -> None:
+            """Pause, splitting what is LEFT by what each job is rather than by where it sat.
+
+            The front of the queue can hold a wave that was suspended and re-entered, which the
+            un-started queue must never receive: `resume_jobs` puts suspended tickets first, and one
+            written into the other list would have the next resume work it from scratch, abandoning
+            the very session the pause was taken to keep. That is `write_pause_plan`'s own rule; it
+            reaches here because waiting out a reset is what first put such a job back on the queue.
+            """
+            held = [j for w in left for j in w]
+            pause_here([j for j in held if not j.get("resume")],
+                       (suspended_now or []) + [j for j in held if j.get("resume")])
+
         results = []
-        for i, wave in enumerate(waves, 1):
+        # Consumed from the FRONT rather than iterated, because a wave the usage limit suspended goes
+        # back on it: those tickets are mid-attempt with their sessions open, and what re-enters them
+        # is another wave. The denominator moves with it, and truthfully — a run that waited out a
+        # reset really does have one more wave to work than it did when it started.
+        waves_left, done = list(waves), 0
+        while waves_left:
             if stopping["flag"]:
-                say("stopping as asked; the rest of the queue is untouched.")
+                # "Untouched" is true of an un-started queue and false of a suspended session, which
+                # holds a worktree and a transcript. Stopping over one without a plan would leave it
+                # for `--resume` to find in the ledger alone, which works and reads as a crash.
+                if any(j.get("resume") for w in waves_left for j in w):
+                    hand_back(waves_left)
+                else:
+                    say("stopping as asked; the rest of the queue is untouched.")
                 break
             if pause_requested():
-                pause_here([j for w in waves[i - 1:] for j in w], [])
+                hand_back(waves_left)
                 break
+            wave, done = waves_left.pop(0), done + 1
             say("")
-            say(f"[wave {i}/{len(waves)}]" if workers > 1 else f"[{i}/{len(waves)}]")
+            total = done + len(waves_left)
+            say(f"[wave {done}/{total}]" if workers > 1 else f"[{done}/{total}]")
             outcome = run_wave(wave, slots, cfg, ledger, say, bases)
             results += outcome
             # Two ways a wave can end in a pause, and the plan is the same either way: its own
@@ -3780,8 +4641,27 @@ def main() -> int:
             # wave of a queue can pause too — otherwise `--pause` during it is silently ignored and
             # the pool reports itself finished.
             suspended = [j for j in wave if dict(outcome).get(j["key"]) == "paused"]
+            if suspended and not pause_requested() and not stopping["flag"]:
+                # A pause with a clock on it. The window resets at an instant the CLI reported and
+                # nothing is waiting on a decision, so the driver waits rather than ending the
+                # invocation — which is what it used to do, leaving the box idle for the rest of the
+                # window and the tickets for whenever somebody next looked at the terminal.
+                again = wait_for_limit_reset(
+                    suspended, load_json(LEDGER, {}), cfg, say,
+                    lambda: stopping["flag"] or pause_requested() is not None)
+                if again:
+                    # The attempt is not over, so its `paused` is not an outcome: the summary counts
+                    # outcomes, and a ticket that paused and then finished must appear once.
+                    resumed = {j["key"] for j in again}
+                    results = [(k, st) for k, st in results
+                               if not (st == "paused" and k in resumed)]
+                    waves_left.insert(0, again)
+                    # And the retro barrier is not crossed on the way: it rewrites the skills a run
+                    # reads, and this one is coming back to finish a ticket that started under the
+                    # ones it has.
+                    continue
             if suspended or pause_requested():
-                pause_here([j for w in waves[i:] for j in w], suspended)
+                hand_back(waves_left, suspended)
                 break
             # The barrier. `skill-retro` rewrites the skills that a run reads, so it runs only when
             # nothing is in flight — which a wave boundary is and a rolling pool never is.

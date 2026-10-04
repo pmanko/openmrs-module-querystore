@@ -1,42 +1,75 @@
 #!/bin/bash
 # Stop-hook gate for the `harden` skill's termination contract.
 #
-# The contract: /harden is complete only when one cycle produces ZERO edits — a full Phase 1 +
-# Phase 2, or the documentation pass the skill's classification rule allows in its place.
-# The skill states that four times and it still got broken, because nothing outside the model
-# enforced it. This does.
+# The contract: /harden is complete when PHASE 1 HAS CONVERGED and the single Phase 2 pass that
+# follows it has run without escalating. It used to be "one cycle produces ZERO edits", and that is
+# what this hook enforced for a month of runs that each took hours: an edit count cannot tell a
+# polish edit from a substantive one, so a gate keyed on it re-opens the loop on the loop's own
+# output, and the confirming work was multiplicative across three nested convergence loops (pass,
+# phase, cycle). Not that polish ALWAYS edits -- #298 converged on a cycle whose measured zero
+# covers Phase 2 as well, so that universal is false and a fresh reviewer said so. Phase 1's gate is the one that was
+# already severity-aware — "a pass that itself found a substantive (non-cosmetic) issue cannot be the
+# last pass" — so the run's condition is now keyed on it. A cycle cap was refused twice, and a
+# prose-provenance signal at least twice, both on the walk-forward that a cap ends a converged run
+# as did-not-converge; this changes what RE-OPENS the loop, never what counts as having finished.
 #
-# Contract with the skill: at the end of every cycle it writes an entry to the state file below,
-# keyed by the repo it is hardening:
+# Contract with the skill: at the close of every Phase 1 pass, and again when Phase 2 finishes, it
+# writes an entry to the state file below, keyed by the repo it is hardening:
 #
-#   { "/abs/path/to/repo": { "cycle": 4, "edits": 3, "ts": 1755400000, "override": false,
+#   { "/abs/path/to/repo": { "cycle": 1, "phase1": "converged", "phase2": "done", "edits": 3,
+#                            "ts": 1755400000, "override": false, "owner": 10560, "head": "1ec8735a",
 #                            "awaiting": [ { "agent": "phase2 quality", "since": 1755400000 } ] } }
+#
+# `owner` and `unattended` are read below and `head` is the helper's; the example carries the two it
+# reads that a reader would not otherwise expect.
+#
+# `edits` is still written and still reported, and it no longer gates anything. It was never an
+# artifact claim — a zero-edit cycle licenses "this process has stopped producing", not "complete" —
+# so it stays as the measured fact the report owes and gives up the job it was bad at.
 #
 # `awaiting` is what lets a cycle wait for its own subagents. Phase 2 spawns them, so a cycle is
 # routinely blocked on one with nothing to do but yield — and without this field the gate refuses that
 # yield, making a cycle waiting correctly indistinguishable from one that quit. Measured: a Phase 2
 # pass blocked on a background agent tripped this hook on every yield and had to burn in-turn sleep
 # loops to stay alive. A non-empty, fresh `awaiting` therefore allows the stop; the harness re-invokes
-#
-# THAT HOLDS ONLY FOR AN ATTENDED SESSION. A `claude -p` process exits when its turn ends, so nothing
-# re-invokes it and the yield IS the death — measured 2026-08-26 on issue #310, which ended in Phase 2
-# pass 3 at 1365 turns and $76.72 with committed work, no PR and ten orphaned worktrees. The allow is
-# therefore scoped to attended sessions; see the marker check below.
 # the session when the agent completes, so yielding mid-await is how the cycle proceeds, not how it
 # ends. The obligation is to CLEAR the field on any terminal outcome, so the allow is bounded by
 # AWAIT_TTL and an agent that has not returned inside it counts as dead rather than outstanding.
+#
+# THAT HOLDS IN FULL ONLY FOR AN ATTENDED SESSION. When a `claude -p` turn ends, the process stops a
+# background agent still running 600 s later and exits without re-invoking anyone (pr-harden's State
+# section carries the measurement). Issue #310 ended so on 2026-08-26, in Phase 2 pass 3 at 1365
+# turns and $76.72 with committed work, no PR and ten orphaned worktrees. The allow is therefore
+# scoped to attended sessions; see the marker check below.
 # Same field, same semantics as pr-harden-gate.sh, which solved this first.
 #
-# edits > 0        -> another cycle is required; this hook blocks the turn from ending.
-# edits == 0       -> converged; allow.
-# override == true -> the skill took the labelled override; allow (the deviation is on the record).
-# no entry         -> no harden run in flight here; allow.
+# run stamped, no phase1 -> a run is in flight and has stated no verdict. Block.
+# phase1 == open        -> another Phase 1 pass is required; this hook blocks the turn from ending.
+# phase1 == converged
+#   and phase2 == pending -> the one Phase 2 pass has not run yet. Block.
+#   and phase2 == done    -> converged; allow.
+#
+# There is no third `phase2` value for an escalation, and the first draft's was deleted rather than
+# repaired. `escalated` was sticky: `--phase1 converged` did not clear it and this file tested it
+# BEFORE `phase1`, so a run whose Phase 2 escalated and whose next Phase 1 pass then converged was
+# handed back the instruction it had just obeyed, every turn, until the six-hour expiry. An
+# escalation resumes Phase 1, which is `phase1: open`, which already blocks -- and `gate-state`
+# resets `phase2` to `pending` on every `phase1` write, so the Phase 2 owed after that convergence
+# cannot be satisfied by the one that escalated.
+# no run AND no phase1  -> an entry from before this contract: the old `edits > 0` rule still
+#                          applies, so a run already in flight is not silently disarmed mid-run.
+# override == true      -> the skill took the labelled override; allow (the deviation is on the record).
+# no entry              -> no harden run in flight here; allow.
 #
 # FAIL OPEN, ALWAYS. A gate that wedges every future turn in every repo is far worse than one that
 # occasionally lets an early stop through, so every ambiguous case allows the stop: no state file,
-# unreadable or malformed JSON, no jq, no entry for this directory, a missing or unparseable edits
-# count, or an entry older than STALE_AFTER (a run that was abandoned, crashed, or /clear-ed). Only an
-# entry that is present, fresh, parseable and explicitly says edits > 0 blocks.
+# unreadable or malformed JSON, no jq, no entry for this directory, an entry that is not an object,
+# a `ts` that is present but not a number, an `awaiting` that is not a list of objects, an
+# unrecognised `phase1`, a missing or unparseable edits count on a legacy entry, or an entry older
+# than STALE_AFTER (a run that was abandoned, crashed, or /clear-ed). An entry that is present, fresh and parseable, and that does
+# not say Phase 1 converged with its Phase 2 done, blocks. An unrecognised `phase2` is deliberately
+# NOT in the list above: only `done` ends a run and that is decidable without interpreting the value,
+# so a stop is not licensed by a word this reader has never heard of.
 
 set -uo pipefail
 
@@ -152,7 +185,7 @@ case "$OWNER_PID" in
         1) allow ;;   # a LIVE session that is not this one owns this entry
       esac            # 0 = ours, 2 = cannot tell: fall through and hold us to the contract
     else
-      allow           # the owning session is gone; nobody here can advance its run
+      allow           # the owning session is gone
     fi
     ;;
 esac
@@ -161,8 +194,9 @@ esac
 # Fail open on anything unparseable, like every other check here.
 AWAITING=$(jq -r '[(.awaiting // [])[] | (.since // 0)] | length' <<<"$ENTRY" 2>/dev/null) || allow
 case "$AWAITING" in ''|*[!0-9]*) AWAITING=0 ;; esac
-# An UNATTENDED run has no next turn: `claude -p` exits when the turn ends, so for it a yield
-# mid-await is not how the cycle proceeds but how the run dies, silently. The authoritative signal is
+# An UNATTENDED run's process stops a background agent still running 600 s after the turn ends,
+# then exits, so for it a yield mid-await is how the run dies whenever the agent outlasts that,
+# silently. The authoritative signal is
 # a pid-stamped marker the pool driver holds for the life of the run — not a field in this entry,
 # which the skill rewrites and would silently drop. A stale marker whose owner is gone must not make
 # an interactive session unattended, so the pid is checked for liveness. Absent or unparseable, this
@@ -203,35 +237,119 @@ if [ "$AWAITING" -gt 0 ]; then
     jq -n --arg a "$AGENTS" '{
       decision: "block",
       reason: ("This run is UNATTENDED and you ended your turn with a background agent outstanding: "
-        + $a + ". An unattended run has no next turn — the process exits when the turn ends, so "
-        + "yielding mid-await does not continue the cycle, it ends the run with the work unfinished. "
+        + $a + ". In an unattended run the process stops an agent still running 600 s after the "
+        + "turn ends and then exits, so yielding mid-await ends the run whenever the agent outlasts "
+        + "that, with the work unfinished, and nothing at the yield says which case this is. "
         + "Collect that agent IN THIS TURN, clear the awaiting entry in "
         + "~/.claude/harden-state.json, and finish the cycle. Do NOT hand back to the user, do NOT "
         + "report progress as if finished, and do NOT ask whether to continue; if you are stopping "
         + "deliberately, take the labelled override so the deviation is on the record."),
       systemMessage: ("unattended harden cycle yielded with agents outstanding (" + $a
-        + ") — there is no next turn; collect them in-turn")
+        + ") — past 600 s the run exits with them; collect them in-turn")
     }'
     exit 0
   fi
 fi
 
-EDITS=$(jq -r '.edits // empty' <<<"$ENTRY" 2>/dev/null) || allow
-case "$EDITS" in ''|*[!0-9]*) allow ;; esac
-[ "$EDITS" -gt 0 ] || allow
+# Resolve the cycle ONCE, here, and never let jq arithmetic near it. Two defects came out of that:
+# `(($c|tonumber?) + 1 | tostring)` on a non-numeric cycle yields jq `empty`, which propagates
+# through the string concatenation and suppresses the WHOLE object -- so the hook printed nothing
+# and the harness read the silence as ALLOW on an entry that had to block. And the first repair,
+# omitting `--cycle` from the emitted command when there was no number, swapped an unparseable
+# argument for a missing one, because `--cycle` is `required=True`. An entry with no cycle is a run
+# that has recorded none, so 1 is the number, and the command is runnable either way.
+CYCLE=$(jq -r '.cycle // empty' <<<"$ENTRY" 2>/dev/null)
+case "$CYCLE" in ''|*[!0-9]*) CYCLE=1 ;; esac
+NEXT=$((CYCLE + 1))
 
-CYCLE=$(jq -r '.cycle // "?"' <<<"$ENTRY" 2>/dev/null)
+# THE TERMINATION PREDICATE.
+#
+# A LEGACY entry keeps the zero-edit rule it was written under: no `run` id AND no verdict, which
+# is what a /harden older than this contract left. That run is mid-flight and cannot re-report
+# itself in the new shape, and of the two directions to be wrong in, dropping a live run's gate is
+# the one that costs it its outstanding findings.
+#
+# BOTH halves of that condition are load-bearing, and each was wrong on its own.
+#   Chosen by the absence of `phase1` alone, it was wrong in the ALLOW direction: a current run
+#   whose first write states no verdict — a bare `harden-set` measuring the count — landed in a
+#   contract it was not written for, and at `edits: 0`, the ordinary reading on a clean tree before
+#   anything is committed, the zero-edit rule allows.
+#   Chosen by the absence of `run` alone, it is wrong the other way: entries written by 0.34.0
+#   through 0.36.0 carry a real verdict and no run id, and judging those on an edit count throws
+#   the verdict away.
+# So: a run that has stamped this entry is never legacy, and a verdict is honoured wherever it
+# came from. A run that has stamped the entry and stated no verdict owes one.
+RUN=$(jq -r '.run // empty' <<<"$ENTRY" 2>/dev/null) || allow
+PHASE1=$(jq -r '.phase1 // empty' <<<"$ENTRY" 2>/dev/null) || allow
+if [ -z "$RUN" ] && [ -z "$PHASE1" ]; then
+  EDITS=$(jq -r '.edits // empty' <<<"$ENTRY" 2>/dev/null) || allow
+  case "$EDITS" in ''|*[!0-9]*) allow ;; esac
+  [ "$EDITS" -gt 0 ] || allow
+  jq -n --arg c "$CYCLE" --arg n "$NEXT" --arg e "$EDITS" '{
+    decision: "block",
+    reason: ("harden termination contract (legacy entry, zero-edit rule): cycle " + $c + " made "
+      + $e + " edit(s), so it was not the last cycle. Run cycle "
+      + $n + " — Phase 1 then Phase 2. This entry predates the run-id contract, so do NOT try to "
+      + "drive its edit count to zero: `gate-state` refuses a write with no --run, and a write WITH "
+      + "one replaces the entry, which is what you want. Record your verdict the ordinary way, "
+      + "`gate-state --owner $PPID --run <this run'"'"'s id> harden-set --cycle " + $n
+      + " --phase1 <open|converged> [--phase2 done] --count-edits`. Do NOT hand back to the user "
+      + "and do NOT ask whether to continue; if you are deliberately stopping early, take the "
+      + "labelled override in the skill'"'"'s Termination section and record it with that same "
+      + "command plus --override --reason, never by editing the state file, which is shared with "
+      + "every live session and only `gate-state` serialises."),
+    systemMessage: ("harden: cycle " + $c + " made " + $e + " edit(s) — another cycle is required")
+  }'
+  exit 0
+fi
 
-# Present, fresh, and edits were made: the contract requires another cycle. `decision: block` on a
-# Stop hook feeds the reason back and keeps the turn going rather than ending it.
-jq -n --arg c "$CYCLE" --arg e "$EDITS" '{
+# A run that has written here without stating a verdict owes one. This is not an ambiguity: the
+# entry says a run is in flight and says nothing about a pass having converged.
+if [ -z "$PHASE1" ]; then
+  WHAT="this run has recorded no Phase 1 verdict, and a run that has written to its gate entry "\
+"without reporting a pass owes one"
+  DO="Run a Phase 1 pass and record its verdict"
+else
+  # An unrecognised `phase1` IS an ambiguity -- `open` and `converged` are opposite answers and this
+  # reader cannot pick -- so it allows, like every other ambiguity here.
+  case "$PHASE1" in open|converged) ;; *) allow ;; esac
+fi
+
+# An unrecognised `phase2` is NOT one, and treating it as one was a live hole. The check used to sit
+# here, before the `phase1` test, so any value this reader did not know disarmed an unambiguous
+# `phase1: open` -- and `escalated` is exactly such a value, written by the 0.34.0 that shipped
+# hours before this, so the entry exists on disk rather than in theory. An upgrade mid-run would
+# have let a run that escalated stop with Phase 1 open, which is the harm the LEGACY branch exists
+# to prevent for older entries. Nothing needs interpreting: only `done` licenses a stop, and
+# "is this `done`?" is decidable whatever else the value might be.
+PHASE2=$(jq -r '.phase2 // "pending"' <<<"$ENTRY" 2>/dev/null) || allow
+
+# Phase 1 converged and the one Phase 2 pass that follows it has run: the run is complete.
+[ "$PHASE1" = "converged" ] && [ "$PHASE2" = "done" ] && allow
+
+if [ -n "${WHAT:-}" ]; then
+  :                       # the no-verdict case above already said what is owed
+elif [ "$PHASE1" = "open" ]; then
+  WHAT="Phase 1 has not converged: the last pass found a substantive (non-cosmetic) issue, and a "\
+"pass that found one cannot be the last pass"
+  DO="Run another Phase 1 pass and record its verdict with --phase1 open|converged"
+else
+  WHAT="Phase 1 has converged and the one Phase 2 pass that follows it has not run"
+  DO="Run Phase 2 once. If it found only polish, record --phase1 converged --phase2 done; if it "\
+"turned up something SUBSTANTIVE it escalates, which resumes Phase 1, so record --phase1 open"
+fi
+
+# `decision: block` on a Stop hook feeds the reason back and keeps the turn going rather than
+# ending it.
+jq -n --arg c "$CYCLE" --arg w "$WHAT" --arg d "$DO" '{
   decision: "block",
-  reason: ("harden termination contract: cycle " + $c + " made " + $e + " edit(s), so it was not the "
-    + "last cycle. Run cycle " + (($c|tonumber?) + 1 | tostring) + " — Phase 1 then Phase 2 — and "
-    + "record its measured edit count. Do NOT hand back to the user and do NOT ask whether to "
-    + "continue; if you are deliberately stopping early, take the labelled override in the skill'"'"'s "
-    + "Termination section and set override:true in ~/.claude/harden-state.json so the deviation is "
-    + "on the record."),
-  systemMessage: ("harden: cycle " + $c + " made " + $e + " edit(s) — another cycle is required")
+  reason: ("harden termination contract: " + $w + ". " + $d + ", via `gate-state --owner $PPID "
+    + "--run <this run'"'"'s id> harden-set --cycle " + $c
+    + " --phase1 <open|converged> [--phase2 done] "
+    + "--count-edits`. Do NOT hand back to the user and do NOT ask whether to continue; if you are "
+    + "deliberately stopping early, take the labelled override in the skill'"'"'s Termination "
+    + "section and record it with that same command plus --override --reason, never by editing the "
+    + "state file, which is shared with every live session and only `gate-state` serialises."),
+  systemMessage: ("harden: " + $w)
 }'
 exit 0

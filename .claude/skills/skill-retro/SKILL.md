@@ -2,7 +2,7 @@
 name: skill-retro
 description: Turn the run records the pipeline skills leave behind into skill improvements — read the accumulated evidence, propose edits only where a lesson is corroborated, have every proposal refuted by a fresh agent, prune as much as you add, then version-bump and push. Also runs the mechanical self-contradiction linter over the skill files. Use when asked to improve the skills from what recent runs learned, or on a cadence. Trigger phrases include "improve the skills", "run the retro", "what did the last runs teach us", "skill-retro".
 argument-hint: "[--since <date>] [--lint-only] [--dry-run]"
-version: 0.2.3
+version: 0.5.0
 ---
 
 # Skill retro — evidence in, governance change out
@@ -29,12 +29,22 @@ So: capture is automatic and belongs to the pipeline skills. Derivation and comm
 
 ## Step 1 — Read the evidence
 
-Records live in `~/.claude/skill-lessons/*.md`, one per finished run, written by the skill that ran
+Records live in `~/.claude/skill-lessons/*.md`, one per finished run, or several where a later run on
+the same ticket and date appended to it, each opening with its own `# ` header — a file newer than
+`LAST` can carry records an earlier window already counted, so count only the records `REJECTED.md`
+does not already name. Each is written by the skill that ran
 — or, for a run that ended without writing one, by the `ticket-pool` driver, which marks its own file
 as driver capture and says which sections nobody observed. Read those as evidence that a run ended
-that way, and corroborate nothing else from them.
+that way, and corroborate nothing else from them. **The store also holds measurement notes, defect
+notes and hand-written captures, so a file count is not a run count** — read each file's own header
+for what it is and for which skill, if any, wrote it. A `/harden` invoked on its own writes none.
 Read every record since the last retro (the last one is recorded in `~/.claude/skill-lessons/LAST`,
-if present; `--since <date>` overrides). Say how many records you read and which runs they cover — a
+if present; `--since <date>` overrides). **Step 6's comparison is owed BEFORE this read, not only
+after the push** — this step depends on the store being in sync and Step 6 is where that is checked,
+so a pass that reads first reads a store nothing has verified. Measured 2026-09-20: `origin/main`
+held three 2026-09-17 files this machine did not, two of them notes about the very window being read
+and one a proposal marked as never refuted. Bring anything missing down before reading.
+Say how many records you read and which runs they cover — a
 retro over one record is a retro that cannot corroborate anything, and should say so rather than
 proceed as if it could.
 
@@ -47,7 +57,12 @@ declined and why; and the rounds or cycles each cost.
 
 `python3 <this dir>/skill-lint.py [roots…]` — defaults to `~/.claude/skills`. It checks only what a
 script can decide: a count stated over a list of a different length, a state field documented but read
-by no gate script, missing frontmatter. Exit 1 if it reports anything.
+by no gate script, missing frontmatter, and a SKILL.md, or a role file beside one (any other top-level
+`*.md` but `evidence.md`), whose word count differs from its budget in
+`<this dir>/skill-budgets.json`, or that has none. Exit 1 if it reports anything, 2 if it found no
+skill to check. With `--against <ref>`, run from the source repo, it also fails a budget that rose since
+`<ref>` with no matching entry in that table's `raises` — `{"from", "to", "why"}` — and `pool-run`
+runs it that way after every retro, against the head the retro started from.
 
 **What it does not check is the interesting half, and do not let its green fool you.** A skill
 contradicting itself in SUBSTANCE — `harden` Phase 2 mandating four *parallel* agents while every
@@ -79,11 +94,21 @@ case arose — say that, rather than inventing the mechanism the reader expects.
 ## Step 4 — Prune as much as you add
 
 For every proposed addition, answer in the report: **which existing rule does this subsume, retire or
-render stale?** Net line growth needs a sentence justifying it. And:
+render stale?** Net growth needs a sentence justifying it, and Step 2's linter holds each SKILL.md and role file to
+its word count in `skill-budgets.json`: pay for growth with a prune in the same pass, or raise that
+file's budget in the same commit, with the sentence as the `why` of a `raises` entry naming the
+exact rise (a new file's budget rises from 0), and put it in the report too; a file you prune has its
+budget lowered in the same commit. And:
 
 - **Never delete a measured rule without recording the measurement that retires it.** These skills
   are full of rules whose whole value is the measurement behind them; a rule deleted silently is a
   measurement thrown away, and the next run re-learns it the expensive way.
+- **A skill with an `evidence.md` keeps what its rules rest on there, not in SKILL.md.** A new rule
+  goes into SKILL.md, or into the role file of the agent that acts on it, as a run needs it; its incidents, dates and measurements go into evidence.md
+  under the same heading, quoting the rule and naming the version that added the entry, and so does
+  the measurement that retires one. A passage
+  moved there stays on the record, so moving it is not a deletion under *Never delete a measured
+  rule*.
 - **Prefer deleting an unsupported clause to rewording it.** Measured across three cycles of run
   seven: every correction that replaced a false claim with a better-sounding one introduced a new
   false claim. The recurrence stopped at deletion.
@@ -94,7 +119,8 @@ render stale?** Net line growth needs a sentence justifying it. And:
 
 One subagent, read-only, **never `subagent_type: "fork"`** — a fork inherits the reasoning that
 produced the proposals, which is the one thing this step is for. Give it the proposals, the run
-records they rest on, and the current skill text. Do not give it your argument for why they are right.
+records they rest on, and the current skill text, with its role files and evidence.md where it has them. Do not give
+it your argument for why they are right.
 
 It answers, per proposal: does the record actually say this? Is the corroboration bar really met, or
 is one sighting being counted twice because two records describe one event? Does the proposal
@@ -112,24 +138,36 @@ added late.
 Apply the surviving proposals. Then, per skill touched:
 
 - bump `version:` in the frontmatter — minor for a new rule, patch for a correction;
-- re-run the linter and leave it at zero for the files you touched;
-- copy the skill into the source repo's `.claude/skills/` (this pipeline's source is
-  `openmrs-module-querystore`; `git remote -v` in that checkout is the authority) and verify with
-  `cmp` that the live copy and the repo copy are byte-identical, **including any `*gate*.sh`** — the
-  registered hooks under `~/.claude/hooks/` are SEPARATE copies, so a skill push alone leaves the gate
-  running old logic;
+- re-run the linter with `--against origin/main` and leave it at zero for the files you touched;
+- copy the skill into any clean checkout of `openmrs/openmrs-module-querystore` — which checkout does
+  not matter, since every commit is pushed — and verify with `cmp`, AFTER the push below, that the
+  live copy and the PUSHED copy are byte-identical, **including any `*gate*.sh`, any
+  `evidence.md` and any role file**, and so is this skill's `skill-budgets.json`, whether or not a budget changed. Read
+  the pushed
+  copy as `git show origin/main:<path>` after a `git fetch`, never off a working tree: a checkout
+  behind `origin/main` reports drift that does not exist, and which checkout is the stale one does
+  not hold still — 2026-09-07 it was the pool's, 2026-09-13 the other. **Fetch immediately before the
+  comparison you report, not once at the top of the step**: on 2026-09-16 another session pushed its
+  own retro between a window's fetch and its all-clear, so that green was measured against a
+  superseded `origin/main` and only a re-fetch showed it. The registered hooks under
+  `~/.claude/hooks/` are SEPARATE copies, so a skill push alone leaves the gate running old logic;
 - **and `cmp` the live SKILL copy of each gate against the live HOOK copy** — `~/.claude/skills/<skill>/
   <gate>.sh` against `~/.claude/hooks/<gate>.sh`. Four copies need THREE equalities to be transitively
   identical and the two below state only two disjoint pairs, so without this one the repo's skill copy
   may drift arbitrarily from the repo's hook copy with every check green. That is the edge that matters:
   each skill's own install line is `cp .claude/skills/<skill>/<gate>.sh ~/.claude/hooks/`, so the
   uncopied one is what becomes the registered gate on the next machine;
-- **and `cmp` `~/.claude/hooks/` against the repo's `.claude/hooks/`, every file, whether or not a skill
+- **and `cmp` `~/.claude/hooks/` against the pushed `.claude/hooks/`, every file, whether or not a skill
   changed.** That directory is what `settings.json` actually runs, so each gate now exists in THREE
   copies (live hook, live skill, repo skill) plus its repo hook copy, and `git-restore-backup.sh` exists
   only there — it is not a skill and matches no `*gate*.sh`, so the clause above never reached it. Added
   2026-08-27, when it was vendored: the first draft of this step's wording created a fourth copy with no
   sync obligation, which is the drift class the whole bullet opens by naming;
+- **and `cmp` `~/.claude/CLAUDE.md` against the pushed `.claude/CLAUDE.md`, whether or not a skill
+  changed.** It is the user-level instruction file every session loads, vendored path-for-path like
+  the skills and hooks, and it matches no clause above — the same fourth-copy drift the bullet above
+  names. Measured 2026-09-15: that path is ALSO loaded as project memory when cwd is this repo,
+  which is why the root `CLAUDE.md` names it;
 - one commit in the repo's own voice — `<skill> <version>[, <skill> <version>]: <lowercase summary>` —
   whose body cites the run records, and which says for each change what corroborated it;
 - push, then write today's date into `~/.claude/skill-lessons/LAST`.
@@ -165,3 +203,5 @@ most likely to skip this step and the one whose evidence is easiest to lose.
   mode these skills document; four false premises died at exactly this gate on run seven.
 - **Don't edit a skill you have not read in this session.** These files carry rules whose reasons are
   measurements; an edit made from the diff alone re-opens something that was closed deliberately.
+  Where it has an evidence.md, read the entry of any rule you change or delete, and update the rule
+  it quotes.

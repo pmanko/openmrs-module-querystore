@@ -47,11 +47,14 @@ mkdir -p "$TMP/.claude"; STATE="$TMP/.claude/pr-harden-state.json"
 run_case "no entry -> allow" allow none
 run_case "reviewed, blocking 0 -> allow" allow \
   "{\"phase\":\"reviewed\",\"blocking\":0,\"pr\":9,\"round\":2,\"ts\":$NOW}"
+# pr-harden step 3's exception: a clean full round's count stays 0 while its fixer runs.
+run_case "fixing, blocking 0 (step 3's exception mid-fix) -> block" block \
+  "{\"phase\":\"fixing\",\"blocking\":0,\"pr\":9,\"round\":2,\"ts\":$NOW}"
 run_case "building, no awaiting -> block" block \
   "{\"phase\":\"building\",\"blocking\":0,\"pr\":null,\"round\":1,\"ts\":$NOW,\"awaiting\":[]}"
 run_case "awaiting fresh, attended -> allow (yield)" allow \
   "{\"phase\":\"building\",\"blocking\":0,\"pr\":null,\"round\":1,\"ts\":$NOW,\"awaiting\":[{\"agent\":\"refute\",\"since\":$NOW}]}"
-run_case "awaiting fresh, UNATTENDED -> block (no next turn)" block \
+run_case "awaiting fresh, UNATTENDED -> block (a yield can end the run)" block \
   "{\"phase\":\"building\",\"blocking\":0,\"pr\":null,\"round\":1,\"ts\":$NOW,\"unattended\":true,\"awaiting\":[{\"agent\":\"refute\",\"since\":$NOW}]}"
 run_case "awaiting STALE, unattended -> block" block \
   "{\"phase\":\"building\",\"blocking\":0,\"pr\":null,\"round\":1,\"ts\":$NOW,\"unattended\":true,\"awaiting\":[{\"agent\":\"refute\",\"since\":$((NOW-7200))}]}"

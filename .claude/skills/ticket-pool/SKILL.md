@@ -2,7 +2,7 @@
 name: ticket-pool
 description: Work a pool of tickets to reviewed pull requests unattended, one fresh session per ticket, with a skill-retro between them so later tickets are worked by improved skills. Use when asked to work a queue or pool of issues rather than a single one, to check what the pipeline has done, or to queue work for it. Trigger phrases include "work the pool", "work through these tickets", "run the pipeline", "what has the pipeline done", "queue this issue for the pipeline".
 argument-hint: "[--once] [--limit N] [--workers N] [--work N] [--claim N] [--release N] [--claims] [--ticket N[,N,…]] [--pause [--now]] [--resume] [--dry-run] [--status] [--retro-now] [--no-retro] [--init]"
-version: 0.18.1
+version: 0.25.0
 ---
 
 # Ticket pool — the loop that learns
@@ -48,7 +48,7 @@ spent its attempt budget. Unlabel an issue to remove it.
 
 An issue with an open PR is **not** this pipeline's work — it is `pr-harden`'s entry point, which is
 what `resolve-ticket` says to do with one. That is also what happens to a ticket whose run ended as a
-`draft`: the next invocation finds the draft PR and hands it to `pr-harden` rather than starting again.
+`draft`: the next invocation finds the draft PR and skips it as `has-open-pr` rather than starting again.
 The PR is recognised from the **ledger's memory of the number** before any matching on titles or
 branches is attempted, because a run that wrote `Refs` on a branch carrying no number leaves a PR that
 no matching can see — and a second run on that ticket would open a second PR for one issue.
@@ -134,56 +134,9 @@ flight and stops at the wave boundary; with it, every session in flight is suspe
 five seconds. Either way it writes `~/.claude/pipeline/paused.json` and `pool-run --resume` carries
 on from there.
 
-**What a suspended ticket keeps.** SIGTERM to the session's process group, and then four things that
-together are the whole feature: its transcript (kept under its own session id, which `--resume`
-re-enters with `claude --resume`), its worktree, its gate state, and its ATTEMPT — a pause is the
-middle of a try, not a failed one, and spending the attempt would let two pauses exhaust
-`ticket.max_attempts` and leave the ticket needing a human. No run record is written either: a record
-counts towards the retro threshold, and this run has not finished to be learned from.
-
-**Resuming continues the conversation; it does not start a second one.** Measured 2026-08-30 outside
-the suite, because the whole feature rests on it: a headless session killed with SIGTERM after 4 of
-12 steps resumed from `--resume <session-id>` and did steps 5–12 only, signing off with a token that
-only the ORIGINAL prompt defined — so the transcript was inherited, not re-derived from the files on
-disk. The driver's half of that is what `pool-test.py`'s `test_pause_now_suspends_and_resumes` pins:
-that the worktree is re-entered rather than recreated (a fresh `make_worktree` would remove the tree
-and cut a new checkout under a session whose whole context is the old one), and that the second start
-carries `--resume <id>` and not `--session-id`.
-
-**A resume re-screens what never started.** A pause is an invitation to come back much later, and
-the un-started tail of the queue was screened when the pause was taken, not now. So `--resume` puts
-it back through `consider` — the same predicate a fresh run uses — which is what stops it opening a
-SECOND PR for a ticket somebody took to one by hand in the meantime. It screens as the PAUSED run
-would have, forced or not, because the operator's `--ticket` decision belongs to the queue and it is
-the same queue. A SUSPENDED ticket is deliberately not re-screened: it is mid-attempt with its
-worktree and session open, and the ledger row it would be judged against is its own.
-
-**The plan is the only place the remaining ORDER survives.** Everything else could be re-derived —
-the label query would find the unworked tickets again — but an operator who typed
-`--ticket 310,297,266` chose that sequence, and which tickets run first decides what evidence the
-retro reads. `--resume` therefore replays the saved queue rather than rebuilding one, and reuses the
-width and retro setting the paused run was using unless this invocation names its own.
-
-**A paused ticket is skipped by a plain `pool-run`**, and told to use `--resume`. Working it would
-open a second session on the same branch while the first is suspended with hours of context in it,
-and nothing would report the loss — a fresh session in a worktree that already holds work looks
-exactly like a run that got a long way. `pool-run --status` names what is paused; `--dry-run
---resume` prints what would be picked up without consuming the plan; `pool-watch <ticket>` shows the
-newest stream for a ticket, which after a resume is the resumed half — the first half is still on
-disk beside it, and the SESSION's own transcript spans both. To abandon a paused ticket instead, name
-it with `--ticket`: that is forced past the skip and says so, naming the session it is abandoning.
-Whether the restart then begins is the worktree's answer, not the pause's — `make_worktree` refuses
-while uncommitted work is in it, printing the `git worktree remove --force` that releases it, and
-removes and recreates it where it is clean. Either way the branch survives, because removing a
-worktree does not delete a ref, and the abandoned transcript stays on disk under its session id.
-
-**The retro is not interruptible, and that is deliberate.** A pause suspends a session only where
-something can resume it, and what carries a suspended session back is its ledger row. The retro has
-no row, so suspending it would end it — losing the work, leaving the source repo mid-checkout for the
-next retro to refuse as dirty, and reporting itself as "no commit landed", which is true and is not
-the reason. The loop will not START one while a pause is outstanding, so what an immediate pause
-meets is a retro already running: it waits for it, then stops at the next wave. A pause the run
-outruns entirely is cleared and said, not left on disk for the next driver.
+The rest of this section is in `pausing.md`, beside this file. Read it before you pause or resume a
+pool, abandon a paused ticket, act on a ticket `--status` shows as paused, or set a `ticket.limit_*`
+key.
 
 **Ctrl-C is unchanged and is not this.** One interrupt still stops after the current wave and leaves
 the queue to be re-derived; a second still kills the sessions outright, spending their attempts. Use
@@ -332,8 +285,9 @@ a deliberate hand-back from a crash, since both leave no PR, and it can only mak
 | `draft` | a PR exists, still a draft: the review loop did not converge. `pr-harden` owns it now |
 | `aborted` | the run hit one of `resolve-ticket`'s six abort conditions and handed back. Not retried |
 | `timeout` | the driver killed the session. The record says which bound it hit |
-| `no-pr` / `error` | it died before opening a PR, and its record did not report an abort |
-| `died-yielding` | it ended with a background agent still outstanding. Not its judgement: it yielded, and an unattended run has no next turn to yield into. Both gates refuse this now, so a fresh sighting means EITHER the marker never reached the gate (check `pipeline/unattended/` for a file whose pid was live) or the run stopped despite being told not to — a block is persuasion, not a lock, and the two have different fixes |
+| `no-pr` / `error` | it died before opening a PR, and its record did not report an abort. GitHub was asked and so was the PR number the run wrote into its own gate entry, so a PR MERGED before the check is no longer invisible here — on 2026-09-13/14 eight delivered tickets were recorded `no-pr` because it was |
+| `unknown` | GitHub could not be asked at all, so nothing here says whether the run delivered. Not retried, and for a different reason from `aborted`: it may have delivered, and a second attempt risks a SECOND PR for one issue. Read the stream and set the row by hand |
+| `died-yielding` | it ended with a background agent still outstanding. Not its judgement: it yielded, and a `claude -p` process stops an agent still running 600 s after the turn ends, then exits. Both gates refuse this now, so a fresh sighting means EITHER the marker never reached the gate (check `pipeline/unattended/` for a file whose pid was live) or the run stopped despite being told not to — a block is persuasion, not a lock, and the two have different fixes |
 | `worktree-blocked` | a previous run left uncommitted work in this ticket's worktree; nothing was touched. Read it, then `git worktree remove --force` that path |
 | `checkout-blocked` | the repository could not be fetched, or its default branch does not resolve on origin, so nothing was touched. Fix the remote or the clone |
 | `dirty-skip` | only in ledger entries written before worktrees: the shared checkout had uncommitted work. It can no longer happen — the driver does not touch your checkout |
@@ -345,8 +299,10 @@ unrepairable, or the refutation gate found two defensible readings and no citati
 them. A second identical run meets the same wall, or is asked to pick a reading `resolve-ticket`
 forbids it to pick — so the ticket waits, and keeps its attempt budget. (The two remaining conditions,
 the round cap and a declined blocking finding, normally leave a draft PR and land as `draft`.)
-Everything else is retried on a later invocation until `ticket.max_attempts`, after which a second
-identical failure is evidence about the skills rather than about the ticket.
+`unknown` waits for a human on the other ground: not that a second run would meet the same wall, but
+that nobody can say whether the first one delivered, and re-running a ticket whose PR is invisible is
+how one issue gets two. Everything else is retried on a later invocation until `ticket.max_attempts`,
+after which a second identical failure is evidence about the skills rather than about the ticket.
 
 **A `checkout-blocked` stalls every ticket for that repository**, because it means the driver could not
 fetch it or could not resolve its default branch on origin — there is no base to cut a worktree from.
@@ -419,153 +375,9 @@ port" is a licence to stop a sibling's server mid-query.
 
 ## Two sessions by hand
 
-**What a hand-launched run does NOT get, and what it now does.** `ticket.timeout_seconds` and
-`ticket.quiet_seconds` are enforced by `Session`, which only the driven path and the retro use; a
-`--work` session is an ordinary interactive `claude` under `Popen`. So it is not killed on a clock,
-and — because it inherits your terminal rather than emitting `stream-json` — it records no
-`cost_usd` and no `turns` either. That mattered more than it sounds: measured on this machine on
-2026-09-08, 32 of 34 ledger rows were `launched_by: work`, the five longest runs were all `--work`
-at 47.7h down to 19.7h and every one of them ended `error`, and only the two driver-launched runs
-recorded a cost at all.
-
-Both bounds are now WATCHED rather than enforced: passing the timeout, and going quiet for
-`quiet_seconds`, each report once — to the log and to your channel — and neither ends the session.
-Killing is left to you on purpose: the driven path may kill on a clock because it is headless and
-the bound is the only thing that can end it, while this session has somebody who can answer it.
-
-Quiet is read from the session's own transcripts under `~/.claude/projects/`, and only writes made
-**since this run started** count. That directory is keyed on the worktree path, which is
-deterministic per ticket, so it outlives the worktree — #266's still held transcripts from
-2026-08-27 with no worktree at all, and without that floor the next run of that ticket is "quiet for
-twelve days" on its first tick. The whole subtree is read, not just the top level: a session's
-subagent transcripts sit under `<session-id>/`, 16 of #266's 17 files were below it, and the largest
-gap in a parent jsonl of a real `--work` run is hours. Fail-open throughout — nothing written yet is
-absence of evidence, not a stall, and the bound still catches a session that wedges before its first
-write.
-
-**And a hand-launched START closes out what an earlier one left behind** — `--work` and `--claim`
-both. A row still saying `running` is otherwise reaped only when a DRIVER starts, which on this
-machine happened twice against 32 hand-launched runs, leaving seven rows reporting a live session
-days later.
-
-**What it takes as proof is a recorded pid that no longer exists, and nothing weaker.** Not "no
-lease holds it": `release_claim` unlinks a lease with no liveness check at all, and `active_leases`
-prunes one whose worktree was removed, so an operator typing `--release` in a second terminal would
-have the next session publish `error` over a run that is still working — and `write_ledger` keeps
-the flag saying so as a field it never saw, so the lie outlives the session that disproves it. A row
-with no pid, which is every row written before this existed, is left alone and marked by `--status`
-rather than rewritten. It also cannot be `reap_running`: that one's soundness IS the machine lock,
-which a hand-launched session never takes.
-
-Everything above is the driver working tickets unattended. If you would rather drive two `claude`
-sessions yourself — to watch them, or to interrupt one — the isolation still has to come from
-somewhere, because **a session started by hand has none of it**. It inherits no
-`OPENMRS_STANDALONE_HOME`, no `MAVEN_ARGS` and no `CLAUDE_PIPELINE_SLOT`, and if you start both in
-your checkout they share one working tree. Measured: two sessions in one directory share ONE gate
-entry, and the first ticket's is silently gone — the later writer wins. Give them a worktree each and
-both entries survive.
-
-**`pool-run` is a shell script, not a skill.** Skills — `/resolve-ticket`, `/ticket-pool` — are what
-you type INSIDE a Claude Code session. `~/.claude/pipeline/pool-run` is a program you run in a
-terminal, and `--work` is a program that STARTS a session. Mistaking one for the other is easy and
-the failure was silent, so `--work` now refuses when it has no terminal and says which it wanted.
-
-So: **one command per terminal.**
-
-```bash
-pool-run --work 266      # terminal 1
-pool-run --work 297      # terminal 2
-```
-
-That is the whole procedure. Each starts an ORDINARY interactive `claude` — your terminal, your
-session, watch and interrupt it as always — already in the ticket's worktree, already holding a
-standalone and a maven repository of its own, with `/resolve-ticket <url>` already invoked. When you
-finish, the slot is given back automatically: on a clean exit, on a failure, and on an interrupt,
-because the release is the half a person forgets and it has to happen on the paths they forget it on.
-
-`--work` refuses to run from inside a session that already holds a slot, since that is the mistake
-that puts two runs in one worktree.
-
-**Permission prompts.** `claude.skip_permissions` starts `--work` sessions with
-`--dangerously-skip-permissions`, so a run never stops to ask; `--skip-permissions` /
-`--no-skip-permissions` override one invocation. It is opt-IN here and unconditional in the headless
-driver, and the difference is not an oversight: a headless run has nobody to ask, so a prompt is not
-a pause but a hang until the quiet watchdog kills the run hours later, while an interactive session
-has somebody in front of it who could answer. What the bypass is scoped to is worth knowing — the
-session's own worktree, its own maven repository and its own standalone, none of which is the
-operator's checkout.
-
-**The whole `claude` block reaches `--work` too**, which for a while it did not: the headless driver
-read `model`, `effort`, `max_budget_usd` and `extra_args` and `--work` read none of them, so a
-configured model silently did not apply to the sessions an operator actually watched. One definition
-now, `common_claude_args`, read by both launchers.
-
-**Remote Control travels with it.** It is a flag on the LAUNCH (`--remote-control [name]`), so a
-launcher that does not pass it silently costs you phone monitoring, with nothing in the session to
-say why it is missing. `claude.remote_control` in `pool.json` turns it on for every `--work` session,
-`--remote-control` / `--no-remote-control` override one invocation, and the session is named for its
-TICKET rather than the host — `chartsearchai-266` — because the point of monitoring two sessions from
-a phone is being able to tell which is which. It applies to `--work` only: the headless driver's
-sessions are not interactive and the flag means nothing to them.
-
-Nothing else about the environment is touched. The session inherits `os.environ` whole, plus the
-three variables the slot adds, so credentials, config and proxy settings reach it exactly as they
-would if you had typed `claude` yourself.
-
-**Ctrl-C goes to the session, not to the launcher.** It has to be said because it very nearly did not
-work: Ctrl-C reaches the whole foreground process group, so without care `subprocess.run` raises
-`KeyboardInterrupt` out of the wait while the session is still running and the release then deletes
-the worktree out from under a live `claude`. Measured before the fix, against a child that caught
-SIGINT and ran on for four more seconds: the launcher returned in **0.4s**. In Claude Code Ctrl-C is
-how you interrupt a tool call, so that is the most-pressed key in the product, not an edge case. The
-launcher now absorbs SIGINT with a no-op HANDLER — not `SIG_IGN`, which `exec` would leave inherited
-and so disable Ctrl-C inside the session too.
-
-Closing the terminal is handled too. SIGHUP's default action kills the launcher outright, so the
-release never ran and the lease outlived the session — measured, the lease file and the worktree were
-both left behind. SIGHUP and SIGTERM are now absorbed for that reason, exactly as SIGINT is for its
-own: the launcher outlives the signal by the moment it takes the session to die, then releases.
-`--claims` and `--release` remain for anything that gets past all of it.
-
-**One claim per ticket, and it is a safety check rather than tidiness.** The worktree path is derived
-from the ticket, so a second claim for the same one resolves to the SAME directory — and creating a
-worktree releases whatever it finds there first. A running session that has just committed has a
-clean tree, so that release succeeds: measured, the second claim deleted the live session's committed
-file and left two leases pointing at one directory, silently.
-
-**A lease is per REPOSITORY and ticket, not per number.** Issue numbers collide across repos freely,
-so `o/b#266` is a different ticket from `o/a#266` and both may be claimed at once. `--release 266`
-works while the number is unambiguous and is REFUSED, naming the candidates, once it is not —
-`--release o/b#266` picks one. Guessing there would delete a worktree belonging to a live session.
-
-**A lease also records the INSTANCE it reserves, not just the slot name.** Editing
-`parallel.standalones` under a running session re-points a name at a different standalone, and a free
-name could then carry an instance somebody was already using.
-
-**And a claim refuses to start while a driver is running**, which is the mirror of the driver
-refusing while a claim is held. Without both halves the symmetry is decorative — a claim would take a
-standalone the driver was already using. Only a LIVE holder counts; a lock left behind by a killed
-driver blocks nobody.
-
-The pieces are still there if you want to drive them yourself — `--claim 266` prints the `cd` and the
-three exports instead of launching anything, `--claims` lists what is held, `--release 266` gives one
-back by hand. Reach for those if you start `claude` some other way; otherwise `--work` is the whole
-of it.
-
-A claim is a worktree cut from `origin/<default>` plus a leased standalone and maven head — the same
-three things the driver hands a worker. The lease is taken with an exclusive create, so two claims
-racing cannot pick one standalone; that is the part that is easy to get wrong by hand and the reason
-this is a command rather than a paragraph of instructions.
-
-A lease is released when `--work`'s session exits, by `--release`, or reclaimed automatically once
-its worktree is gone — it cannot
-be pid-owned, because you claim first and start `claude` afterwards, so there is no process to point
-at when the lease is written. `--release` also clears that worktree's gate entry, because a re-claim
-of the same ticket reuses the same path and would otherwise inherit a stale `phase: building` and
-block the new session's Stop gate for six hours.
-
-**The driver refuses to start while any claim is held**, naming them. Both would be using the same
-standalones and the driver cannot see what a session it did not start is doing with one.
+This section is in `by-hand.md`, beside this file. Read it before you start a `--work` or `--claim`
+session, release a slot, act on a hand-launched run's ledger row, or set `claude.skip_permissions` or
+`claude.remote_control`.
 
 ## Anti-patterns
 

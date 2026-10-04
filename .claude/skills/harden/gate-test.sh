@@ -1,5 +1,6 @@
 #!/bin/bash
-# Same shape as gate-test.sh, for harden-cycle-gate.sh (harden-state.json, `edits` not `phase`).
+# Same shape as pr-harden's gate-test.sh, for harden-cycle-gate.sh (harden-state.json, `phase1`/`phase2`,
+# with the pre-0.34 `edits` rule surviving for entries that carry no `phase1`).
 set -uo pipefail
 HOOK="${1:?hook path}"
 # Resolve to an absolute path and prove it exists BEFORE any case runs. Each case invokes the hook
@@ -41,8 +42,122 @@ run_case() { # name expected entry_json [marker_pid]
 
 AW="[{\"agent\":\"phase2 quality\",\"since\":$NOW}]"
 run_case "no entry -> allow" allow none
-run_case "edits 0 -> allow (converged)" allow "{\"cycle\":2,\"edits\":0,\"ts\":$NOW}"
-run_case "edits 3, no awaiting -> block" block "{\"cycle\":2,\"edits\":3,\"ts\":$NOW}"
+
+# THE PHASE CONTRACT. `/harden` ends when Phase 1 has converged and the one Phase 2 pass that
+# follows it has run without escalating; `edits` is reported and gates nothing.
+#
+# The KNOWN-BAD CONTROL is RUN, not recorded. Point this suite at the pre-0.34 hook —
+# `git show <pre-0.34>:.claude/hooks/harden-cycle-gate.sh > /tmp/old && bash "$0" /tmp/old` — and
+# every failure is a case from this block: an implementation that still reads the edit count cannot
+# pass them. No tally is written down, for the reason the header 40 lines up gives; the first draft
+# of this comment recorded one and it went stale two commits later, when two cases were added below.
+# Some cases here pass under BOTH hooks on purpose, exercising the override, awaiting, staleness and
+# ownership guards the new predicate sits behind and which did not change; they pin that it is still
+# behind them and discriminate nothing on their own. The first two are the sharpest pair: they
+# invert, one in each direction.
+run_case "phase1 open with edits 0 -> block (an edit count does not end it)" block \
+  "{\"cycle\":1,\"phase1\":\"open\",\"edits\":0,\"ts\":$NOW}"
+run_case "converged + phase2 done with edits 99 -> allow (nor does it extend it)" allow \
+  "{\"cycle\":1,\"phase1\":\"converged\",\"phase2\":\"done\",\"edits\":99,\"ts\":$NOW}"
+run_case "phase1 open -> block" block "{\"cycle\":1,\"phase1\":\"open\",\"ts\":$NOW}"
+run_case "converged, phase2 pending -> block (the one Phase 2 pass is owed)" block \
+  "{\"cycle\":1,\"phase1\":\"converged\",\"phase2\":\"pending\",\"ts\":$NOW}"
+run_case "converged, phase2 ABSENT -> block (absent defaults to pending)" block \
+  "{\"cycle\":1,\"phase1\":\"converged\",\"ts\":$NOW}"
+# An escalation resumes Phase 1, so it is written as `phase1: open` and blocks on that. There is
+# no `phase2: escalated`; the first draft had one and it wedged a run that then converged, because
+# `--phase1 converged` did not clear it and this hook tested it first. The retired value is now
+# simply unrecognised, which fails open -- pinned two cases below.
+run_case "escalation is phase1 open, and blocks" block \
+  "{\"cycle\":1,\"phase1\":\"open\",\"phase2\":\"pending\",\"ts\":$NOW}"
+run_case "phase1 open with a stale phase2 done -> block" block \
+  "{\"cycle\":1,\"phase1\":\"open\",\"phase2\":\"done\",\"ts\":$NOW}"
+run_case "unrecognised phase1 -> allow (fail open)" allow \
+  "{\"cycle\":1,\"phase1\":\"maybe\",\"edits\":3,\"ts\":$NOW}"
+# An unrecognised `phase2` does NOT fail open, and these four are why. Only `done` licenses a stop,
+# which is decidable without interpreting the value — and the check used to sit ahead of the
+# `phase1` test, so any unknown value disarmed an unambiguous `open`. `escalated` is the one that
+# makes it real rather than theoretical: harden 0.34.0 wrote it, hours before this, so a run that
+# escalated under it and then upgraded had its gate silently removed. The first two cases below were
+# written the other way round and pinned the hole as correct; they are the reason it survived two
+# review passes.
+run_case "unrecognised phase2 -> block (only 'done' ends a run)" block \
+  "{\"cycle\":1,\"phase1\":\"converged\",\"phase2\":\"soon\",\"ts\":$NOW}"
+run_case "the RETIRED phase2 escalated, converged -> block" block \
+  "{\"cycle\":1,\"phase1\":\"converged\",\"phase2\":\"escalated\",\"ts\":$NOW}"
+run_case "the RETIRED phase2 escalated, phase1 OPEN -> block (the 0.34.0 migration case)" block \
+  "{\"cycle\":2,\"phase1\":\"open\",\"phase2\":\"escalated\",\"ts\":$NOW}"
+run_case "an unrecognised phase2 never overrides an open phase1" block \
+  "{\"cycle\":1,\"phase1\":\"open\",\"phase2\":\"soon\",\"ts\":$NOW}"
+run_case "phase1 open + override -> allow" allow \
+  "{\"cycle\":1,\"phase1\":\"open\",\"ts\":$NOW,\"override\":true}"
+run_case "phase1 open + awaiting fresh, attended -> allow (yield)" allow \
+  "{\"cycle\":1,\"phase1\":\"open\",\"ts\":$NOW,\"awaiting\":$AW}"
+run_case "phase1 open + awaiting fresh, marker LIVE -> block" block \
+  "{\"cycle\":1,\"phase1\":\"open\",\"ts\":$NOW,\"awaiting\":$AW}" $$
+run_case "phase1 open but STALE -> allow" allow \
+  "{\"cycle\":1,\"phase1\":\"open\",\"ts\":$((NOW - 25000))}"
+# AWAIT_TTL is what bounds the awaiting-allow, and it is the whole reason a forgotten `awaiting`
+# cannot license a six-hour window of early stops — the harm the run-id family was about. Every
+# other awaiting case here is fresh, so making the TTL effectively infinite left the suite green.
+STALE_AW="[{\"agent\":\"phase2 quality\",\"since\":$((NOW - 7200))}]"
+run_case "awaiting STALE on an ATTENDED session -> block (AWAIT_TTL)" block \
+  "{\"cycle\":1,\"phase1\":\"open\",\"ts\":$NOW,\"awaiting\":$STALE_AW}"
+run_case "awaiting stale AND converged+done -> allow (nothing owed)" allow \
+  "{\"cycle\":1,\"phase1\":\"converged\",\"phase2\":\"done\",\"ts\":$NOW,\"awaiting\":$STALE_AW}"
+
+# An entry with no `cycle` must still render a copyable command. `--cycle ?` is what it used to
+# emit, and argparse takes an int, so the instruction could not be run; the flag is now omitted.
+run_case "no cycle number -> still blocks" block \
+  "{\"phase1\":\"open\",\"ts\":$NOW}"
+
+# ...and the command it hands back must be RUNNABLE. `--cycle` is required by the writer, and an
+# early repair that omitted the flag when there was no number swapped an unparseable argument for a
+# missing one; the hook resolves the cycle to 1 instead and always emits the flag. A case asserting
+# only `block` could not tell the two apart, so these read the text.
+run_cmd_case() { # name expected_substring entry_json
+  local name="$1" want="$2" entry="$3" work="$TMP/work"
+  mkdir -p "$work"; rm -rf "$TMP/.claude/pipeline/unattended"
+  jq -n --arg k "$work" --argjson e "$entry" '{($k): $e}' > "$STATE"
+  local got; got=$(cd "$work" && HOME="$TMP" bash "$HOOK" 2>/dev/null | jq -r '.reason // ""')
+  if [[ "$got" == *"$want"* ]]; then PASS=$((PASS+1)); echo "  ok   $name"
+  else FAIL=$((FAIL+1)); echo "  FAIL $name: no '$want' in: ${got:0:160}"; fi
+}
+run_cmd_case "the emitted command names a cycle even when the entry has none" \
+  "harden-set --cycle 1 --phase1" "{\"phase1\":\"open\",\"ts\":$NOW}"
+# ...and it must tell the run to stamp its id. This is the one text a blocked run is guaranteed to
+# read, and every member of the inheritance family traces to a write that carried no `--run`.
+# Deleting the flag from this message left both suites green, so nothing pinned the fix.
+run_cmd_case "the emitted command tells the run to stamp its id" \
+  "--run <this run" "{\"phase1\":\"open\",\"ts\":$NOW}"
+run_cmd_case "and uses the entry's cycle when it has one" \
+  "harden-set --cycle 7 --phase1" "{\"cycle\":7,\"phase1\":\"converged\",\"ts\":$NOW}"
+
+# A run that has STAMPED this entry and stated no verdict owes one. Chosen by the absence of
+# `phase1` alone, this fell to the legacy branch — and at `edits: 0`, the ordinary reading on a
+# clean tree, the zero-edit rule allowed it. `edits: 0` is the case that matters here.
+run_case "run stamped, no verdict, 0 edits -> block" block \
+  "{\"run\":\"r1\",\"cycle\":1,\"edits\":0,\"ts\":$NOW}"
+run_case "run stamped, no verdict, N edits -> block" block \
+  "{\"run\":\"r1\",\"cycle\":1,\"edits\":9,\"ts\":$NOW}"
+run_case "run stamped and complete -> allow" allow \
+  "{\"run\":\"r1\",\"cycle\":1,\"edits\":9,\"phase1\":\"converged\",\"phase2\":\"done\",\"ts\":$NOW}"
+# A 0.34.0-0.36.0 entry carries a real verdict and no run id. Judging it on an edit count would
+# throw the verdict away, so the legacy branch needs BOTH halves of its condition.
+run_case "no run but a verdict -> the phase contract, not the edit count" block \
+  "{\"cycle\":1,\"edits\":0,\"phase1\":\"open\",\"ts\":$NOW}"
+
+# LEGACY entries — no run id AND no verdict, written by a /harden that predates the contract. The zero-edit rule
+# still applies to them, so a run already in flight when this changed is not silently disarmed.
+run_case "legacy: edits 0 -> allow (converged)" allow "{\"cycle\":2,\"edits\":0,\"ts\":$NOW}"
+run_case "legacy: edits 3, no awaiting -> block" block "{\"cycle\":2,\"edits\":3,\"ts\":$NOW}"
+# A legacy entry with no usable cycle number used to print NOTHING and be read as allow: jq's
+# `empty` from `tonumber?` on "?" propagates through the concatenation and suppresses the whole
+# object. Silence from this hook is indistinguishable from a deliberate allow, so these two are the
+# fail-open that mattered most, and neither expects a number in the message.
+run_case "legacy: edits 3, NO cycle -> block" block "{\"edits\":3,\"ts\":$NOW}"
+run_case "legacy: edits 3, non-numeric cycle -> block" block \
+  "{\"cycle\":\"abc\",\"edits\":3,\"ts\":$NOW}"
 run_case "awaiting fresh, attended -> allow (yield)" allow "{\"cycle\":2,\"edits\":3,\"ts\":$NOW,\"awaiting\":$AW}"
 run_case "awaiting fresh, marker LIVE -> block" block "{\"cycle\":2,\"edits\":3,\"ts\":$NOW,\"awaiting\":$AW}" $$
 run_case "awaiting fresh, marker DEAD -> allow" allow "{\"cycle\":2,\"edits\":3,\"ts\":$NOW,\"awaiting\":$AW}" 999999
@@ -96,5 +211,22 @@ run_symlink_case() { # name expected entry_json marker_pid
 }
 run_symlink_case "cwd reached via symlink: live marker still found -> block" block \
   "{\"cycle\":2,\"edits\":3,\"ts\":$NOW,\"owner\":$$,\"awaiting\":$AW}" $$
+
+# `owns_this_session` returns 0 ours / 1 positively somebody else's / 2 could not be established,
+# and its header says "only 1 may relax anything". Widening that to `1|2)` is an allow-direction
+# relaxation of exactly that rung and left the suite green, because nothing here could produce a 2.
+# A stub `ps` on PATH does: the walk gets nothing usable and cannot establish ancestry.
+run_ps_stub_case() { # name expected entry_json
+  local name="$1" expect="$2" entry="$3" work="$TMP/work" stub="$TMP/stub"
+  mkdir -p "$work" "$stub"; rm -rf "$TMP/.claude/pipeline/unattended"
+  printf '#!/bin/sh\necho "not a pid"\n' > "$stub/ps"; chmod +x "$stub/ps"
+  jq -n --arg k "$work" --argjson e "$entry" '{($k): $e}' > "$STATE"
+  local out; out=$(cd "$work" && HOME="$TMP" PATH="$stub:$PATH" bash "$HOOK" 2>/dev/null)
+  local got="allow"; grep -q '"block"' <<<"$out" && got="block"
+  if [ "$got" = "$expect" ]; then PASS=$((PASS+1)); echo "  ok   $name ($got)"
+  else FAIL=$((FAIL+1)); echo "  FAIL $name: expected $expect, got $got"; fi
+}
+run_ps_stub_case "owner live but ancestry INDETERMINATE -> block, not allow" block \
+  "{\"cycle\":1,\"phase1\":\"open\",\"ts\":$NOW,\"owner\":$$}"
 
 echo "passed=$PASS failed=$FAIL"; rm -rf "$TMP"; [ "$FAIL" -eq 0 ]

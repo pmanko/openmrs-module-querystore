@@ -30,9 +30,10 @@ Writes are atomic (temp file, then rename), so the hooks — which read without 
 hook must never block on someone else's lock — always see one whole version or the other.
 
   gate-state --owner $PPID pr-set --pr 93 --round 2 --phase reviewed --blocking 1 [--override]
-  gate-state --owner $PPID harden-set --cycle 3 --count-edits [--override]
-  gate-state await "review r3" [--only pr|harden|both]
-  gate-state clear-await [--only pr|harden|both]
+  gate-state --owner $PPID --run harden-1758600000 harden-set --cycle 3 --phase1 open --count-edits
+  gate-state --owner $PPID --run harden-1758600000 harden-set --cycle 3 --phase1 converged --phase2 done --count-edits
+  gate-state --run harden-1758600000 await "review r3" [--only pr|harden|both]
+  gate-state --run harden-1758600000 clear-await [--only pr|harden|both]
   gate-state declined --round 1 --id r1-2 --finding "…" --reason "…"   # writes the pr entry; no --only
   gate-state reviewed-sha <sha>                                        # writes the pr entry; no --only
   gate-state verified-sha <sha>                                        # writes the pr entry; no --only
@@ -56,6 +57,18 @@ FILES = {"pr": CLAUDE / "pr-harden-state.json", "harden": CLAUDE / "harden-state
 LOCK = CLAUDE / "gate-state.lock"
 
 PHASES = ("building", "init", "fixing", "reviewed")
+# `/harden`'s run condition, which is Phase 1's own severity-aware verdict rather than an edit
+# count. `open` means the last Phase 1 pass found a substantive issue, so it cannot be the last
+# pass. `phase2` says whether the ONE Phase 2 pass this traversal owes has run.
+#
+# There is deliberately no `escalated`. The first draft had one, and a fresh reviewer measured what
+# it cost: the value was sticky, `--phase1 converged` did not clear it, and the hook tested it
+# before `phase1` -- so a run whose Phase 2 escalated and whose next Phase 1 pass then CONVERGED was
+# re-handed the instruction it had just obeyed, on every turn, for the six-hour expiry. An
+# escalation is already expressible without it: it resumes Phase 1, which is `--phase1 open`, and
+# the gate blocks on that. Two states, not three, because the third was where the defect lived.
+HARDEN_PHASE1 = ("open", "converged")
+HARDEN_PHASE2 = ("pending", "done")
 
 
 class Held:
@@ -110,6 +123,66 @@ class Held:
         self.fh.close()
 
 
+def _require_run(ap: "argparse.ArgumentParser", run: str | None, what: str) -> None:
+    """Refuse a write that could reach a verdict without saying which run is making it.
+
+    This is the mechanical half of `adopt`. Without it `adopt` is a no-op on an unstamped write and
+    the previous run's entry -- its verdict, its head, its outstanding agents -- is simply inherited,
+    which is the sixth, seventh and eighth defects of one family. Refusing costs a caller one flag
+    and is loud; the alternative was a sentence in a docstring, and that sentence was already false
+    in this file when it was written.
+    """
+    if run is None:
+        ap.error(f"{what} needs --run <id>: it writes the harden entry, and without an id this "
+                 f"cannot tell your run's entry from one a previous run left in this directory. "
+                 f"--run goes BEFORE the subcommand, beside --owner"
+                 + (". One that is only the pr gate's needs no --run: `await <label> --only pr`, "
+                    "--only AFTER the subcommand." if what.startswith("await") else
+                    ". One that is only the pr gate's needs no --run: `clear-await --only pr`, "
+                    "--only AFTER the subcommand." if what.startswith("clear-await") else "."))
+
+
+def _run_id(value: str) -> str:
+    """A run id that is actually one. Empty is the dangerous value, not merely a useless one: every
+    run shares it, so no write ever replaces another, and the hook's `.run // empty` reads it as no
+    run at all -- which puts a verdict-less write back in the legacy branch, where `edits: 0`
+    allows. It is also the value a run reaches for after quoting an unset shell variable."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError(
+            "--run needs a non-empty id; an empty one is shared by every run and reads to the gate "
+            "as no run at all")
+    return value
+
+
+def adopt(entry: dict, run: str) -> None:
+    """Make `entry` belong to `run`, replacing it wholesale if it belonged to another.
+
+    The alternative was a list of field names to drop, and it grew a leak per review pass -- a
+    `phase2`, then a whole verdict, then an `awaiting` -- because `carry unless listed` makes every
+    field added to this entry a new candidate. Replacing inverts the default. There is no unstamped
+    write to consider: `_require_run` refuses one before this is called.
+    """
+    # No `run is None` guard: every caller is preceded by `_require_run`, so there is no such
+    # caller to guard against, and a branch no caller reaches is one the next change removes for
+    # free while believing it was load-bearing. The type says it.
+    #
+    # NOT `not in (None, run)`. Treating an absent id as adoptable-in-place is how the sixth defect
+    # came back a seventh time: a predecessor that stamped no `run` -- every 0.34.0-0.36.0 entry,
+    # and any write that omitted the flag -- was merged into rather than replaced, and its
+    # `awaiting` allowed a stop on the new run's `phase1: open`. An entry this run did not stamp is
+    # not this run's, whatever else is true of it.
+    #
+    # The eighth member arrived because this was made safe by a PREMISE -- "every documented write
+    # carries `--run`" -- and a premise about documentation is not a gate. It was false in this
+    # file's own usage block, 118 lines above where it was written, and a run typing what the helper
+    # documents rode the previous run's entry. So the callers that can reach a verdict now REQUIRE
+    # `--run` (see `_require_run`), so the premise is enforced where it is relied on rather than
+    # asserted in a comment — which is what it was when it was false.
+    if entry.get("run") != run:
+        entry.clear()
+    entry["run"] = run
+
+
 def stamp(entry: dict, owner: int | None = None) -> None:
     entry["ts"] = int(time.time())
     if owner:
@@ -127,6 +200,12 @@ def _git(cwd: str, *args: str) -> str:
 
 def count_edits(cwd: str, since: str | None = None) -> tuple[int, str]:
     """What a `/harden` cycle changed: uncommitted lines plus the commits the cycle added.
+
+    THIS FIGURE IS REPORTED, NOT ENFORCED. Since harden 0.34.0 the gate reads `phase1`/`phase2` and
+    no edit count ends or extends a run, so every sentence below about what "the gate" does with
+    this number describes the gate as it was through 0.33.0. The reasoning is kept because the two
+    misreadings it records still corrupt the figure a run REPORTS, which is an obligation the skill
+    still carries.
 
     Both halves, because a cycle that commits its work has still changed something and a gate reading
     only `git status` would let it stop. The commit half is `<since>..HEAD`, where `since` is the head
@@ -189,7 +268,13 @@ class _Parser(argparse.ArgumentParser):
     """
 
     def error(self, message: str):
-        if "--only" in message:
+        # `--only` ahead of the subcommand fails as `invalid choice: 'pr'`, which names no `--only`
+        # (#480, #485, #488), so the argv is read here rather than the message.
+        argv = sys.argv[1:]
+        if "invalid choice" in message and "--only" in argv:
+            message += ("\n--only goes AFTER the subcommand, and only await, clear-await and clear "
+                        "take it: gate-state --owner $PPID await \"review r3\" --only pr")
+        elif "unrecognized arguments" in message and "--only" in message:
             message += ("\n--only is accepted by await, clear-await and clear. The subcommands that "
                         "write an entry -- pr-set, harden-set, declined, reviewed-sha, "
                         "verified-sha -- each write "
@@ -200,6 +285,18 @@ class _Parser(argparse.ArgumentParser):
 def main() -> int:
     ap = _Parser(description=__doc__.splitlines()[0])
     ap.add_argument("--cwd", default=None, help="the tenant key; defaults to the working directory")
+    ap.add_argument("--run", default=None, type=_run_id,
+                    help="this RUN's id, minted once at the top of the run and passed on every "
+                         "write it makes. A write whose --run differs from the harden entry's "
+                         "REPLACES that entry, so a new run in a reused checkout starts from what "
+                         "it writes rather than from what it found -- not from everything absent "
+                         "from a list, which is what let an `awaiting` from a dead run allow a "
+                         "stop on `phase1: open`. Required wherever a verdict is reachable, "
+                         "because the alternative was a docstring claiming every caller passes it "
+                         "and that claim was false in this file's own usage block. Distinct "
+                         "from --owner, which answers whether a live foreign session holds this "
+                         "checkout and survives a resume; conflating the two is what left the "
+                         "same-pid corner.")
     ap.add_argument("--owner", type=int, default=None,
                     help="the pid of the claude session this entry belongs to. Pass $PPID from a "
                          "tool shell — that IS this session's process, and both gates use it to tell "
@@ -223,8 +320,20 @@ def main() -> int:
     h.add_argument("--count-edits", action="store_true",
                    help="count them here instead: uncommitted changes plus commits not yet pushed, "
                         "or on a branch with no upstream the commits made since the previous cycle "
-                        "closed. One definition of 'what this cycle changed', so a retyped one "
-                        "cannot drift from the gate's reading of it.")
+                        "closed. One definition of 'what this cycle changed', so the number the run "
+                        "reports and the number recorded here cannot be two different numbers. It "
+                        "is reported only; --phase1 is what the gate reads.")
+    h.add_argument("--phase1", choices=HARDEN_PHASE1,
+                   help="Phase 1's verdict at the close of this pass. This is what ends the run: "
+                        "`converged` plus a `--phase2 done` is complete. Omitting it leaves "
+                        "whatever the entry says -- nothing on a fresh one, which the gate reads "
+                        "as a run in flight that owes a verdict and BLOCKS on, but a verdict "
+                        "already there if there is "
+                        "one, so say it every time.")
+    h.add_argument("--phase2", choices=HARDEN_PHASE2,
+                   help="whether the ONE Phase 2 pass this traversal owes has run. Any --phase1 "
+                        "write that does not say resets it to `pending`, because a Phase 1 pass "
+                        "just ran and the Phase 2 that follows it has not.")
     h.add_argument("--override", action="store_true")
     h.add_argument("--reason")
 
@@ -246,9 +355,8 @@ def main() -> int:
 
     # The verifier's counterpart, and it exists for the same reason: the gate compares the head being
     # handed over against the last entry of each list, because a blocking count and a runtime verdict
-    # are both statements about a SHA and neither survives the next commit. FINISH pushes after the
-    # last verifier run in every case, so without this the "verified the merging head" rule was prose
-    # with nothing able to check it.
+    # are both statements about a SHA and neither survives the next commit. Without this the
+    # "verified the merging head" rule was prose with nothing able to check it.
     v = sub.add_parser("verified-sha", help="record the sha a verifier run covered")
     v.add_argument("sha")
 
@@ -269,6 +377,14 @@ def main() -> int:
     with Held(key, write=args.cmd != "show") as held:
         if args.cmd == "pr-set":
             e = held.entry("pr")
+            if args.phase == "building" and args.pr is None and e.get("pr") is not None:
+                # `building` is `resolve-ticket`'s opening write, which has no PR yet, so an entry
+                # still naming one is a previous run's. Warned, not dropped: a run re-reading its own
+                # Step 1 after opening its PR would lose that PR's ledger. Measured on #477, whose
+                # entry kept PR #483's `pr` and ledgers until someone ran `show` at Step 8.
+                print(f"warning: this entry still names PR {e['pr']}, from a previous run: a `building` "
+                      "entry has no PR yet. If that PR is not this run's, read the entry with "
+                      "`gate-state clear --only pr --json`, then re-run this write.")
             e.update({"round": args.round, "phase": args.phase, "blocking": args.blocking,
                       "override": bool(args.override)})
             if args.pr is not None:
@@ -306,42 +422,133 @@ def main() -> int:
                   + (" OVERRIDE" if args.override else ""))
 
         elif args.cmd == "harden-set":
+            _require_run(ap, args.run, "harden-set")
             e = held.entry("harden")
+            # A DIFFERENT run REPLACES this entry rather than inheriting from it. Nothing clears
+            # it between interactive runs, and successive reviewers found a leak per pass here
+            # while the rule was `carry unless listed` -- a `phase2: done`, an `escalated`, a whole
+            # terminal verdict, an `awaiting` -- each through the field or the caller the last fix
+            # did not name. No count is kept: three passes running found the count itself wrong,
+            # and `git log` has them. What holds now is the inversion plus `_require_run` -- no
+            # write reaches this entry without an id, so `drop unless this run wrote it` is
+            # enforced rather than documented.
+            #
+            # Keyed on `run`, not on `owner`. They answer different questions and conflating them
+            # is what left the same-pid corner: `owner` answers "is a live foreign session using
+            # this checkout", which the gate needs and which a resumed session changes; `run`
+            # answers "is this the same run", which a resumed session does not. There is no
+            # unstamped write: `_require_run` refuses one for every command that reaches here.
+            #
+            adopt(e, args.run)
             note = ""
             if args.count_edits:
-                # A recorded head belongs to THIS run only when the same owner wrote it at an earlier
-                # cycle. Nothing clears the harden entry -- the skill requires it to survive, saying
-                # `edits: 0` or `override: true` when the run finishes -- so without this test a
-                # fresh `/harden` in a reused checkout would count from the previous run's head.
-                prev = (e.get("head") if (args.owner is not None and e.get("owner") == args.owner
-                                          and isinstance(e.get("cycle"), int)
-                                          and args.cycle > e["cycle"]) else None)
+                # No identity test here, and that is not an omission: `--run` is required for
+                # this subcommand and `adopt` above has emptied the entry unless this run wrote it,
+                # so a head still present is this run's by construction. Two versions of such a
+                # test have stood here and both were dead -- one compared a value `adopt` had just
+                # written, the other kept an `owner` fallback for a caller that can no longer exist
+                # -- and each survived being replaced by `True` in both suites. Four successive
+                # comment blocks accumulated here describing mechanisms the next commit deleted;
+                # this replaces them, because a rationale that outlives its guard is what the next
+                # reader trusts.
+                #
+                # What remains is the cycle bound, and it is about this run's own traversals. It
+                # was `>` and had to become `>=`: `--cycle` numbers the traversal and only an
+                # escalation moves it, so on an ordinary run it never advanced and the commit half
+                # was never measured at all -- two real commits between two writes, reported as
+                # `edits=0 [commit half not measured]`. Each write now measures what changed since
+                # this run's previous write, and re-recording one pass correctly reports zero.
+                prev = (e.get("head") if (isinstance(e.get("cycle"), int)
+                                          and args.cycle >= e["cycle"]) else None)
                 edits, note = count_edits(key, prev)
             elif args.edits is None:
                 ap.error("harden-set needs --edits N or --count-edits")
             else:
                 edits = args.edits
             e.update({"cycle": args.cycle, "edits": edits, "override": bool(args.override)})
+            if args.phase1:
+                # `phase2` describes THIS traversal's Phase 2 pass, so a Phase 1 write that does
+                # not name it resets it: Phase 1 has just run and the Phase 2 after it has not.
+                # Resetting on `converged` as well as on `open` is not tidiness. `phase1` and
+                # `head` survive a write that does not name them, `override` is rewritten by every
+                # write, and `phase2` would carry too -- so a traversal that had converged and
+                # finished its Phase 2 would hand `done` to the next traversal, whose Phase 2 has
+                # not run. It is scoped to a traversal, and the write that opens a traversal is a
+                # `--phase1` one. A fresh reviewer built that case; the terminal write the skill
+                # documents names `--phase2 done` explicitly, so nothing legitimate needs the carry.
+                e["phase1"] = args.phase1
+                e["phase2"] = args.phase2 or "pending"
+            elif args.phase2:
+                # UNCONDITIONAL. A `--phase2` write with no `--phase1` leans on a verdict this run
+                # may never have written: in a reused checkout it is the PREVIOUS run's
+                # `converged`, and `--phase2 done` alone then ends a run that has run nothing. The
+                # first version of this guard tested `"phase1" not in e`, which fires only where
+                # `phase2` is never read anyway (the hook takes the LEGACY branch) and misses the
+                # case its own comment named -- it refused where it could not matter and allowed
+                # where it did. The skill documents no bare `--phase2` write, so requiring the pair
+                # costs nothing.
+                ap.error("--phase2 needs --phase1: phase2 describes the Phase 2 pass that follows "
+                         "a Phase 1 verdict, and a verdict this run did not write is not one it "
+                         "may report against")
             head = _git(key, "rev-parse", "HEAD")
             if head:
                 e["head"] = head          # what the NEXT cycle measures its commits against
+            # `override` is rewritten by every `harden-set`, so a write that does not repeat
+            # `--override` retracts one that was taken. The reason has to go with it or the entry
+            # carries a justification for a deviation it no longer records.
             if args.reason:
                 e["override_reason"] = args.reason
+            elif not args.override:
+                e.pop("override_reason", None)
             e.setdefault("awaiting", [])
             stamp(e, args.owner)
-            print(f"cycle {args.cycle}: edits={edits}" + (" OVERRIDE" if args.override else "")
+            # Both of these read the ENTRY, never the arguments. Keyed on `args.phase1` the
+            # warning fired on a write that merely omitted the flag, announcing a legacy entry over
+            # a `phase1` the entry already carried and the gate was already holding the run to --
+            # and the skill leans on this line ("`gate-state` says so on the line it prints"), so a
+            # run that believed it would drive `edits` to 0 and be blocked anyway.
+            # LEGACY is no run AND no verdict, which is what the hook branches on. Keyed on the
+            # verdict alone this told a run with a stamped id that it was held to the zero-edit
+            # rule while the gate was blocking it for having stated no verdict -- and the skill
+            # tells the run to trust this line.
+            # Two states. `adopt` above stamps `run` unconditionally and `_require_run` guarantees
+            # it ran, so an entry reaching this line always carries an id -- the third state and the
+            # LEGACY suffix that used to live here were proved unreachable by instrumenting them,
+            # and a branch no input reaches is one the next change removes while believing it was
+            # load-bearing. A legacy entry is still a thing the HOOK meets on disk; it is no longer
+            # a thing this line can print.
+            where = (f"phase1={e['phase1']} phase2={e.get('phase2', 'pending')} "
+                     if "phase1" in e else "no verdict recorded yet ")
+            print(f"cycle {args.cycle}: " + where
+                  + f"edits={edits}" + (" OVERRIDE" if args.override else "")
                   + (f" [{note}]" if note else ""))
 
         elif args.cmd == "await":
+            if "harden" in which[args.only]:
+                _require_run(ap, args.run, "await (it reaches the harden entry)")
             for w in which[args.only]:
                 e = held.entry(w)
+                if w == "harden":
+                    adopt(e, args.run)
                 e.setdefault("awaiting", []).append({"agent": args.agent, "since": int(time.time())})
                 stamp(e, args.owner)
             print(f"awaiting: {args.agent} ({args.only})")
 
         elif args.cmd == "clear-await":
+            # Same requirement and same adoption as `await`, for the same reason. This was the one
+            # caller left that wrote the harden entry without an id: on a virgin file it created an
+            # entry the hook reads as LEGACY, it ignored the `--run` its own documented forms pass,
+            # and its `stamp` refreshed `ts` on a dead run's entry -- restarting the six-hour expiry
+            # that `resolve-ticket` Step 7 names as the only way out of a wedge. Its harm was
+            # block-direction, which is why eight passes went by without it; the claim it falsified
+            # was this slice's own "there is no longer a caller that can silently write without an
+            # id", which is the third closure claim in a row to be the false universal.
+            if "harden" in which[args.only]:
+                _require_run(ap, args.run, "clear-await (it reaches the harden entry)")
             for w in which[args.only]:
                 e = held.entry(w)
+                if w == "harden":
+                    adopt(e, args.run)
                 e["awaiting"] = []
                 stamp(e, args.owner)
             print(f"awaiting cleared ({args.only})")

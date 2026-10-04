@@ -18,6 +18,7 @@ import os
 import re
 import contextlib
 import shutil
+import socket
 import time
 import signal
 import subprocess
@@ -101,7 +102,7 @@ def isolated(tmp: Path):
     # and RELEASE two slots a hand-launched session was holding, removing their worktrees.
     names = ["LEDGER", "LEDGER_FLOCK", "LOGS", "LESSONS", "LAST", "PR_STATE", "HARDEN_STATE",
              "UNATTENDED_DIR", "WORKTREES", "SLOT_M2", "SLOTS", "LOCK", "PAUSE", "PAUSED",
-             "PROJECTS"]
+             "PROJECTS", "SESSIONS"]
     saved = {n: getattr(pool, n) for n in names}
     root = tmp / "state"
     for n in names:
@@ -436,8 +437,8 @@ def test_gate_state_locking(tmp: Path) -> None:
 
     def churn(n: int) -> None:
         for i in range(6):
-            sh([sys.executable, str(helper), "await", f"agent-{n}-{i}"], cwd=d, env=env)
-            sh([sys.executable, str(helper), "clear-await"], cwd=d, env=env)
+            sh([sys.executable, str(helper), "--run", f"r{n}", "await", f"agent-{n}-{i}"], cwd=d, env=env)
+            sh([sys.executable, str(helper), "--run", f"r{n}", "clear-await"], cwd=d, env=env)
 
     threads = [threading.Thread(target=churn, args=(n,)) for n in range(6)]
     for t in threads:
@@ -450,13 +451,17 @@ def test_gate_state_locking(tmp: Path) -> None:
 
     # resolve-ticket Step 7 needs the await in BOTH files or the armed gate refuses the yield the
     # harden cycle needs. One command, so the two cannot come apart.
-    sh([sys.executable, str(helper), "harden-set", "--cycle", "2", "--edits", "3"], cwd=d, env=env)
-    sh([sys.executable, str(helper), "await", "harden phase 2"], cwd=d, env=env)
+    # The SAME id on both, because it is one run. A different one here replaced the entry and the
+    # count vanished -- which is what `resolve-ticket` Step 7 did, hard-coding an id of its own
+    # while the nested `/harden` minted another.
+    sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "2", "--edits", "3"],
+       cwd=d, env=env)
+    sh([sys.executable, str(helper), "--run", "r0", "await", "harden phase 2"], cwd=d, env=env)
     pr = json.loads((home / ".claude/pr-harden-state.json").read_text())[str(d)]
     hd = json.loads((home / ".claude/harden-state.json").read_text())[str(d)]
     check("one await reaches the pr-harden gate", [a["agent"] for a in pr["awaiting"]] == ["harden phase 2"])
     check("the same await reaches the harden gate", [a["agent"] for a in hd["awaiting"]] == ["harden phase 2"])
-    sh([sys.executable, str(helper), "clear-await"], cwd=d, env=env)
+    sh([sys.executable, str(helper), "--run", "r0", "clear-await"], cwd=d, env=env)
     pr = json.loads((home / ".claude/pr-harden-state.json").read_text())[str(d)]
     hd = json.loads((home / ".claude/harden-state.json").read_text())[str(d)]
     check("clearing it clears both", pr["awaiting"] == [] and hd["awaiting"] == [])
@@ -469,12 +474,13 @@ def test_gate_state_locking(tmp: Path) -> None:
         "--phase", "init", "--blocking", "1"], cwd=d, env=env)
     pr = json.loads((home / ".claude/pr-harden-state.json").read_text())[str(d)]
     check("the owning session's pid is stamped on the entry", pr.get("owner") == 4242, str(pr))
-    sh([sys.executable, str(helper), "--owner", "4242", "await", "review r1"], cwd=d, env=env)
+    sh([sys.executable, str(helper), "--owner", "4242", "--run", "rt1", "await", "review r1"],
+       cwd=d, env=env)
     hd = json.loads((home / ".claude/harden-state.json").read_text())[str(d)]
     check("an await stamps the owner on the entry it creates too", hd.get("owner") == 4242, str(hd))
 
     # `--count-edits` is the one definition of what a harden cycle changed. A retyped count is the
-    # thing that drifts from the gate's reading of it.
+    # thing that drifts from the number the run reports. It is reported only; the gate reads phase1.
     repo = tmp / "repo"
     repo.mkdir()
     for args in (["git", "init", "-q", "."], ["git", "config", "user.email", "t@t"],
@@ -484,38 +490,327 @@ def test_gate_state_locking(tmp: Path) -> None:
     sh(["git", "add", "-A"], cwd=repo)
     sh(["git", "commit", "-qm", "seed"], cwd=repo)
     check("a clean tree counts zero edits",
-          "edits=0" in sh([sys.executable, str(helper), "harden-set", "--cycle", "1",
+          "edits=0" in sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "1",
                            "--count-edits"], cwd=repo, env=env).stdout)
     (repo / "a").write_text("2\n")
     (repo / "b").write_text("new\n")
-    got = sh([sys.executable, str(helper), "harden-set", "--cycle", "1", "--count-edits"],
+    got = sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "1", "--count-edits"],
              cwd=repo, env=env).stdout
     check("an uncommitted change and an untracked file both count", "edits=2" in got, got.strip())
     snapshot = (home / ".claude/harden-state.json").read_text()
-    bad = sh([sys.executable, str(helper), "harden-set", "--cycle", "1"], cwd=repo, env=env)
+    bad = sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "1"], cwd=repo, env=env)
     check("harden-set refuses to guess an edit count", bad.returncode != 0, bad.stderr[-120:])
     check("a refused command leaves the state files exactly as they were",
           (home / ".claude/harden-state.json").read_text() == snapshot,
           "the error path wrote to the file")
 
+    # `phase1`/`phase2` are what END a /harden run; `edits` is reported and gates nothing.
+    # Resolved, like the worktree keys above: the tenant key is the PHYSICAL path, and on macOS
+    # `tmp` sits under a symlinked `/var`, so an unresolved `str(repo)` finds no entry at all.
+    key = str(repo.resolve())
+    got = sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "1", "--phase1", "open",
+              "--count-edits"], cwd=repo, env=env).stdout
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("--phase1 open writes the verdict and defaults phase2 to pending",
+          hd.get("phase1") == "open" and hd.get("phase2") == "pending", str(hd))
+    check("the printed line names both phases", "phase1=open phase2=pending" in got, got.strip())
+    sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "1", "--phase1", "converged",
+        "--phase2", "done", "--count-edits"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("converged + done is what the gate allows on",
+          hd["phase1"] == "converged" and hd["phase2"] == "done", str(hd))
+
+    # Most of this entry persists across a write that does not name it -- `phase1`, `owner`, `head`
+    # and the rest all survive one -- and nothing clears it between interactive runs. What makes
+    # `phase2` the field that must not carry is that it is scoped to a TRAVERSAL while the others
+    # are scoped to the entry. Both directions of that were live defects a fresh reviewer built: a
+    # `done` carried into the NEXT run let its first converging pass stop with its own Phase 2 never
+    # run, and a third value, `escalated`, survived `--phase1 converged` and wedged the run on the
+    # instruction it had just obeyed.
+    sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "1", "--phase1", "converged",
+        "--count-edits"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("a converging Phase 1 write does not inherit a previous traversal's phase2 done",
+          hd["phase2"] == "pending", str(hd))
+    sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "1", "--phase1", "converged",
+        "--phase2", "done", "--count-edits"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "2", "--phase1", "open",
+        "--count-edits"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("reopening Phase 1 clears the previous traversal's phase2 done",
+          hd["phase2"] == "pending", str(hd))
+
+    # Both argparse guards. An unrecognised `phase1` fails open at the hook -- `open` and
+    # `converged` are opposite answers and it cannot pick -- so a bad one written here would end a
+    # run outright; an unrecognised `phase2` blocks there, so a bad one wedges instead. Refusing at
+    # the writer is what keeps either from being written at all. Only the phase1 half was covered
+    # when this shipped; deleting `choices=HARDEN_PHASE2` reddened nothing, which is how the gap was
+    # found.
+    # `escalated` is in the pair on purpose: it is the RETIRED third value, and a behavioural
+    # refusal is what pins its removal. The first draft of this case asserted the string was absent
+    # from the file — which fails on the comment explaining why the value is gone, and would pass
+    # on a writer that still accepted it under another name.
+    for flag, value in (("--phase1", "finished"), ("--phase2", "dome"),
+                        ("--phase2", "escalated")):
+        snap = (home / ".claude/harden-state.json").read_text()
+        bad = sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "2", "--phase1",
+                  "converged", flag, value, "--count-edits"], cwd=repo, env=env)
+        check(f"{flag} {value} is refused rather than written",
+              bad.returncode != 0, bad.stderr[-120:])
+        check(f"and a refused {flag} {value} leaves the entry alone",
+              (home / ".claude/harden-state.json").read_text() == snap)
+
+    # The commit half must be measured on the ORDINARY run. The head-reuse guard demanded the
+    # cycle ADVANCE, which was right when a cycle was written once per cycle -- but `--cycle` now
+    # numbers the traversal and only an escalation moves it, so on a run with no escalation it
+    # never advanced and the figure silently lost its commit half on every write.
+    sh([sys.executable, str(helper), "--owner", "4141", "--run", "r4141", "harden-set", "--cycle", "1",
+        "--phase1", "open", "--count-edits"], cwd=repo, env=env)
+    (repo / "later").write_text("x\n")
+    sh(["git", "add", "-A"], cwd=repo)
+    sh(["git", "commit", "-qm", "work inside one traversal"], cwd=repo)
+    got = sh([sys.executable, str(helper), "--owner", "4141", "--run", "r4141", "harden-set", "--cycle", "1",
+              "--phase1", "converged", "--count-edits"], cwd=repo, env=env).stdout
+    check("a commit made inside one traversal is counted, without the cycle advancing",
+          "edits=1" in got and "not measured" not in got, got.strip())
+    # ...and the guard it relaxes still holds: a DIFFERENT session must not count from this run's
+    # head, which is what `>=` could have given away.
+    got = sh([sys.executable, str(helper), "--owner", "4242", "--run", "r4242", "harden-set", "--cycle", "1",
+              "--phase1", "open", "--count-edits"], cwd=repo, env=env).stdout
+    check("another session's head is still not consumed as this run's baseline",
+          "not measured" in got, got.strip())
+
+    # `--phase2` with no `--phase1` leaned on a verdict this run may never have written -- in a
+    # reused checkout, the previous run's `converged` -- so `--phase2 done` alone could end a run
+    # that had run nothing.
+    # The refusal is UNCONDITIONAL, and the entry that must drive it is one that ALREADY carries a
+    # verdict — in a reused checkout that verdict is the previous run's, and `--phase2 done` alone
+    # would end a run that has run nothing. A first version tested "no phase1 on the entry", which
+    # fires only where phase2 is never read and misses this, so both shapes are pinned here.
+    sh([sys.executable, str(helper), "--owner", "11111", "--run", "r11111", "harden-set", "--cycle", "1",
+        "--phase1", "converged", "--phase2", "done", "--count-edits"], cwd=repo, env=env)
+    snap = (home / ".claude/harden-state.json").read_text()
+    bad = sh([sys.executable, str(helper), "--owner", "22222", "--run", "r22222", "harden-set", "--cycle", "1",
+              "--phase2", "done", "--count-edits"], cwd=repo, env=env)
+    check("--phase2 alone is refused OVER a previous run's verdict",
+          bad.returncode != 0 and "needs --phase1" in bad.stderr, bad.stderr[-160:])
+    check("and that refusal leaves the previous run's entry untouched",
+          (home / ".claude/harden-state.json").read_text() == snap)
+    sh([sys.executable, str(helper), "clear", "--only", "harden"], cwd=repo, env=env)
+    bad = sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "1", "--phase2", "done",
+              "--count-edits"], cwd=repo, env=env)
+    check("--phase2 alone is refused on an entry with no verdict either",
+          bad.returncode != 0 and "needs --phase1" in bad.stderr, bad.stderr[-160:])
+    # That clear empties the entry, so put a phased one back for the two cases below.
+    sh([sys.executable, str(helper), "--run", "r0", "harden-set", "--cycle", "2", "--phase1", "open",
+        "--count-edits"], cwd=repo, env=env)
+
+    # The run boundary. Two of the family's six defects arrived here after the others were closed:
+    # a whole terminal verdict picked up by a write that omitted `--phase1`, and then an `awaiting`
+    # that the five-name drop list did not name. The inverse mutation matters -- a suite that cannot
+    # tell the fixed writer from the broken one is what let both through -- so the replacement, the
+    # await path, the same-run keep and the unstamped no-op are all pinned.
+    # A DIFFERENT run REPLACES the entry. The predecessor of this rule dropped a LIST of five
+    # field names, and `awaiting` -- the one name not on it -- was the sixth allow-direction defect
+    # of the family, letting a dead run's outstanding agent allow a stop on `phase1: open`. So the
+    # property to pin is not "these fields went" but "nothing of the old run survived", which is
+    # what makes a seventh member impossible rather than merely absent.
+    sh([sys.executable, str(helper), "--owner", "31313", "--run", "A", "harden-set", "--cycle", "1",
+        "--phase1", "converged", "--phase2", "done", "--override", "--reason", "A's reason",
+        "--count-edits"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--owner", "31313", "--run", "A", "await", "A's agent",
+        "--only", "harden"], cwd=repo, env=env)
+    before = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("run A's entry carries a verdict, an override, a head and an outstanding agent",
+          before.get("phase1") == "converged" and before.get("override") is True
+          and before.get("head") and before.get("awaiting"), str(before))
+    got = sh([sys.executable, str(helper), "--owner", "41414", "--run", "B", "harden-set",
+              "--cycle", "1", "--count-edits"], cwd=repo, env=env).stdout
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    survived = [k for k in ("phase1", "phase2", "override_reason") if k in hd]
+    check("a new run's write leaves NOTHING of the old one -- not a field, not the awaiting",
+          not survived and hd.get("awaiting") == [] and hd.get("override") is False, str(hd))
+    check("and does not measure against the previous run's head",
+          "no head from an earlier cycle" in got, got.strip())
+    # An UNSTAMPED predecessor is replaced too, and this is the case the first version exempted.
+    # Reading an absent id as "adoptable in place" put the sixth defect straight back: every entry
+    # written before the id existed has no id, so its `awaiting` merged into the new run and
+    # allowed a stop on that run's own `phase1: open`.
+    sh([sys.executable, str(helper), "clear", "--only", "harden"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--owner", "31313", "--run", "r31313", "harden-set", "--cycle", "1",
+        "--phase1", "converged", "--phase2", "done", "--count-edits"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--owner", "31313", "--run", "unstamped-stand-in", "await",
+        "a dead run's agent", "--only", "harden"], cwd=repo, env=env)
+    # ...then strip the id, to stand in for an entry written before ids existed. `gate-state` can no
+    # longer produce one, which is the point of the requirement; the hook still meets them on disk.
+    _sf = home / ".claude/harden-state.json"
+    _st = json.loads(_sf.read_text()); _st[key].pop("run", None)
+    _sf.write_text(json.dumps(_st, indent=2, sort_keys=True) + "\n")
+    sh([sys.executable, str(helper), "--owner", "41414", "--run", "C", "harden-set", "--cycle", "1",
+        "--phase1", "open", "--count-edits"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("an entry with NO run id is replaced, awaiting and all",
+          hd.get("phase1") == "open" and hd.get("phase2") == "pending"
+          and hd.get("awaiting") == [] and hd.get("run") == "C"
+          and "override_reason" not in hd, str(hd))
+
+    # The head is reused across this run's own writes, and NOT across a traversal that has gone
+    # backwards -- a run restarting its numbering. The bound is the last identity test left in
+    # `count_edits`, two others having been deleted as dead, and nothing covered it.
+    sh([sys.executable, str(helper), "clear", "--only", "harden"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--run", "bound", "harden-set", "--cycle", "5",
+        "--phase1", "open", "--count-edits"], cwd=repo, env=env)
+    (repo / "bound-work").write_text("x\n")
+    sh(["git", "add", "-A"], cwd=repo)
+    sh(["git", "commit", "-qm", "work inside the traversal"], cwd=repo)
+    fwd = sh([sys.executable, str(helper), "--run", "bound", "harden-set", "--cycle", "5",
+              "--phase1", "open", "--count-edits"], cwd=repo, env=env).stdout
+    check("a head recorded by this run at the same cycle is reused",
+          "edits=1" in fwd and "not measured" not in fwd, fwd.strip())
+    back = sh([sys.executable, str(helper), "--run", "bound", "harden-set", "--cycle", "1",
+               "--phase1", "open", "--count-edits"], cwd=repo, env=env).stdout
+    check("but a traversal number that went BACKWARDS does not reuse it",
+          "not measured" in back, back.strip())
+
+    # `--run` is REQUIRED wherever `adopt` can reach a verdict. It used to be safe only because a
+    # docstring said every documented write carried it, and that sentence was false in the helper's
+    # own usage block -- so a run typing what the helper documented rode the previous run's entry.
+    for cmd in (["harden-set", "--cycle", "1", "--phase1", "open", "--count-edits"],
+                ["await", "an agent", "--only", "harden"],
+                ["await", "an agent"]):
+        bad = sh([sys.executable, str(helper), "--owner", "51515", *cmd], cwd=repo, env=env)
+        check(f"`{cmd[0]} {cmd[1]}` without --run is refused",
+              bad.returncode != 0 and "needs --run" in bad.stderr, bad.stderr[-140:])
+    for cmd in (["clear-await", "--only", "harden"], ["clear-await"]):
+        bad = sh([sys.executable, str(helper), "--owner", "51515", *cmd], cwd=repo, env=env)
+        check(f"`{' '.join(cmd)}` without --run is refused too",
+              bad.returncode != 0 and "needs --run" in bad.stderr, bad.stderr[-140:])
+    for cmd in (["await", "a pr agent", "--only", "pr"], ["clear-await", "--only", "pr"]):
+        ok = sh([sys.executable, str(helper), "--owner", "51515", *cmd], cwd=repo, env=env)
+        check(f"but `{cmd[0]} --only pr` does not need one -- it cannot reach the harden entry",
+              ok.returncode == 0, ok.stderr[-140:])
+    # `--only` BEFORE the subcommand fails as argparse's `invalid choice: 'pr'`, a message that does
+    # not name `--only`, so guidance keyed on the message never reached it (#480, #485, #488). And
+    # #488 was steered there by the --run refusal, which named where --run goes and not --only.
+    for cmd in (["--only", "pr", "await", "x"], ["--only", "harden", "clear"]):
+        bad = sh([sys.executable, str(helper), "--owner", "51515", *cmd], cwd=repo, env=env)
+        check(f"`{' '.join(cmd)}` says --only goes AFTER the subcommand",
+              bad.returncode != 0 and "AFTER the subcommand" in bad.stderr, bad.stderr[-200:])
+    bad = sh([sys.executable, str(helper), "--owner", "51515", "await", "an agent"], cwd=repo, env=env)
+    check("the --run refusal on await names `--only pr` placed after the subcommand",
+          "await <label> --only pr" in bad.stderr, bad.stderr[-240:])
+    # `clear-await` adopts, like `await`. Without it, it was the last writer that could touch the
+    # harden entry with no id: on a virgin file it created one the hook reads as LEGACY, and its
+    # `stamp` restarted the six-hour expiry on a dead run's entry -- the documented way out of a
+    # wedge. Its harm was block-direction, which is how it survived eight review passes.
+    sh([sys.executable, str(helper), "clear", "--only", "harden"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--owner", "61616", "--run", "P", "harden-set", "--cycle", "1",
+        "--phase1", "converged", "--phase2", "done", "--count-edits"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--owner", "62626", "--run", "Q", "clear-await",
+        "--only", "harden"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("clear-await from a new run replaces the entry rather than refreshing it",
+          hd.get("run") == "Q" and "phase1" not in hd, str(hd))
+
+    # An empty id is shared by every run and reads to the gate as no id at all, which puts a
+    # verdict-less write back in the legacy branch where `edits: 0` allows. It is also what quoting
+    # an unset shell variable produces, which is the correction a run reaches for first.
+    snap = (home / ".claude/harden-state.json").read_text()
+    bad = sh([sys.executable, str(helper), "--run", "", "harden-set", "--cycle", "1",
+              "--phase1", "open", "--count-edits"], cwd=repo, env=env)
+    check("an empty --run is refused rather than written",
+          bad.returncode != 0 and "non-empty" in bad.stderr, bad.stderr[-140:])
+    check("and the refusal leaves the entry alone",
+          (home / ".claude/harden-state.json").read_text() == snap)
+
+    # The printed line has to agree with the gate about what LEGACY means, because the skill tells
+    # the run to trust it: keyed on the verdict alone it announced the zero-edit rule to a
+    # run-stamped entry the gate was blocking for having stated no verdict.
+    got = sh([sys.executable, str(helper), "--run", "D", "harden-set", "--cycle", "1",
+              "--count-edits"], cwd=repo, env=env).stdout
+    check("a run-stamped entry with no verdict is not reported as LEGACY",
+          "LEGACY" not in got, got.strip())
+
+    # An `await` creates this entry as readily as a `harden-set` does, and that is the path the
+    # sixth defect came in on, so the boundary has to hold there too.
+    sh([sys.executable, str(helper), "--owner", "31313", "--run", "A", "harden-set", "--cycle", "1",
+        "--phase1", "converged", "--phase2", "done", "--count-edits"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--owner", "41414", "--run", "B", "await", "B's agent",
+        "--only", "harden"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("an await from a new run replaces the entry too",
+          "phase1" not in hd and [a["agent"] for a in hd["awaiting"]] == ["B's agent"], str(hd))
+    # The SAME run keeps its own state across writes, or nothing could accumulate.
+    sh([sys.executable, str(helper), "--owner", "41414", "--run", "B", "harden-set", "--cycle", "1",
+        "--phase1", "open", "--count-edits"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--owner", "41414", "--run", "B", "harden-set", "--cycle", "1",
+        "--count-edits"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("but the SAME run's later write keeps its own verdict",
+          hd.get("phase1") == "open", str(hd))
+    # There is no longer an unstamped write to worry about: the refusal above makes one impossible
+    # for any command that can reach a verdict, which is what turned `adopt`'s safety from a
+    # sentence in a docstring into something the writer enforces.
+
+    # `override` is rewritten by every write, so its reason has to go with it or the entry carries a
+    # justification for a deviation it no longer records.
+    sh([sys.executable, str(helper), "--owner", "41414", "--run", "r41414", "harden-set", "--cycle", "1", "--phase1",
+        "open", "--override", "--reason", "cost", "--count-edits"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("a taken override records its reason",
+          hd.get("override") is True and hd.get("override_reason") == "cost", str(hd))
+    sh([sys.executable, str(helper), "--owner", "41414", "--run", "r41414", "harden-set", "--cycle", "1",
+        "--phase1", "open", "--count-edits"], cwd=repo, env=env)
+    hd = json.loads((home / ".claude/harden-state.json").read_text())[key]
+    check("and a later write retracts both, never the flag alone",
+          hd.get("override") is False and "override_reason" not in hd, str(hd))
+
+    # The LEGACY warning reads the ENTRY, not the arguments. Keyed on the argument it announced a
+    # legacy entry over a `phase1` the entry already carried and the gate was already enforcing.
+    sh([sys.executable, str(helper), "--run", "r41414", "harden-set", "--cycle", "2", "--phase1",
+        "open", "--count-edits"], cwd=repo, env=env)
+    got = sh([sys.executable, str(helper), "--run", "r41414", "harden-set", "--cycle", "2",
+              "--count-edits"], cwd=repo, env=env).stdout
+    check("omitting --phase1 on this run's own PHASED entry does not claim it went legacy",
+          "LEGACY" not in got and "phase1=open" in got, got.strip())
+    # A FRESH entry for a run that has stated no verdict. A bare write over this run's own earlier
+    # verdict keeps it, which is the case above; this is the other one.
+    sh([sys.executable, str(helper), "clear", "--only", "harden"], cwd=repo, env=env)
+    got = sh([sys.executable, str(helper), "--run", "r41414", "harden-set", "--cycle", "3",
+              "--count-edits"], cwd=repo, env=env).stdout
+    check("a run-stamped entry with no verdict says that, not LEGACY",
+          "LEGACY" not in got and "no verdict recorded yet" in got, got.strip())
+    # `gate-state` can no longer WRITE a legacy entry -- `--run` is required wherever a verdict is
+    # reachable -- so the only legacy entries are the ones already on disk from before the id
+    # existed. Build one the way the world does, by hand, and check both readers still honour it.
+    sh([sys.executable, str(helper), "clear", "--only", "harden"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--run", "r41414", "harden-set", "--cycle", "1",
+        "--count-edits"], cwd=repo, env=env)
+    sfile = home / ".claude/harden-state.json"
+    st = json.loads(sfile.read_text()); st[key].pop("run", None); st[key]["edits"] = 4
+    sfile.write_text(json.dumps(st, indent=2, sort_keys=True) + "\n")
+    hd = json.loads(sfile.read_text())[key]
+    check("a pre-run-id entry on disk keeps no run and no verdict",
+          "run" not in hd and "phase1" not in hd, str(hd))
+
     # A branch with no upstream is the pre-PR configuration, and `@{u}..HEAD` has no answer there:
-    # on #255 and #229 a cycle that committed 9 and 3 commits scored edits=0, which the gate reads as
+    # on #255 and #229 a cycle that committed 9 and 3 commits scored edits=0, which the gate then read as
     # converged. The commit half is measured against the head the previous cycle of the same run
     # recorded instead.
     sh(["git", "add", "-A"], cwd=repo)
     sh(["git", "commit", "-qm", "cycle one's work"], cwd=repo)
-    got = sh([sys.executable, str(helper), "--owner", "777", "harden-set", "--cycle", "1",
+    got = sh([sys.executable, str(helper), "--owner", "777", "--run", "r777", "harden-set", "--cycle", "1",
               "--count-edits"], cwd=repo, env=env).stdout
     check("with no upstream and no earlier cycle, the commit half is reported unmeasured",
           "commit half not measured" in got, got.strip())
     (repo / "c").write_text("cycle two\n")
     sh(["git", "add", "-A"], cwd=repo)
     sh(["git", "commit", "-qm", "cycle two's work"], cwd=repo)
-    got = sh([sys.executable, str(helper), "--owner", "777", "harden-set", "--cycle", "2",
+    got = sh([sys.executable, str(helper), "--owner", "777", "--run", "r777", "harden-set", "--cycle", "2",
               "--count-edits"], cwd=repo, env=env).stdout
     check("a committed cycle on an upstreamless branch counts its commit", "edits=1" in got,
           got.strip())
-    got = sh([sys.executable, str(helper), "--owner", "888", "harden-set", "--cycle", "3",
+    got = sh([sys.executable, str(helper), "--owner", "888", "--run", "r888", "harden-set", "--cycle", "3",
               "--count-edits"], cwd=repo, env=env).stdout
     check("another session's head is not consumed as this run's baseline",
           "commit half not measured" in got, got.strip())
@@ -524,7 +819,7 @@ def test_gate_state_locking(tmp: Path) -> None:
     repo_key = next(k for k in state if k.endswith("/repo"))
     state[repo_key]["head"] = "0" * 40
     (home / ".claude/harden-state.json").write_text(json.dumps(state))
-    got = sh([sys.executable, str(helper), "--owner", "888", "harden-set", "--cycle", "4",
+    got = sh([sys.executable, str(helper), "--owner", "888", "--run", "r888", "harden-set", "--cycle", "4",
               "--count-edits"], cwd=repo, env=env).stdout
     check("a recorded head that no longer resolves is reported, not counted as zero",
           "no longer resolves" in got, got.strip())
@@ -541,11 +836,11 @@ def test_gate_state_locking(tmp: Path) -> None:
     (repo / "d").write_text("cycle five\n")
     sh(["git", "add", "-A"], cwd=repo)
     sh(["git", "commit", "-qm", "cycle five's work"], cwd=repo)
-    got = sh([sys.executable, str(helper), "--owner", "999", "harden-set", "--cycle", "5",
+    got = sh([sys.executable, str(helper), "--owner", "999", "--run", "r999", "harden-set", "--cycle", "5",
               "--count-edits"], cwd=repo, env=env).stdout
     check("with an upstream and no head yet, the per-branch fallback says what it counted",
           "rather than this cycle's work" in got, got.strip())
-    got = sh([sys.executable, str(helper), "--owner", "999", "harden-set", "--cycle", "6",
+    got = sh([sys.executable, str(helper), "--owner", "999", "--run", "r999", "harden-set", "--cycle", "6",
               "--count-edits"], cwd=repo, env=env).stdout
     check("a converged cycle counts zero even with commits unpushed behind it",
           "edits=0" in got, got.strip())
@@ -599,6 +894,19 @@ def test_gate_state_locking(tmp: Path) -> None:
     entry = json.loads((home / ".claude/pr-harden-state.json").read_text())[str(hand.resolve())]
     check("the resolve-ticket handoff keeps its ledger when the PR number arrives",
           [d["id"] for d in entry["declined"]] == ["r1-1"], json.dumps(entry))
+
+    # A `building` write has no PR yet, so landing on an entry that names one is a previous run's
+    # leftover (#477 inherited PR #483's). It warns and changes nothing: the same write from a run
+    # that already opened its PR must not lose that PR's ledger.
+    got = sh([sys.executable, str(helper), "pr-set", "--ticket", "379", "--round", "1",
+              "--phase", "building", "--blocking", "0"], cwd=hand, env=env).stdout
+    entry = json.loads((home / ".claude/pr-harden-state.json").read_text())[str(hand.resolve())]
+    check("a building write over an entry naming a PR says which PR", "PR 382" in got, got.strip())
+    check("and keeps that PR and its ledger", entry["pr"] == 382
+          and [d["id"] for d in entry["declined"]] == ["r1-1"], json.dumps(entry))
+    got = sh([sys.executable, str(helper), "pr-set", "--pr", "382", "--round", "1",
+              "--phase", "init", "--blocking", "0"], cwd=hand, env=env).stdout
+    check("a write that names the PR does not warn", "warning" not in got, got.strip())
 
 
 # ─────────────────────────────────────────────────────────── scheduling ──
@@ -657,6 +965,9 @@ def test_parallel_run(tmp: Path) -> None:
 
     with isolated(tmp):
         results = pool.run_wave(jobs, slots, cfg, {}, say, {str(work): base})
+        # Where `claude` files each session: the folder `silence_since` already reads.
+        folders = {j["ticket"]: pool.project_dir_name(pool.worktree_path("o/r", j["ticket"]))
+                   for j in jobs}
 
     check("both tickets ran", len(results) == 2, str(results))
     lines = [l for l in marker.read_text().splitlines() if l.strip()]
@@ -680,6 +991,15 @@ def test_parallel_run(tmp: Path) -> None:
     check("the driver capture landed in the suite's own tree",
           list((tmp / "state/skill-lessons").glob("*.md")) != [],
           "no record was written anywhere the suite can see")
+    # A capture's `transcript:` is where a retro opens a run that died, so it must be a path and not
+    # the record template's `<cwd-slug>` placeholder, which every capture carried until 2026-09-25.
+    for ticket, folder in folders.items():
+        caps = list((tmp / "state/skill-lessons").glob(f"*-{ticket}-driver.md"))
+        text = caps[0].read_text() if len(caps) == 1 else ""
+        line = next((l for l in text.splitlines() if l.startswith("transcript:")), "")
+        sid = next((l.split()[1] for l in text.splitlines() if l.startswith("session: ")), "?")
+        check(f"#{ticket}'s driver capture names its own session's transcript, in the folder silence_since reads",
+              line == f"transcript: ~/.claude/projects/{folder}/{sid}.jsonl", line or str(caps))
     check("the operator's real skill-lessons gained nothing",
           real_lessons_before == {p.name for p in REAL_LESSONS.glob("*.md")},
           str({p.name for p in REAL_LESSONS.glob("*.md")} - real_lessons_before))
@@ -733,6 +1053,58 @@ def test_record_attribution(tmp: Path) -> None:
               got is None or "310" not in got.name, str(got))
         got = pool.record_written(before2, "266", set())
         check("with no siblings the unnumbered fallback still finds a record", got is not None)
+
+        # #542 on 2026-09-25: an owner-directed retro edited an old note mid-run, the run wrote no
+        # record, and the fallback handed the run the note.
+        note = lessons / "2026-01-01-a-defect-note.md"
+        note.write_text("somebody else's note\n")
+        before3 = pool.lesson_files()
+        note.write_text("somebody else's note, edited mid-run\n")
+        got = pool.record_written(before3, "542", set())
+        check("with no stream, a pre-existing file edited mid-run is not taken", got is None, str(got))
+        stream = tmp / "542.jsonl"
+        def calls(*inputs, output=""):
+            events = [{"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": i} for i in inputs]}}]
+            if output:
+                events.append({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "content": output}]}})
+            stream.write_text("".join(json.dumps(e) + "\n" for e in events))
+            return stream
+
+        got = pool.record_written(before3, "542", set(), calls({"command": "true"}))
+        check("nor when the run's stream never names it", got is None, str(got))
+        got = pool.record_written(before3, "542", set(),
+                                  calls({"command": "ls -t ~/.claude/skill-lessons"}, output=note.name))
+        check("nor when only a tool's OUTPUT names it (#444 listed the store)", got is None, str(got))
+        got = pool.record_written(before3, "542", set(),
+                                  calls({"command": f"cat >> ~/.claude/skill-lessons/{note.name}"}))
+        check("but it is taken when the run's own tool call names it", got == note, str(got))
+        (lessons / "2026-01-01-repo-PR543.md").write_text("a pr-named record, unnumbered for #542\n")
+        (lessons / "2026-01-01-a-later-note.md").write_text("newer, and no business of this run's\n")
+        got = pool.record_written(before3, "542", set(), calls(
+            {"file_path": "/x/.claude/skill-lessons/2026-01-01-repo-PR543.md", "content": "..."}))
+        check("a record named for the PR is found through the stream over a newer unnamed file",
+              got and got.name.endswith("-PR543.md"), str(got))
+
+
+def test_record_says_aborted(tmp: Path) -> None:
+    print("\nreading a run's abort from a record file that may hold several runs")
+    # Longer than the 12 lines the pre-append reader scanned, as every real record is.
+    converged = ("# resolve-ticket · repo · #1 · 2026-01-01\noutcome: converged\n"
+                 + "".join(f"\n## Section {i}\n- an entry\n" for i in range(5)))
+    aborted = "# resolve-ticket · repo · #1 · 2026-01-01\noutcome: aborted (condition 3)\n\n## Declined\n"
+    capture = f"\n{pool.DRIVER_HEADER}\noutcome as the driver measured it: no-pr\n- nothing\n"
+    fence = "\n## Where a skill blocked or contradicted this run\n```\n# re-run the probe\nmvn test\n```\n"
+    cases = [("a second run that aborted after a first converged is an abort", converged + aborted, True),
+             ("a second run that converged after a first aborted is not", aborted + converged, False),
+             ("a driver capture appended after an aborted record does not hide it", aborted + capture, True),
+             ("a fenced `# ` comment inside an aborted record does not hide it", aborted + fence, True),
+             ("a single converged record is not an abort", converged, False)]
+    for i, (name, text, want) in enumerate(cases):
+        path = tmp / f"abort-{i}.md"
+        path.write_text(text)
+        check(name, pool.record_says_aborted(path) is want, text)
 
 
 def test_crash_does_not_clobber(tmp: Path) -> None:
@@ -844,6 +1216,9 @@ def test_db_port_hosts(tmp: Path) -> None:
           str(pool.slot_problems(cfg, 2)))
 
 
+Q = chr(34) * 3          # the docstring delimiter, spelled so this file can contain it
+
+
 def test_skills_commands_run(tmp: Path) -> None:
     """Every `gate-state` invocation the skills tell a run to type, executed as written.
 
@@ -866,7 +1241,16 @@ def test_skills_commands_run(tmp: Path) -> None:
     sh(["git", "add", "-A"], cwd=repo)
     sh(["git", "commit", "-qm", "seed"], cwd=repo)
 
-    skills = Path.home() / ".claude/skills"
+    # The REPO's skills, not `~/.claude`'s. Reading the installed copy meant this suite validated
+    # a file the commit under test had not changed: six invocations that cannot run went green,
+    # and only syncing the install afterwards turned it red. Repo-vs-installed drift is
+    # `parity_problems`' job; this test's job is the file being committed.
+    # `gate-state`'s OWN usage block is scanned too. It is documentation a run reads and copies,
+    # it drifted from the skills it summarises, and the eighth defect of the inheritance family
+    # came straight out of it: two harden writes with no `--run`, 118 lines above a comment
+    # asserting that every documented write carries one.
+    usage = (HERE / "gate-state").read_text().split(Q)[1]
+    skills = HERE.parent / "skills"
     found = []
     for name in ("resolve-ticket", "pr-harden", "harden", "ticket-pool"):
         text = (skills / name / "SKILL.md").read_text()
@@ -874,7 +1258,30 @@ def test_skills_commands_run(tmp: Path) -> None:
             invocation = m.group(1).strip().rstrip("`").strip()
             if invocation and not invocation.startswith("("):
                 found.append((name, invocation))
+    for m in re.finditer(r"^  gate-state ([^\n]+)", usage, re.M):
+        # `[--flag]` is this block's notation for optional, so drop the optional parts and run the
+        # required spine. A placeholder like `<sha>` is passed through as a literal, which is what
+        # a reader would type before substituting and is harmless to the helper.
+        inv = re.sub(r"\[[^\]]*\]", "", m.group(1).split("#")[0])
+        # `<sha>` is a placeholder, and to a shell it is a redirection — substitute before running.
+        inv = re.sub(r"<[^>]+>", "placeholder", inv).strip()
+        if inv and not inv.startswith("("):
+            found.append(("gate-state usage block", inv))
     check("the skills do document the helper", len(found) >= 8, f"only found {len(found)}")
+    # ...and the usage block specifically. Its absence is what let the eighth defect through, and
+    # a scan that silently stops matching -- a reflow past the two-space anchor would do it --
+    # leaves both suites green, which is the shape this whole slice keeps paying for.
+    from_usage = [i for src, i in found if src == "gate-state usage block"]
+    check("and gate-state's own usage block is among the sources scanned",
+          len(from_usage) >= 6, f"only {len(from_usage)} from the usage block")
+    # Name the lines that matter rather than counting them. A `>= 6` pin passed while the four
+    # harden-touching invocations -- the two verdict writes, the await and the clear-await, whose
+    # missing `--run` was the eighth defect -- all stopped matching, because the block has ten.
+    for want in ("harden-set", "await", "clear-await"):
+        hits = [i for i in from_usage
+                if re.search(rf"(?:^|\s){re.escape(want)}(?:\s|$)", i) and "--run" in i]
+        check(f"the usage block's `{want}` is scanned and carries --run",
+              hits, f"no --run-carrying `{want}` among {from_usage}")
 
     bad = []
     for name, invocation in found:
@@ -887,11 +1294,111 @@ def test_skills_commands_run(tmp: Path) -> None:
 
     # And the ones that must be understood as a pair really are one: an await written by the
     # resolve-ticket form has to be visible to BOTH gates, which is the whole of Step 7.
-    sh([sys.executable, str(helper), "--owner", str(os.getpid()), "await", "x"], cwd=repo, env=env)
+    sh([sys.executable, str(helper), "--owner", str(os.getpid()), "--run", "rt1", "await", "x"],
+       cwd=repo, env=env)
     both = [json.loads((home / ".claude" / f).read_text()).get(str(repo.resolve()), {}).get("awaiting")
             for f in ("pr-harden-state.json", "harden-state.json")]
     check("the default-scope await lands in both gates", all(both), str(both))
 
+
+
+def test_parity_names_a_file_on_either_side(tmp: Path) -> None:
+    """`parity_problems` walked only the LIVE skill tree, so a file the repo added and nobody
+    installed was never named, and the retro's "live copies and the mirror identical" read green over
+    a skill whose role file did not exist where every run reads it. Both directions, and the control
+    that identical trees report nothing."""
+    names = ("CLAUDE", "PIPELINE", "GATE_PAIRS", "MIRRORED_SKILLS")
+    saved = {n: getattr(pool, n) for n in names}
+    live, src = tmp / "home", tmp / "repo"
+    try:
+        pool.CLAUDE, pool.PIPELINE = live, live / "pipeline"
+        pool.GATE_PAIRS, pool.MIRRORED_SKILLS = [], ["s"]
+        for d in (live / "pipeline", src / ".claude/pipeline"):
+            d.mkdir(parents=True)
+            for script in ("pool-run", "pool-watch", "gate-state"):
+                (d / script).write_text("same\n")
+        for d in (live / "skills/s", src / ".claude/skills/s"):
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text("same\n")
+        cfg = {"source_repo": str(src)}
+        got = pool.parity_problems(cfg)
+        check("parity: identical trees report nothing", got == [], str(got))
+        (src / ".claude/skills/s/role.md").write_text("new\n")
+        got = pool.parity_problems(cfg)
+        check("parity: a file only the repo has is named", any("s/role.md" in p for p in got), str(got))
+        (live / "skills/s/role.md").write_text("new\n")
+        got = pool.parity_problems(cfg)
+        check("parity: and is not named once it is installed", got == [], str(got))
+        (live / "skills/s/extra.md").write_text("x\n")
+        got = pool.parity_problems(cfg)
+        check("parity: a file only the live copy has is still named",
+              any("s/extra.md" in p for p in got), str(got))
+    finally:
+        for n, v in saved.items():
+            setattr(pool, n, v)
+
+
+def test_a_retro_that_raises_a_budget_unrecorded_is_a_problem(tmp: Path) -> None:
+    """`skill-retro/skill-budgets.json` holds each skill file to an exact word count, and skill-retro
+    Step 4 lets a budget rise only with a stated reason. That reason was prose, and prose is what let
+    the skills grow all month under a "prune as much as you add" rule. So `skill-lint.py --against <ref>`
+    fails a budget that rose since <ref> with no matching `raises` entry, and the driver runs it after
+    every retro against the head that retro started from. The fixture is a real repository and the
+    linter is the repo's own."""
+    src = tmp / "src"
+    lint_dir, skill = src / ".claude/skills/skill-retro", src / ".claude/skills/s"
+    lint_dir.mkdir(parents=True)
+    skill.mkdir(parents=True)
+    shutil.copy(HERE.parent / "skills/skill-retro/skill-lint.py", lint_dir / "skill-lint.py")
+    body = "---\nname: s\nversion: 1\n---\nsome words here\n"
+    (skill / "SKILL.md").write_text(body)
+    n = len(body.encode().split())
+    budgets = lint_dir / "skill-budgets.json"
+    budgets.write_text(json.dumps({"words": {"s": n}, "raises": {}}))
+    for args in (["git", "init", "-q", "."], ["git", "config", "user.email", "t@t"],
+                 ["git", "config", "user.name", "t"], ["git", "add", "-A"], ["git", "commit", "-qm", "seed"]):
+        sh(args, cwd=src)
+    before = sh(["git", "rev-parse", "HEAD"], cwd=src).stdout.strip()
+    got = pool.lint_problems(src, before)
+    check("lint ratchet: an unchanged tree has nothing to say", got == [], str(got))
+    (skill / "SKILL.md").write_text(body + "three more words\n")
+    budgets.write_text(json.dumps({"words": {"s": n + 3}, "raises": {}}))
+    got = pool.lint_problems(src, before)
+    check("lint ratchet: a budget raised with no recorded raise is a problem",
+          any("rose from" in q for q in got), str(got))
+    budgets.write_text(json.dumps({"words": {"s": n + 3},
+                                   "raises": {"s": {"from": n, "to": n + 3, "why": "a new rule"}}}))
+    got = pool.lint_problems(src, before)
+    check("lint ratchet: and is not one once the raise is recorded", got == [], str(got))
+    budgets.write_text(json.dumps({"words": {"s": n + 3},
+                                   "raises": {"s": {"from": n, "to": n + 2, "why": "for other numbers"}}}))
+    got = pool.lint_problems(src, before)
+    check("lint ratchet: a raise recorded for other numbers does not cover this one",
+          any("rose from" in q for q in got), str(got))
+    (skill / "SKILL.md").write_text("---\nname: s\nversion: 1\n---\nwords\n")
+    budgets.write_text(json.dumps({"words": {"s": n - 2}, "raises": {}}))
+    got = pool.lint_problems(src, before)
+    check("lint ratchet: a lowered budget needs no entry", got == [], str(got))
+    (skill / "SKILL.md").write_text(body + "an unbudgeted growth\n")
+    budgets.write_text(json.dumps({"words": {"s": n}, "raises": {}}))
+    got = pool.lint_problems(src, before)
+    check("lint ratchet: a SKILL.md over its budget still fails, as it did before",
+          any("over its budget" in q for q in got), str(got))
+    live = tmp / "live"
+    (live / "skill-retro").mkdir(parents=True)
+    (live / "s").mkdir()
+    shutil.copy(HERE.parent / "skills/skill-retro/skill-lint.py", live / "skill-retro/skill-lint.py")
+    (live / "s/SKILL.md").write_text(body + "five more words here now\n")
+    (live / "skill-retro/skill-budgets.json").write_text(json.dumps({"words": {"s": n + 5}, "raises": {}}))
+    for form in (["--against", before], [f"--against={before}"]):
+        r = sh([sys.executable, str(live / "skill-retro/skill-lint.py"), str(live)] + form, cwd=src)
+        check(f"lint ratchet: the live copy, in no checkout, reads the table at <ref> through the repo it runs in ({form[0][:10]})",
+              r.returncode == 1 and "rose from" in r.stdout, r.stdout[-300:] + r.stderr[-200:])
+    r = sh([sys.executable, str(live / "skill-retro/skill-lint.py"), str(live), "--agains", before], cwd=src)
+    check("lint ratchet: an unknown option is refused, not taken for a root", r.returncode == 2, r.stdout[-200:])
+    (lint_dir / "skill-lint.py").unlink()
+    got = pool.lint_problems(src, before)
+    check("lint ratchet: a missing linter is said, not read as clean", any("missing" in q for q in got), str(got))
 
 
 def test_pool_gate_state_via_helper(tmp: Path) -> None:
@@ -1090,6 +1597,24 @@ def test_claim_and_release(tmp: Path) -> None:
         check("a lease whose worktree is gone is reclaimed, not held forever",
               pool.claim_slot(cfg, "o/r", "402", work, base, say) is not None)
 
+        # A session reaped without a release leaves its gate entry at the ticket's path, and the next
+        # claim of that ticket recreates the same path. Measured on #477: the next session's Step 1
+        # `building` write merged into PR #483's entry, ledgers and all.
+        pool.release_claim(cfg, "310", say)
+        first = pool.claim_slot(cfg, "o/r", "477", work, base, say)
+        _sp.run([str(HERE / "gate-state"), "--owner", "9", "pr-set", "--pr", "483",
+                 "--round", "1", "--phase", "reviewed", "--blocking", "0"],
+                cwd=str(first["worktree"]), capture_output=True)
+        key = str(first["worktree"].resolve())
+        check("the reaped session's gate entry exists before the next claim",
+              json.loads(pool.PR_STATE.read_text()).get(key, {}).get("pr") == 483, "nothing to clean up")
+        (pool.SLOTS / f"{first['slot'].name}.json").unlink()
+        second = pool.claim_slot(cfg, "o/r", "477", work, base, say)
+        check("a new claim of the same ticket takes the leftover gate entry with the old worktree",
+              second is not None and second["worktree"] == first["worktree"]
+              and key not in json.loads(pool.PR_STATE.read_text()),
+              json.dumps(json.loads(pool.PR_STATE.read_text()).get(key)))
+
 
 def test_work_needs_a_terminal(tmp: Path) -> None:
     """`--work` launches an INTERACTIVE session, so refusing without a tty is the whole contract.
@@ -1197,8 +1722,12 @@ def test_work_one_command(tmp: Path) -> None:
         check("with a standalone of its own", line[1] == str(one), line[1])
         check("with co-tenancy declared", line[2] == "slot-1", line[2])
         check("with a private maven head", "m2/slot-1" in line[3], line[3])
+        # ENDS with it rather than IS it. The claim is "nothing left to type", which is about the
+        # prompt being present and LAST; the launch also carries flags now (`--settings`, and
+        # `--remote-control` where it is configured), and an equality here said something stricter
+        # than the sentence above it — that no flag may ever be added — which was never the rule.
         check("and the skill already invoked, so there is nothing left to type",
-              line[4].strip() == "/resolve-ticket https://example/266", repr(line[4]))
+              line[4].strip().endswith("/resolve-ticket https://example/266"), repr(line[4]))
 
         check("the slot is given back when the session exits", pool.active_leases() == {},
               "an unqualified release is ambiguous once two repos are configured, and refusing "
@@ -1222,6 +1751,24 @@ def test_work_one_command(tmp: Path) -> None:
                              {"url": "https://example/266"}, work, say)
         check("and it is off unless asked for",
               "--remote-control" not in seen.read_text(), seen.read_text())
+
+        # The carry cannot land without this. A session that bypasses prompts HOLDS an inbound peer
+        # message from a sender it cannot identify as another session of its own permission class,
+        # and `pool-run` is a python script — unidentifiable by construction, whatever it puts in
+        # the envelope. Measured 2026-09-13: everything else worked, the message was quarantined,
+        # and #379 sat at the limit notice for seven hours past its reset while the log said only
+        # that it had been told. Passed on the LAUNCH because it cannot be set afterwards, and
+        # scoped to this session because it lets any local process put a turn into it.
+        seen.unlink()
+        pool.work_in_session(cfg, "o/r", "266", {"url": "https://example/266"}, work, say)
+        args = seen.read_text().strip().split("|")[4]
+        check("a session the pool starts accepts the nudge the carry will send it",
+              "--settings" in args and "crossSessionInbound" in args and "accept" in args, args)
+        seen.unlink()
+        pool.work_in_session(pool.merge(cfg, {"ticket": {"limit_continue_work": False}}), "o/r",
+                             "266", {"url": "https://example/266"}, work, say)
+        check("and with the carry off it is not loosened at all",
+              "crossSessionInbound" not in seen.read_text(), seen.read_text())
 
         # `pool.json` documents its `claude` block as reaching EVERY session, and for a while
         # `--work` read none of it — an operator's configured model silently did not apply to the
@@ -2943,17 +3490,1084 @@ def test_the_next_hand_launch_closes_out_what_died(tmp: Path) -> None:
           "the reap runs after the claim, where an exception strands the slot")
 
 
+# ────────────────────────────────────────────────────────── usage limit ──
+
+
+def limit_stub(path: Path, argv_log: Path, resets_in: int, status: str = "rejected",
+               tail: str = "", overage: str = "false", exit_code: int = 1) -> Path:
+    """A `claude` that reports a claude.ai usage limit the way the real one does, then dies.
+
+    The `rate_limit_event` record is not invented for this suite: it is the shape the CLI already
+    streams on `--output-format stream-json`, and the operator's own kept streams carry 304 of them
+    (`status`, `resetsAt`, `rateLimitType`, `unifiedWindows`). Only the STATUS differs here —
+    theirs all say `allowed_warning`, because a rejection ends the run that would have logged it.
+    """
+    path.write_text(
+        "#!/bin/bash\n"
+        f'echo "$PWD :: $@" >> {argv_log}\n'
+        f'reset=$(python3 -c "import time;print(int(time.time())+({resets_in}))")\n'
+        "echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\","
+        "\"text\":\"working\"}]}}'\n"
+        f'echo "{{\\"type\\":\\"rate_limit_event\\",\\"rate_limit_info\\":{{\\"status\\":\\"{status}\\",'
+        f'\\"resetsAt\\":$reset,\\"rateLimitType\\":\\"five_hour\\",\\"utilization\\":1.0,'
+        f'\\"isUsingOverage\\":{overage}}}}}"\n'
+        f"{tail}"
+        f"exit {exit_code}\n")
+    path.chmod(0o755)
+    return path
+
+
+def limit_fixture(tmp: Path, quiet: int = 300):
+    """The pieces every usage-limit case needs: a repo, a slot, a config and one ticket."""
+    origin, work = git_fixture(tmp)
+    one = standalone_fixture(tmp / "sa", "sa1", 8081, 3316)
+    cfg = pool.merge(pool.DEFAULTS, {
+        "parallel": {"max_workers": 1, "standalones": [str(one)]},
+        "ticket": {"timeout_seconds": 300, "quiet_seconds": quiet},
+    })
+    job = {"slug": "o/r", "path": work, "ticket": "266", "url": "https://example/266",
+           "title": "t", "key": "o/r#266"}
+    return work, cfg, job
+
+
+def test_a_usage_limit_suspends_the_ticket_rather_than_spending_it(tmp: Path) -> None:
+    """The whole feature: a run the usage limit ended is a PAUSE with a known reset, not an error.
+
+    Before this, the limit reached `work_ticket` as `is_error` and nothing else — indistinguishable
+    from a crash. That cost three things on every ticket in flight when the window closed: the
+    attempt (two of those and the ticket waits for a human), the worktree (dropped, so the session
+    could never be re-entered), and a driver-capture record counted towards the retro threshold —
+    for a run that had not failed at all. What it must produce instead is exactly what an operator
+    pause produces, plus the one thing an operator pause cannot carry: when to come back.
+    """
+    print("\na usage limit suspends the ticket instead of spending it")
+    work, cfg, job = limit_fixture(tmp)
+    argv_log = tmp / "argv.txt"
+    stub = limit_stub(tmp / "claude-stub", argv_log, resets_in=90)
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+
+    with isolated(tmp) as root:
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        started = pool.now()
+        results = pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+
+        check("the ticket reports itself paused, not errored",
+              results == [("o/r#266", "paused")], str(results))
+        entry = pool.load_json(pool.LEDGER, {}).get("o/r#266", {})
+        check("the attempt is NOT spent — the run did not fail, it ran out of quota",
+              entry.get("attempts", 0) == 0, f"attempts={entry.get('attempts')}")
+        check("the worktree is kept, because the session resumes into it",
+              Path(entry.get("worktree", "/nonexistent")).is_dir(), str(entry.get("worktree")))
+        check("the session id is kept", bool(entry.get("session_id")), str(entry))
+        check("no driver-capture record: the run is not over",
+              not list((root / "skill-lessons").glob("*.md")),
+              str([p.name for p in (root / "skill-lessons").glob("*.md")]))
+        check("the row says WHY it is paused, so a pause with a clock is told from the operator's",
+              "usage limit" in (entry.get("paused_for") or ""), str(entry.get("paused_for")))
+        # The reset the CLI reported, not a guess: the driver may not invent a time to come back at.
+        resume_at = entry.get("resume_at")
+        check("the row carries the reset the CLI reported, which is the whole point",
+              isinstance(resume_at, int) and started + 60 <= resume_at <= started + 120,
+              f"resume_at={resume_at} started={started}")
+
+
+def test_a_limit_the_session_got_past_is_not_a_pause(tmp: Path) -> None:
+    """A rejection is not a verdict on the run — only on one moment of it.
+
+    The status field moves: a session rejected while overage is being provisioned, or holding a
+    grace window, sees `rejected` and then `allowed`, and finishes. Latching the first rejection
+    would suspend a session that had already recovered, and the driver would then sit waiting for a
+    reset that had stopped nothing. So the LAST observation wins, and a run that ended normally is
+    never re-read as a pause however it began.
+    """
+    print("\na rejection the session got past is not a pause")
+    work, cfg, job = limit_fixture(tmp)
+    argv_log = tmp / "argv.txt"
+    stub = limit_stub(
+        tmp / "claude-stub", argv_log, resets_in=90,
+        tail=("echo '{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\","
+              "\"utilization\":0.2}}'\n"
+              "echo '{\"type\":\"result\",\"result\":\"done\",\"total_cost_usd\":0.01}'\n"),
+        exit_code=0)
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        results = pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+        entry = pool.load_json(pool.LEDGER, {}).get("o/r#266", {})
+
+    check("the ticket is not paused — it finished", results != [("o/r#266", "paused")], str(results))
+    check("and the attempt IS spent, because the run really ran",
+          entry.get("attempts", 0) == 1, f"attempts={entry.get('attempts')}")
+    check("nothing to come back for", entry.get("resume_at") is None, str(entry.get("resume_at")))
+
+
+def test_a_reset_that_has_already_passed_did_not_stop_this_run(tmp: Path) -> None:
+    """A rejection whose window has since reset cannot be what ended the run — so it is an error.
+
+    Without this the driver has no way to tell "the limit stopped me" from "a limit stopped me
+    hours ago and something else has stopped me now", and would answer the second by sleeping until
+    a reset that is already behind it, waking immediately, and re-entering a session that is going
+    to fail again for the reason nobody looked at.
+    """
+    print("\na reset that has already passed is not what ended the run")
+    work, cfg, job = limit_fixture(tmp)
+    stub = limit_stub(tmp / "claude-stub", tmp / "argv.txt", resets_in=-600)
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        results = pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+        entry = pool.load_json(pool.LEDGER, {}).get("o/r#266", {})
+
+    check("a stale rejection leaves the failure reading as the failure it is",
+          results == [("o/r#266", "error")], str(results))
+    check("and it is spent, like any other error", entry.get("attempts") == 1, str(entry))
+
+
+# ────────────────────────────────────────────────────────────── api outage ──
+
+
+# The CLI's result text for each case, copied from the kept streams rather than written for this
+# suite: #402's first attempt (20260925T152447Z), #515's (20260924T102400Z), and a safeguard refusal.
+OUTAGE_DNS = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+OUTAGE_SILENT = ("API Error: No response from API (waited 4m, then 10m on the retry). If a proxy or "
+                 "gateway on your network holds responses until they complete, raise API_TIMEOUT_MS")
+SAFEGUARD = ("API Error: Opus 5 (1M context)'s safeguards flagged this message "
+             "(https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal "
+             "conversations. ")
+
+
+def failing_then_serving_stub(path: Path, argv_log: Path, counter: Path, failures: int,
+                              result: str) -> Path:
+    """A `claude` whose first `failures` runs end on `result` as an error, and which then finishes."""
+    record = json.dumps({"type": "result", "subtype": "success", "is_error": True, "result": result,
+                         "total_cost_usd": 1.0})
+    path.write_text(
+        "#!/bin/bash\n"
+        f'echo "$@" >> {argv_log}\n'
+        f'n=$(cat {counter} 2>/dev/null || echo 0); echo $((n+1)) > {counter}\n'
+        "echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\","
+        "\"text\":\"working\"}]}}'\n"
+        f'if [ "$n" -lt "{failures}" ]; then\n'
+        f"  cat <<'EOF'\n{record}\nEOF\n"
+        "  exit 1\n"
+        "fi\n"
+        "echo '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\",\"total_cost_usd\":2.0}'\n")
+    path.chmod(0o755)
+    return path
+
+
+def outage_run(tmp: Path, failures: int, result: str, resumes: int = 3,
+               pause_during_wait: bool = False) -> tuple[list, dict, list[str]]:
+    """One ticket through `run_wave` over that stub: its results, its ledger row, and each argv."""
+    work, cfg, job = limit_fixture(tmp)
+    argv_log = tmp / "argv.txt"
+    stub = failing_then_serving_stub(tmp / "claude-stub", argv_log, tmp / "n", failures, result)
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)},
+                           "ticket": {"outage_resumes": resumes,
+                                      "outage_wait_seconds": 6 if pause_during_wait else 0}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        if pause_during_wait:
+            # Asked once the first leg has ended and the driver is waiting — not before it starts,
+            # where the watchdog would take it and no outage would ever be seen.
+            def ask() -> None:
+                while not (tmp / "n").exists():
+                    time.sleep(0.2)
+                time.sleep(2)
+                pool.save_json(pool.PAUSE, {"asked": True})
+            threading.Thread(target=ask, daemon=True).start()
+        results = pool.run_wave([job], slots, cfg, {}, say, {str(work): base})
+        entry = pool.load_json(pool.LEDGER, {}).get("o/r#266", {})
+    argvs = argv_log.read_text().splitlines() if argv_log.exists() else []
+    return results, entry, argvs
+
+
+def resumed_id(argv: str) -> str | None:
+    m = re.search(r"--resume (\S+)", argv)
+    return m and m.group(1)
+
+
+def test_an_api_outage_resumes_the_same_session_instead_of_spending_an_attempt(tmp: Path) -> None:
+    """The whole feature: #402 and #515 each lost a first attempt to the API being unreachable.
+
+    Both were re-worked from zero by a fresh attempt, and #515 left 14 uncommitted changes behind in
+    the tree it abandoned. What must happen instead is that the SAME session continues, in the same
+    tree, inside the same attempt.
+    """
+    print("\nan API outage resumes the same session instead of spending an attempt")
+    for label, text in (("unreachable", OUTAGE_DNS), ("no response", OUTAGE_SILENT)):
+        sub = tmp / label.replace(" ", "-")
+        sub.mkdir()
+        results, entry, argvs = outage_run(sub, failures=1, result=text)
+        check(f"{label}: the session is started twice", len(argvs) == 2, str(argvs))
+        first = re.search(r"--session-id (\S+)", argvs[0]) if argvs else None
+        check(f"{label}: the second run RESUMES the first one's session id",
+              bool(first) and len(argvs) == 2 and resumed_id(argvs[1]) == first.group(1),
+              str(argvs))
+        check(f"{label}: and is told it was an outage, not an operator pause",
+              len(argvs) == 2 and "never reached the API" in argvs[1], str(argvs[-1:]))
+        check(f"{label}: the ticket does not end as an error",
+              results and results[0][1] != "error", str(results))
+        check(f"{label}: exactly one attempt is spent", entry.get("attempts") == 1, str(entry))
+        check(f"{label}: the row counts the resume", entry.get("outage_resumes") == 1, str(entry))
+        check(f"{label}: cost is the attempt's, not its last leg's",
+              entry.get("cost_usd") == 3.0, str(entry.get("cost_usd")))
+
+
+def test_a_safeguard_refusal_is_not_an_outage(tmp: Path) -> None:
+    """The negative control. A refusal also reads "API Error:", and resuming it asks the same thing."""
+    print("\na safeguard refusal is not re-entered as an outage")
+    results, entry, argvs = outage_run(tmp, failures=1, result=SAFEGUARD)
+    check("the session is started once", len(argvs) == 1, str(argvs))
+    check("and it ends as the error it is", results == [("o/r#266", "error")], str(results))
+    check("with no resume counted", entry.get("outage_resumes") == 0, str(entry))
+
+
+def test_an_outage_that_outlasts_every_resume_is_an_error(tmp: Path) -> None:
+    """Bounded: a network that never comes back ends the attempt, as it always did."""
+    print("\nan outage that outlasts every resume is still an error")
+    results, entry, argvs = outage_run(tmp, failures=9, result=OUTAGE_DNS, resumes=2)
+    check("one run plus the two resumes allowed, and no more", len(argvs) == 3, str(argvs))
+    check("then it ends as an error", results == [("o/r#266", "error")], str(results))
+    check("spending one attempt", entry.get("attempts") == 1, str(entry))
+    off, _, off_argvs = outage_run(tmp / "off", failures=1, result=OUTAGE_DNS, resumes=0)
+    check("`outage_resumes: 0` turns it off", len(off_argvs) == 1 and off == [("o/r#266", "error")],
+          f"{off} {off_argvs}")
+
+
+def test_a_pause_asked_during_the_outage_wait_is_a_pause(tmp: Path) -> None:
+    """The wait is not a place where the operator's pause goes unheard or ends the attempt."""
+    print("\na pause asked for during the outage wait suspends the ticket")
+    results, entry, argvs = outage_run(tmp, failures=1, result=OUTAGE_DNS, pause_during_wait=True)
+    check("the session is not re-entered", len(argvs) == 1, str(argvs))
+    check("the ticket reports itself paused", results == [("o/r#266", "paused")], str(results))
+    check("no attempt is spent", entry.get("attempts", 0) == 0, str(entry))
+    check("the session id is kept for `--resume`", bool(entry.get("session_id")), str(entry))
+
+
+def test_a_rejection_covered_by_overage_is_not_a_pause(tmp: Path) -> None:
+    """Paid overflow is not a window that resets, so there is nothing to wait for.
+
+    This is the CLI's own carve-out, mirrored rather than invented: its arming predicate excludes a
+    rejection while overage is in use. A driver that slept on one would wait out a `resetsAt` that
+    says nothing about when the credits come back.
+    """
+    print("\na rejection covered by overage is not a pause")
+    work, cfg, job = limit_fixture(tmp)
+    stub = limit_stub(tmp / "claude-stub", tmp / "argv.txt", resets_in=90, overage="true")
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        results = pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+
+    check("an overage rejection is not slept on", results == [("o/r#266", "error")], str(results))
+
+
+def test_a_session_silent_under_a_limit_is_suspended_not_killed(tmp: Path) -> None:
+    """The quiet watchdog must not spend a ticket that is only blocked on quota.
+
+    A session that cannot make a request produces nothing, and `quiet_seconds` is 90 minutes in the
+    shipped config — so the OTHER way a limit reaches the driver is as a watchdog kill, with every
+    cost of one: the attempt spent, the worktree dropped, `timeout` in the ledger. The two routes
+    have to end in the same place, and this is the one no exit code marks.
+    """
+    print("\na session silent under a live limit is suspended, not killed")
+    work, cfg, job = limit_fixture(tmp, quiet=3)
+    stub = limit_stub(tmp / "claude-stub", tmp / "argv.txt", resets_in=120,
+                      tail="sleep 120\n")
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        results = pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+        entry = pool.load_json(pool.LEDGER, {}).get("o/r#266", {})
+
+    check("silence under a live limit is a pause, not a timeout",
+          results == [("o/r#266", "paused")], str(results))
+    check("nothing was killed_for, so nothing reads as a death",
+          not entry.get("killed_for"), str(entry.get("killed_for")))
+    check("the attempt is not spent by the watchdog either",
+          entry.get("attempts", 0) == 0, f"attempts={entry.get('attempts')}")
+    check("and it still knows when to come back", isinstance(entry.get("resume_at"), int),
+          str(entry.get("resume_at")))
+
+
+def test_a_session_nothing_can_resume_is_ended_by_a_limit_not_suspended(tmp: Path) -> None:
+    """A limit may only suspend a session something can carry back — which means a ticket.
+
+    What re-enters a suspended session is its LEDGER ROW: the session id and the worktree. The retro
+    has neither, which is why `run_retro` builds its session `pausable=False`, and a limit that
+    ignored that flag would suspend a retro into nothing — the work lost, the source repo left
+    mid-checkout for the next retro to refuse as dirty, and the whole thing reported through the
+    problem list as "no commit landed", which is true and is not the reason. So the limit ends it,
+    the way it always did, and the driver says which limit rather than leaving that inference to an
+    operator reading a list of consequences.
+    """
+    print("\na session nothing can resume is ended by a limit, not suspended")
+    with isolated(tmp):
+        stub = limit_stub(tmp / "claude-stub", tmp / "argv.txt", resets_in=120)
+        cfg = pool.merge(pool.DEFAULTS, {"claude": {"binary": str(stub)}})
+        say = pool.Say(tmp / "retro.md")
+        ticket = pool.Session("t", tmp, cfg, tmp / "ticket", 300, 300, say).run()
+        retro = pool.Session("/skill-retro", tmp, cfg, tmp / "retro", 300, 300, say,
+                             pausable=False).run()
+
+    check("a ticket's session IS suspended by the limit",
+          ticket.get("paused_for") == pool.LIMIT_WHY, str(ticket.get("paused_for")))
+    check("the retro's session is NOT — nothing could re-enter it",
+          not retro.get("paused_for") and not retro.get("killed_for"), str(retro))
+    check("it ends as the error it is",
+          retro.get("is_error") is True, str(retro.get("is_error")))
+    check("but it still carries the limit that ended it, so the reason is not left to be inferred",
+          (retro.get("rate_limit") or {}).get("resets_at") is not None,
+          str(retro.get("rate_limit")))
+
+    # Wired, not merely available: the run dict has carried the limit all along, and a `run_retro`
+    # that never read it would report the retro's death as "no commit landed" exactly as before.
+    body = (HERE / "pool-run").read_text()
+    body = body[body.index("def run_retro("):body.index("def retro_forecast(")]
+    check("run_retro names the limit in its problem list",
+          "rate_limit" in body, "run_retro never reads the limit that ended its session")
+
+
+def test_the_driver_waits_for_the_reset_and_re_enters_the_session(tmp: Path) -> None:
+    """The half that made the operator type `--resume`: waiting, then re-entering.
+
+    Everything else here existed already — `work_ticket` suspends, `resume_jobs` rebuilds, `--resume`
+    re-enters. What was missing was the wait, so the driver's answer to a limit was to write a plan
+    and exit, and the pool sat idle from the moment the window closed until somebody came back to
+    the terminal. The reset is a KNOWN instant; there is nothing for a human to decide.
+    """
+    print("\nthe driver waits for the reset and re-enters the session")
+    work, cfg, job = limit_fixture(tmp)
+    argv_log = tmp / "argv.txt"
+    stub = limit_stub(tmp / "claude-stub", argv_log, resets_in=3)
+    quiet_sink, notifier = notify_sink(tmp)
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)}, "notify": {"command": notifier},
+                           # No jitter, so the case measures the WAIT and not a random margin on it.
+                           "ticket": {"limit_wait_jitter_seconds": 0}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        results = pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+        check("suspended by the limit", results == [("o/r#266", "paused")], str(results))
+        entry = pool.load_json(pool.LEDGER, {}).get("o/r#266", {})
+        sid, wt = entry.get("session_id"), Path(entry.get("worktree", "/nonexistent"))
+        (wt / "sentinel.txt").write_text("survives\n")
+
+        began = time.time()
+        resumed = pool.wait_for_limit_reset([job], pool.load_json(pool.LEDGER, {}), cfg, say,
+                                            lambda: False)
+        waited = time.time() - began
+        check("it actually waited for the window rather than returning at once",
+              waited >= 2, f"returned after {waited:.1f}s")
+        check("and it did not wait appreciably past it",
+              waited < 30, f"returned after {waited:.1f}s")
+        check("a wait the driver ends itself pages nobody",
+              not [e for e in notified(quiet_sink) if e.get("event") == "limit-held"],
+              str(notified(quiet_sink))[:200])
+        check("it hands back a job carrying the suspended session",
+              resumed is not None and len(resumed) == 1
+              and resumed[0].get("resume", {}).get("session_id") == sid, str(resumed))
+
+        stub.write_text("#!/bin/bash\n"
+                        f'echo "$PWD :: $@" >> {argv_log}\n'
+                        "echo '{\"type\":\"result\",\"result\":\"done\",\"total_cost_usd\":0.01}'\n")
+        stub.chmod(0o755)
+        pool.run_wave(resumed, slots, cfg, ledger, say, {str(work): base})
+
+    lines = [l for l in argv_log.read_text().splitlines() if l.strip()]
+    check("the session was started twice in all", len(lines) == 2, str(lines))
+    check("the first start opened a NEW session", "--session-id" in lines[0], lines[0])
+    check("the second RESUMED it rather than starting another",
+          f"--resume {sid}" in lines[1] and "--session-id" not in lines[1], lines[1])
+    check("in the same worktree, re-entered rather than recreated",
+          lines[1].split(" :: ")[0] == str(wt.resolve()) and (wt / "sentinel.txt").exists(),
+          lines[1])
+
+
+def test_a_reset_too_far_out_is_handed_back_to_a_human(tmp: Path) -> None:
+    """A weekly limit is not something to sleep through.
+
+    The five-hour window is at most five hours out and waiting for it costs an idle box. A seven-day
+    one can be days out, and a driver holding worktrees, slots and the machine lock across it is not
+    unattended operation, it is a hang — so past the cap the pause is handed back the way an
+    operator's is, with the reset named so the person reading knows what they are waiting for.
+    """
+    print("\na reset too far out is handed back rather than slept through")
+    work, cfg, job = limit_fixture(tmp)
+    stub = limit_stub(tmp / "claude-stub", tmp / "argv.txt", resets_in=3 * 24 * 3600)
+    sink, notifier = notify_sink(tmp)
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)},
+                           "notify": {"command": notifier}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+        began = time.time()
+        resumed = pool.wait_for_limit_reset([job], pool.load_json(pool.LEDGER, {}), cfg, say,
+                                            lambda: False)
+        elapsed = time.time() - began
+        entry = pool.load_json(pool.LEDGER, {}).get("o/r#266", {})
+
+    check("it refuses to wait", resumed is None, str(resumed))
+    check("and refuses immediately, rather than by timing out", elapsed < 10, f"{elapsed:.1f}s")
+    check("the operator is told when it resets, since they are the ones waiting now",
+          "resets" in (tmp / "run.md").read_text(), (tmp / "run.md").read_text()[-400:])
+    check("the ticket is still resumable by hand", entry.get("status") == "paused", str(entry))
+    # The awareness half, and it is not decoration. `paused` is in SETTLED, so it pages nobody — the
+    # right answer for a pause the driver ends itself and the wrong one here, where only a person
+    # can. The same limit used to end these runs as `error`, which DID page: waiting must not buy
+    # its quiet by dropping the one signal that mattered.
+    held = [e for e in notified(sink) if e.get("event") == "limit-held"]
+    check("a refused wait pages the operator, because only they can end this one",
+          len(held) == 1 and held[0].get("needs_human") is True, str(notified(sink))[:300])
+    check("and names the ticket it is holding", held and held[0].get("tickets") == ["o/r#266"],
+          str(held[:1]))
+
+
+def test_a_reset_the_platform_cannot_represent_still_suspends(tmp: Path) -> None:
+    """The numbers come off the wire, and the first thing done with one is PRINT it.
+
+    `work_ticket` names the reset in the line it says as it suspends the session, before anything
+    has judged whether the reset is plausible — so a `resetsAt` no calendar can hold would raise out
+    of that line and take the pause with it: the attempt spent, the ticket recorded as a crash by
+    the wave's own handler, and a live session orphaned in a worktree nothing names. Suspending on a
+    number nobody can read is the smaller failure, and the wait then refuses it like any other reset
+    too far out.
+    """
+    print("\na reset the platform cannot represent still suspends the ticket")
+    work, cfg, job = limit_fixture(tmp)
+    stub = limit_stub(tmp / "claude-stub", tmp / "argv.txt", resets_in=99999999999999)
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        results = pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+        entry = pool.load_json(pool.LEDGER, {}).get("o/r#266", {})
+        resumed = pool.wait_for_limit_reset([job], pool.load_json(pool.LEDGER, {}), cfg, say,
+                                            lambda: False)
+
+    check("the ticket is suspended rather than crashed", results == [("o/r#266", "paused")],
+          str(results))
+    check("the attempt is not spent by an unprintable number",
+          entry.get("attempts", 0) == 0, f"attempts={entry.get('attempts')}")
+    check("and the wait refuses it, the way it refuses any reset too far out",
+          resumed is None, str(resumed))
+
+
+def test_waiting_for_a_reset_stays_interruptible(tmp: Path) -> None:
+    """A wait that Ctrl-C and `--pause` cannot reach is a driver nobody can stop for hours.
+
+    The wait is the longest thing this driver ever does with nothing running, and the two ways an
+    operator stops a pool both work by being NOTICED — the signal handler sets a flag the loop
+    reads, and `--pause` writes a file every watchdog polls. Neither survives a `time.sleep` to the
+    reset, so the wait has to be a poll.
+    """
+    print("\nwaiting for a reset stays interruptible")
+    work, cfg, job = limit_fixture(tmp)
+    stub = limit_stub(tmp / "claude-stub", tmp / "argv.txt", resets_in=3000)
+    cfg = pool.merge(cfg, {"claude": {"binary": str(stub)}})
+    say = pool.Say(tmp / "run.md")
+    base = pool.remote_head(work)
+    ledger: dict = {}
+    asked = {"at": None}
+
+    def interrupted() -> bool:
+        if asked["at"] is None:
+            asked["at"] = time.time()
+            return False
+        return time.time() - asked["at"] > 1
+
+    with isolated(tmp):
+        slots = pool.build_slots(cfg, 1, tmp / "m2")
+        pool.run_wave([job], slots, cfg, ledger, say, {str(work): base})
+        began = time.time()
+        resumed = pool.wait_for_limit_reset([job], pool.load_json(pool.LEDGER, {}), cfg, say,
+                                            interrupted)
+        waited = time.time() - began
+
+    check("an interruption ends the wait", resumed is None, str(resumed))
+    check("promptly, not at the reset", waited < 60, f"waited {waited:.0f}s of a 50-minute reset")
+
+
+def test_the_wave_loop_is_the_thing_that_waits(tmp: Path) -> None:
+    """The wait is only worth anything where the loop reaches it.
+
+    `wait_for_limit_reset` is exercised directly above, the way `resume_jobs` is: the wave loop is
+    inside `main` and a case cannot enter it without a `gh`, a preflight and a real queue. So what
+    is pinned here is the wiring — that the loop calls it, that a wait it refuses still leaves the
+    plan an operator resumes from, and that the retro barrier is not crossed while a session is
+    suspended mid-attempt. The retro rewrites the skills a live run is reading; running it between
+    a pause and its resume would hand the resumed session different skills mid-ticket.
+    """
+    print("\nthe wave loop is the thing that waits")
+    body = (HERE / "pool-run").read_text()
+    loop = body[body.index("def main() -> int:"):]
+    check("the wave loop waits for the reset", "wait_for_limit_reset(" in loop,
+          "main never calls it, so the driver still exits at the limit")
+    check("a wait it refuses still ends in the plan `--resume` reads",
+          bool(re.search(r"hand_back\(\w+, suspended\)", loop))
+          and "pause_here(" in loop[loop.index("def hand_back("):],
+          "a refused wait has no way back to the operator")
+    # Waiting is what first put a job carrying a live session back on the queue, so every exit from
+    # the loop now has to split the remainder by KIND. One that flattened it would write a suspended
+    # ticket into the un-started half of the plan, and the next resume would work it from scratch —
+    # abandoning the very session the pause was taken to keep.
+    check("every stop path splits what is left by whether the job carries a session",
+          loop.count("hand_back(") >= 4, "a stop path hands the raw remainder to pause_here")
+    check("and none of them flattens the queue into the un-started list",
+          "pause_here([j for w in" not in loop,
+          "a stop path still passes every remaining job as never-started")
+    resumed_at = loop.index("wait_for_limit_reset(")
+    retro_at = loop.rindex("run_retro(cfg, say, force=False)")
+    check("and the retro barrier is not crossed while a ticket is suspended",
+          "continue" in loop[resumed_at:retro_at],
+          "the loop falls through to the retro with a session suspended mid-attempt")
+
+def peer_listener(path: Path, received: list) -> threading.Thread:
+    """A real unix socket standing in for a live session's inbox.
+
+    Not a mock of anything under test: what is under test is the frame the driver writes and the
+    guards it applies before writing one, and a socket is the genuine article on both sides. The
+    real receiver is `claude`'s own peer inbox, which is why the assertions below are about the
+    ENVELOPE — `type`, `message.content`, `session_id` — and not about anything this listener does.
+    """
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    srv.listen(4)
+    srv.settimeout(30)
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except (OSError, socket.timeout):
+                return
+            with conn:
+                buf = b""
+                conn.settimeout(5)
+                try:
+                    while b"\n" not in buf:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                except (OSError, socket.timeout):
+                    pass
+            for line in buf.decode(errors="replace").splitlines():
+                if line.strip():
+                    try:
+                        received.append(json.loads(line))
+                    except ValueError:
+                        received.append({"unparseable": line})
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    return t
+
+
+def refusing_then_serving_stub(path: Path, counter: Path, refusals: int, rejection: str) -> Path:
+    """A `claude` that refuses the first `refusals` probes and then serves, as a closed window does.
+
+    `rejection` is what it says while refusing — a real-shaped `rate_limit_event`, or nothing at
+    all. Nothing at all is the case that matters: the rejected form of that record has never been
+    observed by this pipeline (every one it has captured says `allowed_warning`, because a
+    rejection ends the run that would have logged it), so the carry must not depend on seeing one.
+    """
+    path.write_text(
+        "#!/bin/bash\n"
+        f'n=$(cat {counter} 2>/dev/null || echo 0); echo $((n+1)) > {counter}\n'
+        f'if [ "$n" -lt "{refusals}" ]; then\n'
+        f"  {rejection}\n"
+        '  echo \'{"type":"result","is_error":true,"result":"usage limit"}\'\n'
+        "  exit 1\n"
+        "fi\n"
+        'echo \'{"type":"result","result":"ok"}\'\n')
+    path.chmod(0o755)
+    return path
+
+
+REJECTION_EVENT = ('echo \'{"type":"rate_limit_event","rate_limit_info":{"status":"rejected",'
+                   '"resetsAt":RESET,"rateLimitType":"five_hour","isUsingOverage":false}}\'')
+
+
+def live_session_fixture(tmp: Path, root: Path, name: str = "t") -> tuple[int, Path, list]:
+    """A real process, a real socket and the registry entry `claude` would publish for them.
+
+    The socket goes under /tmp rather than the case directory, and not for convenience: an AF_UNIX
+    path is capped near 104 bytes and a per-case temp directory is already longer than that. It is
+    the same constraint `claude` works under, which is why it publishes its own socket path in the
+    registry instead of letting a caller derive one — and why the driver reads it from there.
+    """
+    holder = subprocess.Popen(["/bin/sh", "-c", "sleep 300"])
+    sock = Path("/tmp") / f"cc-pool-test-{holder.pid}-{name}.sock"
+    sock.unlink(missing_ok=True)
+    # UTC, because that is what `claude` records — and NOT `process_start`, which reads local time
+    # out of `ps`. An earlier fixture built this field by calling the very function the entry is
+    # checked against, so the comparison was true by construction and a three-hour timezone
+    # disagreement lived underneath it, refusing every nudge on any machine not set to UTC.
+    utc_start = time.strftime("%a %b %d %H:%M:%S %Y",
+                              time.gmtime(pool.process_start(holder.pid) or time.time()))
+    received: list = []
+    peer_listener(sock, received)
+    (root / "sessions").mkdir(parents=True, exist_ok=True)
+    (root / "sessions" / f"{holder.pid}.json").write_text(json.dumps({
+        "pid": holder.pid,
+        "sessionId": f"session-of-{holder.pid}",
+        "cwd": str(tmp),
+        "procStart": utc_start,
+        "messagingSocketPath": str(sock),
+        "kind": "interactive",
+        "status": "idle",
+    }))
+    return holder.pid, sock, received
+
+
+def test_a_stalled_work_session_is_told_when_its_window_reopens(tmp: Path) -> None:
+    """The `--work` half, which neither the CLI's wait nor the driver's can reach.
+
+    The CLI's own wait-for-the-reset belongs to the SESSION and can be off for an account — measured
+    on this machine 2026-09-11, when three `--work` sessions sat idle for 4h14m past a 07:10 reset
+    and the continuation prompt appears in none of their transcripts. The driver's wait cannot help
+    either: it suspends and re-enters a session, and a `--work` session has no ledger row carrying
+    its id and worktree back. So the watcher notices the window reopening and says so, over the
+    local peer socket the session itself publishes.
+
+    Three guards stand before that, because unlike everything else this watcher does, it ACTS: the
+    session must be quiet, the ACCOUNT must have refused a probe rather than merely be suspected,
+    and the reset must have arrived. The negative case below is the one that matters most — a quiet
+    session with no limit against it is a session waiting for a person, and must be left alone.
+    """
+    print("\na stalled --work session is told when its window reopens")
+    with isolated(tmp) as root:
+        pid, _sock, received = live_session_fixture(tmp, root)
+        wt = tmp / "wt"
+        wt.mkdir()
+        started = pool.now() - 1000
+        # A transcript where `claude` writes one, aged past the probe threshold: the watcher asks
+        # the account only about a run that has actually stopped writing.
+        proj = pool.PROJECTS / pool.project_dir_name(wt)
+        proj.mkdir(parents=True, exist_ok=True)
+        stale = proj / "s.jsonl"
+        stale.write_text("{}\n")
+        os.utime(stale, (pool.now() - 400, pool.now() - 400))
+
+        # Refuses once naming a window two seconds out, then serves. Both halves are required:
+        # a clock alone would nudge a session the account is still refusing.
+        stub = refusing_then_serving_stub(
+            tmp / "claude-stub", tmp / "probes.txt", 1,
+            REJECTION_EVENT.replace("RESET", str(pool.now() + 2)))
+        cfg = pool.merge(pool.DEFAULTS, {
+            "claude": {"binary": str(stub)},
+            "ticket": {"timeout_seconds": 5, "quiet_seconds": 5, "limit_wait_jitter_seconds": 0,
+                       # Small on purpose: this case waits on the poll that asks whether
+                       # the account is serving yet. The pacing case leaves it alone.
+                       "limit_probe_seconds": 3},
+        })
+        stop = threading.Event()
+        t = threading.Thread(target=pool.watch_hand_launched, daemon=True,
+                             args=(cfg, "o/r#1", wt, started, stop, lambda *a, **k: None, pid))
+        t.start()
+        deadline = time.time() + 60
+        while time.time() < deadline and not received:
+            time.sleep(0.5)
+        stop.set()
+
+    check("the stalled session is sent exactly one turn", len(received) == 1, str(received)[:200])
+    msg = received[0] if received else {}
+    check("as a user message, which is what a session acts on",
+          msg.get("type") == "user", str(msg.get("type")))
+    check("carrying the session id, so a recycled pid cannot be handed somebody else's resume",
+          msg.get("session_id") == f"session-of-{pid}", str(msg.get("session_id")))
+    body = (msg.get("message", {}).get("content") or "").lower()
+    check("and it says continue where you stopped, not start again",
+          "continue the /resolve-ticket run" in body and "do not start the skill again" in body,
+          str(msg.get("message", {}).get("content"))[:200])
+
+
+def test_a_probe_spent_on_an_earlier_silence_does_not_delay_the_one_that_matters(tmp: Path) -> None:
+    """The shape that let #315 sit idle for an hour with the account wide open.
+
+    Measured 2026-09-14. Pacing was per WATCHER, so a probe spent during an earlier quiet spell
+    pushed the next look ten minutes out. #315 then stopped six minutes before its window reopened;
+    its first look landed seven minutes later with the account already serving — and "open" says
+    nothing without a refusal to pair it with, so it never armed, while three siblings that had
+    caught the refusal in their own spells all resumed.
+
+    What is asserted is the pacing itself and not the nudge: that a session which has been writing
+    and goes quiet AGAIN is looked at promptly rather than after the previous spell's interval.
+    Delivery is covered by the cases above, and asserting it here would need a refusal and then a
+    service, which is two more intervals of waiting for a property neither of them is about.
+    """
+    print("\na probe spent on an earlier silence does not delay the one that matters")
+    with isolated(tmp) as root:
+        pid, _sock, _received = live_session_fixture(tmp, root)
+        wt = tmp / "wt"
+        wt.mkdir()
+        started = pool.now() - 5000
+        proj = pool.PROJECTS / pool.project_dir_name(wt)
+        proj.mkdir(parents=True, exist_ok=True)
+        live = proj / "s.jsonl"
+        live.write_text("{}\n")
+        probes = tmp / "probes.txt"
+
+        def quiet_for(seconds: int) -> None:
+            """Age the transcript. It is the only thing `silence_since` reads."""
+            os.utime(live, (pool.now() - seconds, pool.now() - seconds))
+
+        def probe_count() -> int:
+            return int(probes.read_text().strip() or 0) if probes.exists() else 0
+
+        # Always serves, so nothing ever arms and every probe is just a probe.
+        stub = refusing_then_serving_stub(tmp / "claude-stub", probes, 0, "true")
+        cfg = pool.merge(pool.DEFAULTS, {
+            "claude": {"binary": str(stub)},
+            # `quiet_seconds` sets the probe threshold and `timeout_seconds` the tick; both small so
+            # the case moves. The REPEAT interval is deliberately not derived from either — an
+            # earlier version of this case derived it, which made it pass against the broken code.
+            "ticket": {"timeout_seconds": 6, "quiet_seconds": 20, "limit_wait_jitter_seconds": 0},
+        })
+        stop = threading.Event()
+        quiet_for(400)
+        threading.Thread(target=pool.watch_hand_launched, daemon=True,
+                         args=(cfg, "o/r#1", wt, started, stop, lambda *a, **k: None, pid)).start()
+
+        deadline = time.time() + 45
+        while time.time() < deadline and probe_count() < 1:
+            time.sleep(0.5)
+        first = probe_count()
+
+        # The session writes again, held fresh across several ticks so the watcher cannot miss that
+        # the spell ended, and then goes quiet a second time.
+        for _ in range(6):
+            quiet_for(0)
+            time.sleep(3)
+        quiet_for(400)
+        began = time.time()
+        deadline = began + 45
+        while time.time() < deadline and probe_count() <= first:
+            time.sleep(0.5)
+        waited = time.time() - began
+        second = probe_count()
+        stop.set()
+
+    check("the first quiet spell is probed", first >= 1, f"{first} probes")
+    check("and so is the second, promptly rather than after the first spell's interval",
+          second > first and waited < 40, f"{second} probes after {waited:.0f}s (first={first})")
+
+
+def test_a_refusal_that_names_no_window_is_still_carried(tmp: Path) -> None:
+    """The link nothing here has been able to measure, removed from the critical path.
+
+    A reset time reaches the driver through a `rate_limit_event` whose REJECTED form this pipeline
+    has never captured: all 304 records in its kept streams say `allowed_warning`, because a
+    rejection ends the run that would have logged one. Its shape is taken from the CLI's own
+    arming predicate, not from an observation — so a carry that needed it would rest on a guess,
+    and would fail silently by simply never firing.
+
+    It does not need it. Being usage-limited means the account will not serve a request, and the
+    limit lifting means it will; both are observable without any record naming a window. So a probe
+    refused WITHOUT explanation blocks the session just the same, the account is polled until it
+    serves one, and only then is anything sent. A named window is an optimisation over that — it
+    says when to stop asking early — and never a precondition.
+    """
+    print("\na refusal that names no window is still carried")
+    with isolated(tmp) as root:
+        pid, _sock, received = live_session_fixture(tmp, root)
+        wt = tmp / "wt"
+        wt.mkdir()
+        started = pool.now() - 1000
+        proj = pool.PROJECTS / pool.project_dir_name(wt)
+        proj.mkdir(parents=True, exist_ok=True)
+        stale = proj / "s.jsonl"
+        stale.write_text("{}\n")
+        os.utime(stale, (pool.now() - 400, pool.now() - 400))
+
+        # Refused twice, saying NOTHING about a window or a reset, then served.
+        stub = refusing_then_serving_stub(tmp / "claude-stub", tmp / "probes.txt", 2, "true")
+        cfg = pool.merge(pool.DEFAULTS, {
+            "claude": {"binary": str(stub)},
+            "ticket": {"timeout_seconds": 4, "quiet_seconds": 4, "limit_wait_jitter_seconds": 0,
+                       "limit_probe_seconds": 3},
+        })
+        stop = threading.Event()
+        threading.Thread(target=pool.watch_hand_launched, daemon=True,
+                         args=(cfg, "o/r#1", wt, started, stop, lambda *a, **k: None, pid)).start()
+        deadline = time.time() + 90
+        while time.time() < deadline and not received:
+            time.sleep(0.5)
+        stop.set()
+        probes = int((tmp / "probes.txt").read_text().strip() or 0)
+
+    check("a session is carried past a refusal that named no window at all",
+          len(received) == 1, str(received)[:200])
+    check("and it was carried because the account SERVED one, not because a clock passed",
+          probes >= 3, f"{probes} probes — it did not poll until the account served")
+
+
+def test_a_quiet_work_session_with_no_limit_against_it_is_left_alone(tmp: Path) -> None:
+    """Quiet is not the signal. The ACCOUNT refusing a probe is.
+
+    A `--work` session goes quiet for the ordinary reason too: it asked its operator something and
+    is waiting. Nudging that one injects a turn answering nothing, into a conversation whose next
+    move was the person's — and `quiet_seconds` is reached by every session that stops for lunch.
+    So the watcher spends a probe and believes the answer, and this case is the one that fails if
+    silence is ever promoted back into evidence.
+    """
+    print("\na quiet --work session with no limit against it is left alone")
+    with isolated(tmp) as root:
+        pid, _sock, received = live_session_fixture(tmp, root)
+        wt = tmp / "wt"
+        wt.mkdir()
+        started = pool.now() - 1000
+        proj = pool.PROJECTS / pool.project_dir_name(wt)
+        proj.mkdir(parents=True, exist_ok=True)
+        stale = proj / "s.jsonl"
+        stale.write_text("{}\n")
+        os.utime(stale, (pool.now() - 400, pool.now() - 400))
+
+        # The account answers "not limited" — the probe runs and returns no rejection.
+        stub = tmp / "claude-stub"
+        stub.write_text("#!/bin/bash\n"
+                        "echo '{\"type\":\"rate_limit_event\",\"rate_limit_info\":"
+                        "{\"status\":\"allowed\",\"utilization\":0.1}}'\n"
+                        "echo '{\"type\":\"result\",\"result\":\"ok\"}'\n")
+        stub.chmod(0o755)
+        cfg = pool.merge(pool.DEFAULTS, {
+            "claude": {"binary": str(stub)},
+            "ticket": {"timeout_seconds": 5, "quiet_seconds": 5, "limit_wait_jitter_seconds": 0,
+                       # Small on purpose: this case waits on the poll that asks whether
+                       # the account is serving yet. The pacing case leaves it alone.
+                       "limit_probe_seconds": 3},
+        })
+        stop = threading.Event()
+        threading.Thread(target=pool.watch_hand_launched, daemon=True,
+                         args=(cfg, "o/r#1", wt, started, stop, lambda *a, **k: None, pid)).start()
+        time.sleep(25)
+        stop.set()
+
+    check("nothing is sent to a session the account is not refusing", not received, str(received))
+
+
+def test_a_session_is_addressable_from_a_machine_that_is_not_on_utc(tmp: Path) -> None:
+    """The two clocks compared here are in different zones, and neither says so.
+
+    `claude` records its own start in UTC; `ps -o lstart=` prints local. Compared as strings they
+    differ by the machine's offset and nothing else, so a string check refuses every live session
+    anywhere but UTC — measured 2026-09-13 on a +0300 box, where it had refused every nudge the
+    carry ever attempted while the log said only "no live session is registered under pid N".
+
+    Pinned in BOTH spellings, because which one `claude` writes is not this driver's to decide and
+    a future version may answer differently. What must not come back is a comparison that only
+    works where the machine agrees with the recorder.
+    """
+    print("\na session is addressable from a machine that is not on UTC")
+    with isolated(tmp) as root:
+        pid, _sock, _received = live_session_fixture(tmp, root)
+        path = root / "sessions" / f"{pid}.json"
+        entry = json.loads(path.read_text())
+        started = pool.process_start(pid)
+
+        check("the UTC spelling `claude` actually writes is accepted",
+              pool.live_session(pid) is not None,
+              f"procStart={entry.get('procStart')!r} refused; ps reads "
+              f"{time.strftime('%a %b %d %H:%M:%S %Y', time.localtime(started))!r}")
+
+        entry["procStart"] = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(started))
+        path.write_text(json.dumps(entry))
+        check("and so is the local spelling, in case that is ever what is recorded",
+              pool.live_session(pid) is not None, str(entry.get("procStart")))
+
+        # The guard still has to guard. An hour out in either direction is not this machine's
+        # offset arithmetic, it is a different process.
+        entry["procStart"] = time.strftime("%a %b %d %H:%M:%S %Y", time.gmtime(started + 3600))
+        path.write_text(json.dumps(entry))
+        check("a start time that is neither reading of this process is still refused",
+              pool.live_session(pid) is None, str(entry.get("procStart")))
+
+
+def test_a_recycled_pid_is_never_handed_a_resume(tmp: Path) -> None:
+    """Pids are reissued, and registry files outlive the sessions that wrote them.
+
+    The cost of getting this wrong is not a wasted message: it is a `/resolve-ticket` resume prompt
+    delivered into whatever unrelated session now holds that pid. `procStart` is what tells the two
+    apart, and it is checked against the LIVE process rather than trusted from the file.
+    """
+    print("\na recycled pid is never handed a resume")
+    with isolated(tmp) as root:
+        pid, sock, received = live_session_fixture(tmp, root)
+        entry = json.loads((root / "sessions" / f"{pid}.json").read_text())
+
+        check("a live session with a matching procStart is addressable",
+              pool.live_session(pid) is not None, "the fixture itself is not addressable")
+
+        entry["procStart"] = "Mon Jan  1 00:00:00 2001"
+        (root / "sessions" / f"{pid}.json").write_text(json.dumps(entry))
+        check("a registry entry whose procStart does not match the live process is refused",
+              pool.live_session(pid) is None, str(pool.live_session(pid)))
+        failed = pool.continue_session(pid, "hello")
+        check("and nothing is sent to it", bool(failed) and not received, f"{failed} {received}")
+
+        (root / "sessions" / f"{pid}.json").unlink()
+        check("neither is a pid with no registry entry at all",
+              bool(pool.continue_session(pid, "hello")) and not received, str(received))
+
+
+def test_the_carry_can_be_turned_off(tmp: Path) -> None:
+    """It acts on a session somebody may be sitting in front of, so it has an off switch.
+
+    `limit_continue_work: false` leaves the watcher exactly what it was before — a reporter. The
+    same is true of `limit_wait_max_seconds: 0`, which is already the switch for the driver's own
+    wait: one instruction, "do not wait for usage limits", answered the same way on both paths
+    rather than two knobs that can disagree.
+    """
+    print("\nthe carry can be turned off")
+    for n, off in enumerate(({"limit_continue_work": False}, {"limit_wait_max_seconds": 0})):
+        case = tmp / str(n)
+        case.mkdir()
+        with isolated(case) as root:
+            pid, _sock, received = live_session_fixture(case, root, name=str(n))
+            wt = case / "wt"
+            wt.mkdir()
+            started = pool.now() - 1000
+            proj = pool.PROJECTS / pool.project_dir_name(wt)
+            proj.mkdir(parents=True, exist_ok=True)
+            stale = proj / "s.jsonl"
+            stale.write_text("{}\n")
+            os.utime(stale, (pool.now() - 400, pool.now() - 400))
+            stub = limit_stub(case / "stub", case / "argv.txt", resets_in=2)
+            cfg = pool.merge(pool.DEFAULTS, {
+                "claude": {"binary": str(stub)},
+                "ticket": {**{"timeout_seconds": 5, "quiet_seconds": 5,
+                              "limit_wait_jitter_seconds": 0}, **off},
+            })
+            stop = threading.Event()
+            threading.Thread(target=pool.watch_hand_launched, daemon=True,
+                             args=(cfg, "o/r#1", wt, started, stop, lambda *a, **k: None,
+                                   pid)).start()
+            time.sleep(20)
+            stop.set()
+        check(f"with {sorted(off)[0]} it sends nothing", not received, str(received))
+
+def test_pr_detection(tmp: Path) -> None:
+    """A merged PR is not an open PR — the outcome check must not read that as `no-pr`.
+
+    Every case drives the real functions; the one substitution is `sh`, the process boundary to
+    `gh`, restored in a finally so later cases keep the shipped one. The eight tickets whose
+    delivered PRs were recorded `no-pr`, with their merge times, are in
+    `.claude/skill-lessons/2026-09-17-pool-pr-detection.md`.
+    """
+    OPEN_417 = {"number": 417, "title": "finding citation extent", "isDraft": False,
+                "headRefName": "fix/409-finding-citation-extent-prose-anchored",
+                "closingIssuesReferences": [], "url": "u417", "createdAt": "2026-09-13T15:43:22Z",
+                "body": "Refs #409.\n`main` gained #416 (issue #294) after this branch was reviewed"}
+    OPEN_452 = {"number": 452, "title": "linear citation split", "isDraft": False,
+                "headRefName": "fix/448-linear-citation-split", "closingIssuesReferences": [],
+                "url": "u452", "createdAt": "2026-09-17T01:00:00Z", "body": "Refs #448."}
+    OPEN_424 = {"number": 424, "title": "unstated dosing ceiling", "isDraft": False,
+                "headRefName": "feat/no-number-here", "closingIssuesReferences": [], "url": "u424",
+                "createdAt": "2026-09-14T04:51:51Z",
+                "body": "Refs [#276](https://github.com/openmrs/openmrs-module-chartsearchai/issues/276) ..."}
+    BODY_ONLY = {**OPEN_417, "number": 500, "headRefName": "fix/no-number", "title": "anchored prose"}
+    MERGED_431 = {"number": 431, "isDraft": False, "state": "MERGED", "url": "u431",
+                  "headRefName": "feat/315-ended-order-stop-date", "title": "ended order stop date",
+                  "closingIssuesReferences": [], "createdAt": "2026-09-14T17:21:06Z",
+                  "body": "Refs #315."}
+    SINCE = pool.iso_to_epoch("2026-09-13T00:00:00Z")
+
+    def fake_sh(out="", code=0):
+        # The real `sh` returns what subprocess.run returns, so the stand-in returns that type too.
+        return lambda args, cwd=None, timeout=300: subprocess.CompletedProcess(
+            args=args, returncode=code, stdout=out, stderr="")
+
+    real_sh = pool.sh
+    try:
+        got = pool.pr_for_ticket([OPEN_417], "294", since=SINCE)
+        check("prose mention of #294 is not #294's PR", (got and got["number"]) is None)
+        got = pool.pr_for_ticket([OPEN_417], "409", since=SINCE)
+        check("its `Refs #409` still is #409's PR", (got and got["number"]) == 417)
+        got = pool.pr_for_ticket([BODY_ONLY], "409", since=SINCE)
+        check("body tier alone: `Refs #409` with nothing in the branch", (got and got["number"]) == 500)
+        got = pool.pr_for_ticket([BODY_ONLY], "294", since=SINCE)
+        check("body tier alone: the bare mention of #294 does not", (got and got["number"]) is None)
+        got = pool.pr_for_ticket([OPEN_424], "276", since=SINCE)
+        check("`Refs [#276](url)` on a numberless branch matches", (got and got["number"]) == 424)
+        got = pool.pr_for_ticket([OPEN_452], "448", since=None)
+        check("branch tier needs no `since`", (got and got["number"]) == 452)
+        check("a None list is not an exception", pool.pr_for_ticket(None, "448") is None)
+
+        pool.sh = fake_sh(out="", code=0)
+        check("open_prs: exit 0 with empty stdout is unknown", pool.open_prs("o/r") is None)
+        pool.sh = fake_sh(out="[]", code=1)
+        check("open_prs: a non-zero exit is unknown", pool.open_prs("o/r") is None)
+        pool.sh = fake_sh(out=json.dumps([OPEN_452]), code=0)
+        check("open_prs: a real answer is a list",
+              [x["number"] for x in pool.open_prs("o/r")] == [452])
+
+        pool.sh = fake_sh(out=json.dumps(MERGED_431), code=0)
+        pr, asked = pool.outcome_pr("o/r", "315", {"pr": 431}, SINCE, [])
+        check("the gate's number finds a MERGED PR the open list cannot see",
+              ((pr and pr["number"]), asked) == (431, True))
+        check("and the ladder calls that ready", bool(pr and not pr.get("isDraft")))
+
+        pool.sh = fake_sh(out="", code=1)
+        pr, asked = pool.outcome_pr("o/r", "448", {}, SINCE, [OPEN_452])
+        check("an open-list hit never asks gh again", ((pr and pr["number"]), asked) == (452, True))
+        pr, asked = pool.outcome_pr("o/r", "999", {}, SINCE, [])
+        check("nothing found and the ask worked is no-pr territory", (pr, asked) == (None, True))
+        pr, asked = pool.outcome_pr("o/r", "999", {}, SINCE, None)
+        check("a failed ask with nothing to fall back on is unknown", (pr, asked) == (None, False))
+        pr, asked = pool.outcome_pr("o/r", "315", {"pr": 431}, SINCE, None)
+        check("a failed list still consults the gate", (pr, asked) == (None, False))
+    finally:
+        pool.sh = real_sh
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        for name, fn in [("ticket-identity", test_ticket_identity),
+        for name, fn in [("pr detection", test_pr_detection),
+                         ("ticket-identity", test_ticket_identity),
                          ("legacy-ticket-state", test_legacy_ticket_state),
                          ("worktrees", test_worktrees), ("slots", test_slots),
                          ("gate-state", test_gate_state_locking), ("waves", test_waves),
                          ("parallel run", test_parallel_run), ("say", test_say_is_thread_safe),
-                         ("records", test_record_attribution), ("crash", test_crash_does_not_clobber),
+                         ("records", test_record_attribution), ("aborted", test_record_says_aborted),
+                         ("crash", test_crash_does_not_clobber),
                          ("nothing ran", test_nothing_ran), ("maven tail", test_shared_maven_repo), ("db ports", test_db_port_hosts),
                          ("skill commands", test_skills_commands_run),
+                         ("parity both ways", test_parity_names_a_file_on_either_side),
+                         ("lint ratchet", test_a_retro_that_raises_a_budget_unrecorded_is_a_problem),
                          ("driver gate-state", test_pool_gate_state_via_helper),
                          ("save_json temp", test_save_json_temp_is_private),
                          ("ledger cross-process", test_ledger_cross_process),
@@ -2995,7 +4609,29 @@ def main() -> int:
                          ("notify flagged ready", test_the_end_of_a_pool_carries_what_the_status_could_not),
                          ("work watchdog", test_a_hand_launched_run_is_watched_even_though_nobody_is),
                          ("status staleness", test_status_names_a_running_row_no_session_holds),
-                         ("work reaps the dead", test_the_next_hand_launch_closes_out_what_died)]:
+                         ("work reaps the dead", test_the_next_hand_launch_closes_out_what_died),
+                         ("limit suspends", test_a_usage_limit_suspends_the_ticket_rather_than_spending_it),
+                         ("limit recovered", test_a_limit_the_session_got_past_is_not_a_pause),
+                         ("limit stale reset", test_a_reset_that_has_already_passed_did_not_stop_this_run),
+                         ("limit overage", test_a_rejection_covered_by_overage_is_not_a_pause),
+                         ("outage resumes", test_an_api_outage_resumes_the_same_session_instead_of_spending_an_attempt),
+                         ("outage safeguard", test_a_safeguard_refusal_is_not_an_outage),
+                         ("outage cap", test_an_outage_that_outlasts_every_resume_is_an_error),
+                         ("outage pause", test_a_pause_asked_during_the_outage_wait_is_a_pause),
+                         ("limit quiet watchdog", test_a_session_silent_under_a_limit_is_suspended_not_killed),
+                         ("limit vs the retro", test_a_session_nothing_can_resume_is_ended_by_a_limit_not_suspended),
+                         ("limit waits and resumes", test_the_driver_waits_for_the_reset_and_re_enters_the_session),
+                         ("limit too far out", test_a_reset_too_far_out_is_handed_back_to_a_human),
+                         ("limit bogus reset", test_a_reset_the_platform_cannot_represent_still_suspends),
+                         ("limit interruptible", test_waiting_for_a_reset_stays_interruptible),
+                         ("limit loop wiring", test_the_wave_loop_is_the_thing_that_waits),
+                         ("work carried past a limit", test_a_stalled_work_session_is_told_when_its_window_reopens),
+                         ("work second quiet spell", test_a_probe_spent_on_an_earlier_silence_does_not_delay_the_one_that_matters),
+                         ("work carried with no window named", test_a_refusal_that_names_no_window_is_still_carried),
+                         ("work quiet but unlimited", test_a_quiet_work_session_with_no_limit_against_it_is_left_alone),
+                         ("work non-utc machine", test_a_session_is_addressable_from_a_machine_that_is_not_on_utc),
+                         ("work recycled pid", test_a_recycled_pid_is_never_handed_a_resume),
+                         ("work carry off switch", test_the_carry_can_be_turned_off)]:
             sub = tmp / name.replace(" ", "-")
             sub.mkdir()
             try:
